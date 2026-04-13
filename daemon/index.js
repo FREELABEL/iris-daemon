@@ -1498,9 +1498,17 @@ LIMIT ${limit}
         }
       }
 
-      // Accept the task
-      await this.cloud.acceptTask(event.task_id)
-      console.log(`[daemon] Accepted task: ${event.task_id}`)
+      // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
+      try {
+        await this.cloud.acceptTask(event.task_id)
+        console.log(`[daemon] Accepted task: ${event.task_id}`)
+      } catch (acceptErr) {
+        if (acceptErr.message?.includes('running') || acceptErr.message?.includes('422')) {
+          console.log(`[daemon] Task already running — proceeding with execution`)
+        } else {
+          throw acceptErr
+        }
+      }
 
       // Execute (executor.runningTasks will track it from here)
       await this.executor.execute(task)
