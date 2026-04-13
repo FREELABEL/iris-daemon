@@ -1,0 +1,25 @@
+{
+  "name": "iris-daemon",
+  "version": "2.0.0",
+  "description": "IRIS Hive Daemon — turns any machine into a sovereign compute node. Executes tasks, runs scripts, manages schedules, and connects to the IRIS mesh network. Includes session bridge, bot channels, and browser automation.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "daemon": "node daemon.js",
+    "status": "curl -s http://localhost:3200/health",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "bonjour-service": "^1.2.1",
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.3.0",
+    "express": "^4.18.0",
+    "form-data": "^4.0.0",
+    "node-cron": "^3.0.3",
+    "node-pty": "^1.1.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "pusher-js": "^8.4.0",
+    "ssh2": "^1.17.0"
+  }
+}

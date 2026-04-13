@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  IRIS Compute Node — macOS LaunchAgent
+
+  This plist lives in ~/Library/LaunchAgents/ (user-level ONLY).
+  Never install in /Library/LaunchDaemons/ (system-level).
+
+  LaunchAgents inherit the user's environment (Ollama, GPU, etc.)
+  and cannot escalate privileges. If compromised, damage is limited
+  to the user's home directory — no root access, no system files.
+
+  Installed by: installers/install.sh
+  Removed by:   installers/uninstall.sh
+-->
+<dict>
+  <!-- Unique identifier -->
+  <key>Label</key>
+  <string>io.heyiris.daemon</string>
+
+  <!-- Launch the wrapper script (resolves PATH + env vars) -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.iris/iris-daemon-wrapper.sh</string>
+  </array>
+
+  <!-- Start when user logs in -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on crash -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Working directory -->
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.iris/daemon</string>
+
+  <!-- Log files -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/.iris/logs/daemon.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.iris/logs/daemon.stderr.log</string>
+
+  <!-- Background process — macOS deprioritizes CPU -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Throttle restarts: wait 10s between crashes -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Environment variables (wrapper script handles the rest) -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IRIS_DIR</key>
+    <string>__HOME__/.iris</string>
+  </dict>
+</dict>
+</plist>
