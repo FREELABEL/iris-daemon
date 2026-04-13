@@ -481,10 +481,10 @@ function startDaemon () {
     process.on('SIGTERM', () => cleanup('SIGTERM'))
 
     daemon.start().catch((err) => {
-      console.error('Daemon failed to start:', err.message)
-      ipcServer.close()
-      cleanupSocket()
-      process.exit(1)
+      console.error('Daemon cloud auth failed:', err.message)
+      console.error('[daemon] Running in OFFLINE mode — local schedules and HTTP server still active')
+      console.error('[daemon] Cloud tasks will not be dispatched until auth is fixed')
+      console.error('[daemon] Retry: iris bridge restart')
     })
   })
 
