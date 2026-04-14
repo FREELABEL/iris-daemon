@@ -285,13 +285,21 @@ class TaskExecutor {
         console.log(`[executor] Fetching ${task.config.platform} credentials for bloq ${task.config.bloq_id}...`)
         const credResult = await this.cloud.fetchTaskCredentials(taskId)
         if (credResult?.credentials) {
-          credentialFilePath = path.join(workspace.dir, 'session-auth.json')
-          fs.writeFileSync(credentialFilePath, JSON.stringify(credResult.credentials), 'utf-8')
-          fs.chmodSync(credentialFilePath, '600')
-          // Inject into task config so spawn picks it up via env vars
-          task.config.env_vars = task.config.env_vars || {}
-          task.config.env_vars.BROWSER_SESSION_FILE = credentialFilePath
-          console.log(`[executor] Credentials written to ${credentialFilePath}`)
+          // For api_key credentials, inject as env vars directly (n8n, etc.)
+          if (credResult.env_vars && typeof credResult.env_vars === 'object') {
+            task.config.env_vars = task.config.env_vars || {}
+            Object.assign(task.config.env_vars, credResult.env_vars)
+            console.log(`[executor] Injected ${Object.keys(credResult.env_vars).length} env vars from ${task.config.platform} credentials`)
+          }
+          // For browser_session credentials, write to file
+          if (credResult.credential_type !== 'api_key') {
+            credentialFilePath = path.join(workspace.dir, 'session-auth.json')
+            fs.writeFileSync(credentialFilePath, JSON.stringify(credResult.credentials), 'utf-8')
+            fs.chmodSync(credentialFilePath, '600')
+            task.config.env_vars = task.config.env_vars || {}
+            task.config.env_vars.BROWSER_SESSION_FILE = credentialFilePath
+            console.log(`[executor] Browser session written to ${credentialFilePath}`)
+          }
         }
       } catch (err) {
         console.warn(`[executor] No credentials available for task ${taskId}: ${err.message}`)
