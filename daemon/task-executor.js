@@ -72,6 +72,41 @@ function parseKeyValuePrompt (prompt) {
   return tokens
 }
 
+// Load project .env vars that child processes need (n8n, etc.)
+// Cached so we only read from disk once per daemon session.
+let _projectEnvCache = null
+function loadProjectEnv () {
+  if (_projectEnvCache !== null) return _projectEnvCache
+  _projectEnvCache = {}
+  const envKeys = ['N8N_EMAIL', 'N8N_PASSWORD', 'N8N_URL', 'N8N_WORKFLOW_ID']
+  // 1. Check ~/.iris/bridge/.env
+  const bridgeEnv = path.join(os.homedir(), '.iris', 'bridge', '.env')
+  // 2. Check freelabel fl-docker-dev/.env
+  const flPath = findFreelabelPath()
+  const flEnv = flPath ? path.join(flPath, 'fl-docker-dev', '.env') : null
+  for (const envFile of [bridgeEnv, flEnv]) {
+    if (!envFile || !fs.existsSync(envFile)) continue
+    try {
+      const lines = fs.readFileSync(envFile, 'utf-8').split('\n')
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+        const eq = trimmed.indexOf('=')
+        if (eq < 1) continue
+        const key = trimmed.slice(0, eq).trim()
+        const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+        if (envKeys.includes(key) && val && !_projectEnvCache[key]) {
+          _projectEnvCache[key] = val
+        }
+      }
+    } catch { /* skip */ }
+  }
+  if (Object.keys(_projectEnvCache).length > 0) {
+    console.log(`[executor] Loaded project env: ${Object.keys(_projectEnvCache).join(', ')}`)
+  }
+  return _projectEnvCache
+}
+
 // Auto-detect freelabel project root (looks for som:creators npm script)
 function findFreelabelPath () {
   // 1. Explicit env var
@@ -821,6 +856,59 @@ class TaskExecutor {
           break
         }
 
+        case 'remotion_carousel': {
+          // prompt = JSON string with full carousel props
+          // e.g. '{"brand":"freelabel","headline":"5 Ways...","tips":[...],...}'
+          // Renders CarouselSlide0..CarouselSlide8 as PNGs
+          const remotionRoot = findRemotionPath()
+          if (!remotionRoot) {
+            reject(new Error('Remotion not installed. Run: curl -fsSL https://heyiris.io/install-code | bash'))
+            return
+          }
+
+          try {
+            await ensureRemotionInstalled(remotionRoot)
+          } catch (e) {
+            reject(new Error(`Remotion dependency install failed: ${e.message}`))
+            return
+          }
+
+          // Parse carousel props from prompt (JSON)
+          let carouselProps
+          try {
+            carouselProps = JSON.parse(task.prompt)
+          } catch (e) {
+            reject(new Error(`Invalid carousel JSON: ${e.message}`))
+            return
+          }
+
+          // Write a bash script that renders all 9 slides
+          const outputDir = path.join(workspace.dir, 'slides')
+          fs.mkdirSync(outputDir, { recursive: true })
+
+          const slideCommands = []
+          for (let i = 0; i < 9; i++) {
+            const slideProps = JSON.stringify({ ...carouselProps, slideIndex: i })
+            const outFile = path.join(outputDir, `slide-${i}.png`)
+            slideCommands.push(
+              `echo "[carousel] Rendering slide ${i}/8..."`,
+              `npx remotion still CarouselSlide${i} "${outFile}" --props '${slideProps.replace(/'/g, "'\\''")}'`
+            )
+          }
+          slideCommands.push(`echo "[carousel] All 9 slides rendered to ${outputDir}"`)
+          slideCommands.push(`ls -la "${outputDir}"`)
+
+          const scriptContent = `#!/bin/bash\nset -e\ncd "${remotionRoot}"\n${slideCommands.join('\n')}\n`
+          const scriptPath = path.join(workspace.dir, 'render-carousel.sh')
+          fs.writeFileSync(scriptPath, scriptContent, 'utf-8')
+          fs.chmodSync(scriptPath, '755')
+
+          cmd = '/bin/bash'
+          args = [scriptPath]
+          workspace.projectDir = remotionRoot
+          break
+        }
+
         case 'instagram': {
           // prompt format: "{campaign} [key=value ...]"
           // e.g. "inbox account=heyiris.io board=38 wb=1"
@@ -875,6 +963,27 @@ class TaskExecutor {
             args = ['run', 'som:all', '--', `only=custom`, `enrich=1`, `enrich_goal=email`, `limit=0`]
             workspace.projectDir = enrichRoot
           }
+          break
+        }
+
+        case 'venue_outreach': {
+          // Venue discovery + enrichment + email outreach pipeline
+          // prompt format: "{city} [key=value ...]"
+          // e.g. "las-vegas limit=20 discover=1 enrich=1 email=1 dry=1"
+          // e.g. "las-vegas,seattle,atlanta discover=1 limit=15"
+          const venueParts = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
+          const venueCity = venueParts[0] || 'las-vegas'
+          const venueExtraArgs = venueParts.slice(1)
+
+          const venueRoot = this.freelabelPath || findFreelabelPath()
+          if (!venueRoot) {
+            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            return
+          }
+
+          cmd = 'npm'
+          args = ['run', 'venue:outreach', '--', venueCity, ...venueExtraArgs]
+          workspace.projectDir = venueRoot
           break
         }
 
@@ -1686,6 +1795,7 @@ exit 1
         cwd: workspace.projectDir,
         env: {
           ...process.env,
+          ...loadProjectEnv(),
           PATH: spawnPath,
           TASK_ID: task.id,
           TASK_TYPE: task.type,
@@ -1816,6 +1926,7 @@ exit 1
         cwd: workspace.projectDir,
         env: {
           ...process.env,
+          ...loadProjectEnv(),
           PATH: `${irisPathRuntime}:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
           TASK_ID: task.id,
           TASK_TYPE: task.type,
