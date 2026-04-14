@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)"
+case "${1:-status}" in
+    start)
+        PID=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -n "$PID" ]; then echo "Bridge already running (PID: $PID)"; exit 0; fi
+        nohup node "$BRIDGE_DIR/index.js" > "$BRIDGE_DIR/bridge.log" 2>&1 &
+        sleep 2
+        if curl -s "http://localhost:3200/health" > /dev/null 2>&1; then
+            echo "Bridge started on http://localhost:3200 (PID: $!)"
+        else
+            echo "Failed to start. Check: cat $BRIDGE_DIR/bridge.log"; exit 1
+        fi ;;
+    stop)
+        PID=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; echo "Stopped (PID: $PID)"
+        else echo "Not running"; fi ;;
+    restart) "$0" stop; sleep 1; "$0" start ;;
+    status)
+        if curl -s "http://localhost:3200/health" > /dev/null 2>&1; then
+            echo "Running (PID: $(lsof -ti :3200 2>/dev/null || true))"
+        else echo "Not running"; fi ;;
+    logs) tail -f "$BRIDGE_DIR/bridge.log" ;;
+    *) echo "Usage: iris-bridge {start|stop|restart|status|logs}" ;;
+esac

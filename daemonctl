@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+REAL_SCRIPT="$0"
+[ -L "$REAL_SCRIPT" ] && REAL_SCRIPT="$(readlink "$REAL_SCRIPT")"
+BRIDGE_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
+IRIS_CONFIG="$HOME/.iris/config.json"
+
+has_node_key() {
+    [ -n "${IRIS_API_KEY:-}" ] && return 0
+    [ -f "$BRIDGE_DIR/.env" ] && return 0
+    [ -f "$IRIS_CONFIG" ] && grep -q '"node_api_key"' "$IRIS_CONFIG" 2>/dev/null && return 0
+    return 1
+}
+
+case "${1:-status}" in
+    start)
+        if ! has_node_key; then
+            # Self-heal: auto-register if SDK token exists
+            if [ -f "$HOME/.iris/sdk/.env" ]; then
+                _TOKEN=$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
+                _UID=$(grep IRIS_USER_ID "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
+                if [ -n "$_TOKEN" ]; then
+                    echo "No node key found. Auto-registering..."
+                    _HLABEL=$(hostname -s 2>/dev/null || echo "My-Machine")
+                    _HDOCK=$(command -v docker >/dev/null 2>&1 && echo "true" || echo "false")
+                    _RESP=$(curl -sL --max-time 10 \
+                        -H "Authorization: Bearer $_TOKEN" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"name\": \"$_HLABEL\", \"capabilities\": {\"docker\": $_HDOCK}}" \
+                        "https://apiv2.heyiris.io/api/v1/hive/register-node" 2>/dev/null || echo '{}')
+                    _NKEY=$(echo "$_RESP" | jq -r '.node_key // empty' 2>/dev/null || \
+                            echo "$_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node_key',''))" 2>/dev/null || \
+                            echo "$_RESP" | sed -n 's/.*"node_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                    if [ -n "$_NKEY" ] && [ "$_NKEY" != "null" ]; then
+                        printf '{"node_api_key":"%s","user_id":%s,"api_url":"https://fl-iris-api-v5-mnmol.ondigitalocean.app"}\n' "$_NKEY" "${_UID:-0}" > "$IRIS_CONFIG"
+                        chmod 600 "$IRIS_CONFIG"
+                        echo "Registered! Continuing to start daemon..."
+                    else
+                        echo "Auto-registration failed. Register manually:"
+                        echo "  iris-daemon register"
+                        exit 1
+                    fi
+                fi
+            fi
+            # Re-check after auto-registration attempt
+            if ! has_node_key; then
+                echo "No API key configured."
+                echo "  Authenticate:  iris-login"
+                echo "  Then register: iris-daemon register"
+                exit 1
+            fi
+        fi
+        SOCK="$HOME/.iris/daemon.sock"
+        if [ -S "$SOCK" ] && node -e "require('net').createConnection('$SOCK',()=>{console.log('alive');process.exit(0)}).on('error',()=>process.exit(1))" 2>/dev/null; then
+            echo "Daemon already running"; exit 0
+        fi
+        rm -f "$SOCK"
+        # Ensure Node 18+ for Playwright compatibility in child processes
+        DAEMON_NODE="$(which node)"
+        if [ -d "$HOME/.nvm/versions/node" ]; then
+            for _v in 22 20 18; do
+                _NVM_DIR=$(find "$HOME/.nvm/versions/node" -maxdepth 1 -name "v${_v}.*" -type d 2>/dev/null | sort -rV | head -1)
+                if [ -n "$_NVM_DIR" ] && [ -x "$_NVM_DIR/bin/node" ]; then
+                    DAEMON_NODE="$_NVM_DIR/bin/node"
+                    export PATH="$_NVM_DIR/bin:$PATH"
+                    break
+                fi
+            done
+        fi
+        nohup "$DAEMON_NODE" "$BRIDGE_DIR/daemon.js" > "$BRIDGE_DIR/daemon.log" 2>&1 &
+        sleep 3
+        if [ -S "$SOCK" ]; then
+            echo "Hive daemon started (PID: $!)"
+            echo "Your machine is now a compute node in IRIS Hive."
+        else
+            echo "Daemon failed to start. Check logs: iris-daemon logs"
+            tail -5 "$BRIDGE_DIR/daemon.log" 2>/dev/null
+            exit 1
+        fi ;;
+    stop)
+        SOCK="$HOME/.iris/daemon.sock"
+        PID=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; echo "Daemon stopped (PID: $PID)"
+        elif [ -S "$SOCK" ]; then rm -f "$SOCK"; echo "Cleaned stale socket"
+        else echo "Not running"; fi ;;
+    restart) "$0" stop; sleep 1; "$0" start ;;
+    status)
+        SOCK="$HOME/.iris/daemon.sock"
+        if [ -S "$SOCK" ]; then
+            node "$BRIDGE_DIR/daemon.js" --status 2>/dev/null || echo "Not running. Start with: iris-daemon start"
+        else echo "Not running. Start with: iris-daemon start"; fi ;;
+    logs) tail -f "$BRIDGE_DIR/daemon.log" ;;
+    register)
+        if [ ! -f "$HOME/.iris/sdk/.env" ] || [ -z "$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)" ]; then
+            if command -v iris-login >/dev/null 2>&1; then
+                echo "Not authenticated. Running iris-login..."
+                iris-login
+                # Re-check after login
+                if [ ! -f "$HOME/.iris/sdk/.env" ]; then echo "Auth failed."; exit 1; fi
+            else
+                echo "Not authenticated. Run 'iris-login' first."
+                exit 1
+            fi
+        fi
+        SDK_TOKEN=$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" | cut -d= -f2)
+        if [ -z "$SDK_TOKEN" ]; then
+            echo "SDK token not found. Run 'iris-login' first."
+            exit 1
+        fi
+        HOSTNAME_LABEL=$(hostname -s 2>/dev/null || echo "My Machine")
+        HAS_DOCKER=$(command -v docker >/dev/null 2>&1 && echo "true" || echo "false")
+        USER_ID=$(grep IRIS_USER_ID "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
+        echo "Registering $(hostname -s) as Hive compute node..."
+        REG_TMP=$(mktemp 2>/dev/null || echo "/tmp/iris-reg-$$")
+        HTTP_CODE=$(curl -sL --max-time 10 -o "$REG_TMP" -w "%{http_code}" \
+            -H "Authorization: Bearer $SDK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$HOSTNAME_LABEL\", \"capabilities\": {\"docker\": $HAS_DOCKER}}" \
+            "https://apiv2.heyiris.io/api/v1/hive/register-node" 2>/dev/null || echo "000")
+        RESP=$(cat "$REG_TMP" 2>/dev/null || echo '{}'); rm -f "$REG_TMP"
+        NODE_KEY=$(echo "$RESP" | jq -r '.node_key // empty' 2>/dev/null || \
+                   echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node_key',''))" 2>/dev/null || \
+                   echo "$RESP" | sed -n 's/.*"node_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        if [ -n "$NODE_KEY" ] && [ "$NODE_KEY" != "null" ]; then
+            mkdir -p "$HOME/.iris"
+            printf '{"node_api_key":"%s","user_id":%s,"api_url":"https://fl-iris-api-v5-mnmol.ondigitalocean.app"}\n' "$NODE_KEY" "${USER_ID:-0}" > "$IRIS_CONFIG"
+            chmod 600 "$IRIS_CONFIG"
+            echo "Registered! Node key saved to ~/.iris/config.json"
+            echo "Start with: iris-daemon start"
+        else
+            case "$HTTP_CODE" in
+                000) echo "Registration failed: network unreachable." ;;
+                401) echo "Registration failed: token not authorized."
+                     echo "  Your SDK token may be expired. Run: iris-login" ;;
+                5*)  echo "Registration failed: server error ($HTTP_CODE). Try again later." ;;
+                *)   echo "Registration failed (HTTP $HTTP_CODE)."
+                     echo "$RESP" | head -c 200 ;;
+            esac
+            echo "  Manual setup: https://app.heyiris.io/dashboard/hive"
+        fi ;;
+    session)
+        shift
+        # Prefer Node 18+ (Playwright requirement)
+        SESSION_NODE="node"
+        if [ -d "$HOME/.nvm" ]; then
+            for v in 22 20 18; do
+                NVM_NODE=$(find "$HOME/.nvm/versions/node" -maxdepth 1 -name "v${v}.*" -type d 2>/dev/null | sort -rV | head -1)
+                if [ -n "$NVM_NODE" ] && [ -x "$NVM_NODE/bin/node" ]; then
+                    SESSION_NODE="$NVM_NODE/bin/node"; break
+                fi
+            done
+        fi
+        case "${1:-}" in
+            save)
+                PLATFORM="${2:-}"
+                if [ -z "$PLATFORM" ]; then
+                    echo "Usage: iris bridge session save <platform>"
+                    echo "  Platforms: youtube, instagram, twitter, linkedin"
+                    exit 1
+                fi
+                "$SESSION_NODE" "$BRIDGE_DIR/scripts/save-session.js" "$PLATFORM" ;;
+            list|ls)
+                "$SESSION_NODE" "$BRIDGE_DIR/scripts/save-session.js" list ;;
+            *)
+                echo "Usage: iris bridge session {save <platform>|list}"
+                echo "  save <platform>   Open browser to save login session"
+                echo "  list              Show saved sessions" ;;
+        esac ;;
+    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|session}" ;;
+esac

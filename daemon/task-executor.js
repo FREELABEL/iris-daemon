@@ -26,6 +26,24 @@ const os = require('os')
 const https = require('https')
 const http = require('http')
 
+// Resolve a Node 18+ binary path for child processes (Playwright requirement)
+function resolveNode18Path () {
+  const nvmDir = path.join(os.homedir(), '.nvm', 'versions', 'node')
+  if (!fs.existsSync(nvmDir)) return null
+  for (const major of [22, 20, 18]) {
+    try {
+      const dirs = fs.readdirSync(nvmDir).filter(d => d.startsWith(`v${major}.`)).sort().reverse()
+      if (dirs.length > 0) {
+        const binDir = path.join(nvmDir, dirs[0], 'bin')
+        if (fs.existsSync(path.join(binDir, 'node'))) return binDir
+      }
+    } catch { /* skip */ }
+  }
+  return null
+}
+
+const _node18BinDir = resolveNode18Path()
+
 /**
  * Split a prompt string into key=value tokens, preserving values that contain spaces.
  * e.g. "courses limit=20 strategy=AI Course | V3 dry=1"
@@ -968,6 +986,17 @@ class TaskExecutor {
             return
           }
 
+          // Auto-inject local browser session for YouTube tasks
+          if (discoverSubcommand.includes('yt') || discoverSubcommand.includes('youtube')) {
+            const localSession = path.join(os.homedir(), '.iris', 'sessions', 'youtube.json')
+            if (!task.config?.env_vars?.BROWSER_SESSION_FILE && fs.existsSync(localSession)) {
+              task.config = task.config || {}
+              task.config.env_vars = task.config.env_vars || {}
+              task.config.env_vars.BROWSER_SESSION_FILE = localSession
+              console.log(`[executor] Using local YouTube session: ${localSession}`)
+            }
+          }
+
           cmd = 'npm'
           args = ['run', `discover:${discoverSubcommand}`, '--', ...discoverExtraArgs]
           workspace.projectDir = discoverRoot
@@ -1648,13 +1677,16 @@ exit 1
 
       console.log(`[executor] Running: ${cmd} ${args.slice(0, 2).join(' ')}...`)
 
-      // Ensure IRIS CLI is in PATH for spawned scripts
+      // Prepend Node 18+ and IRIS CLI to PATH for spawned processes
       const irisPath = path.join(os.homedir(), '.iris', 'bin')
+      const basePath = process.env.PATH || '/usr/local/bin:/usr/bin:/bin'
+      const spawnPath = [_node18BinDir, irisPath, basePath].filter(Boolean).join(':')
+
       const child = spawn(cmd, args, {
         cwd: workspace.projectDir,
         env: {
           ...process.env,
-          PATH: `${irisPath}:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
+          PATH: spawnPath,
           TASK_ID: task.id,
           TASK_TYPE: task.type,
           WORKSPACE_DIR: workspace.dir,
