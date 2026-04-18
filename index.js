@@ -17,7 +17,7 @@ app.use(express.json({ limit: '10mb' }))
 // CORS — allow the Elon frontend (localhost:9300) to call health/status directly
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
-  res.header('Access-Control-Allow-Headers', 'Content-Type')
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept')
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
@@ -29,7 +29,7 @@ const PORT = process.env.BRIDGE_PORT || 3200
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude'
 const OPENCODE_BIN = process.env.OPENCODE_BIN || '/opt/homebrew/bin/opencode'
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'
-const IRIS_API_URL = process.env.IRIS_API_URL || 'https://app.heyiris.io'
+const IRIS_API_URL = process.env.IRIS_API_URL || 'https://web.heyiris.io'
 const BRIDGE_VERSION = require('./package.json').version
 
 // ─── Messaging Bot State ────────────────────────────────────────
@@ -348,6 +348,445 @@ function stopAllDiscordBots () {
   }
 }
 
+// ─── OBS Studio (WebSocket Control) ──────────────────────────────
+
+const OBSChannel = require('./channels/obs')
+let obsChannel = null
+
+app.post('/api/providers/obs', async (req, res) => {
+  const { ws_url, password } = req.body
+  try {
+    if (obsChannel) await obsChannel.stop()
+    obsChannel = new OBSChannel({ wsUrl: ws_url || 'ws://localhost:4455', password: password || undefined })
+    await obsChannel.start()
+    res.json({ status: 'running', host: obsChannel.config.wsUrl })
+  } catch (err) {
+    console.error('[obs] Start failed:', err.message)
+    res.status(400).json({ error: err.message })
+  }
+})
+
+app.delete('/api/providers/obs', async (req, res) => {
+  if (obsChannel) { await obsChannel.stop(); obsChannel = null }
+  res.json({ ok: true })
+})
+
+app.get('/api/obs/scenes', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected. POST /api/providers/obs to connect.' })
+  try { res.json(await obsChannel.getScenes()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/scene', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  const { scene_name } = req.body
+  if (!scene_name) return res.status(400).json({ error: 'scene_name required' })
+  try { res.json(await obsChannel.setScene(scene_name)) } catch (e) { res.status(400).json({ error: e.message }) }
+})
+
+app.post('/api/obs/stream/start', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.startStream()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/stream/stop', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.stopStream()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/obs/stream/status', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.getStreamStatus()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/record/start', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.startRecord()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/record/stop', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.stopRecord()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/obs/record/status', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.getRecordStatus()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/marker', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.createMarker(req.body.description)) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/obs/audio/mute', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  const { input, muted } = req.body
+  if (!input) return res.status(400).json({ error: 'input name required' })
+  try { res.json(await obsChannel.setInputMute(input, muted !== false)) } catch (e) { res.status(400).json({ error: e.message }) }
+})
+
+app.get('/api/obs/inputs', async (req, res) => {
+  if (!obsChannel?.isRunning) return res.status(503).json({ error: 'OBS not connected' })
+  try { res.json(await obsChannel.getInputList()) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ─── OBS Dashboard (browser-based scene controller) ──────────────
+
+app.get('/obs-dashboard', async (req, res) => {
+  // Fetch live scenes from OBS if connected
+  let scenes = []
+  let current = ''
+  let streamActive = false
+  let recordActive = false
+  if (obsChannel?.isRunning) {
+    try {
+      const s = await obsChannel.getScenes()
+      scenes = s.scenes || []
+      current = s.current || ''
+    } catch {}
+    try { const st = await obsChannel.getStreamStatus(); streamActive = st.active } catch {}
+    try { const rc = await obsChannel.getRecordStatus(); recordActive = rc.active } catch {}
+  }
+
+  // Load event timeline from local JSON
+  let eventData = null
+  try {
+    const fs = require('fs')
+    const path = require('path')
+    const home = process.env.HOME || ''
+    const eventsDir = path.join(home, '.iris', 'events')
+    // Find event files, prefer the one from query param or most recent
+    const eventId = req.query.event || '1343'
+    const files = fs.readdirSync(eventsDir).filter(f => f.startsWith(eventId + '-') && f.endsWith('.json'))
+    if (files.length > 0) {
+      eventData = JSON.parse(fs.readFileSync(path.join(eventsDir, files[0]), 'utf8'))
+    }
+  } catch {}
+
+  // Build merged timeline — one entry per time block, Performance Stage takes priority
+  const timeline = []
+  if (eventData) {
+    const stages = eventData.stages || eventData.event_stages || []
+    // Group set times by time slot, prioritize Performance > Host > Judges
+    const stagePriority = { 'Performance Stage': 1, 'Host Stage': 2, 'Judges Stage': 3 }
+    const timeSlots = new Map() // key: start_time, value: best entry
+
+    for (const stage of stages) {
+      const setTimes = stage.set_times || stage.event_stage_set_times || []
+      for (const st of setTimes) {
+        const key = st.start_time || ''
+        const priority = stagePriority[stage.title] || 99
+        const existing = timeSlots.get(key)
+        if (!existing || priority < existing._priority) {
+          timeSlots.set(key, {
+            time: st.start_time || '',
+            end: st.end_time || '',
+            title: st.title || st.name || '',
+            stage: stage.title || '',
+            description: st.description || '',
+            _priority: priority,
+          })
+        }
+      }
+    }
+
+    // Add show entries from merged set times
+    for (const entry of timeSlots.values()) {
+      delete entry._priority
+      timeline.push(entry)
+    }
+
+    // Add production timeline
+    const prodTimeline = (eventData.metadata || {}).production_timeline || []
+    for (const pt of prodTimeline) {
+      timeline.push({ time: pt.time, title: pt.task, stage: 'Production', description: '', isProd: true })
+    }
+    timeline.sort((a, b) => (a.time || '').localeCompare(b.time || ''))
+  }
+
+  const html = `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>${eventData?.title || 'Stream Control'} — FreeLabel</title>
+<link rel="icon" href="https://iris-cdn.sfo3.cdn.digitaloceanspaces.com/assets/freelabel/favicon.png">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a0a; color: #fff; font-family: -apple-system, system-ui, sans-serif; padding: 12px; min-height: 100vh; }
+  h1 { font-size: 16px; text-align: center; margin-bottom: 4px; color: #eab308; }
+  .subtitle { text-align: center; font-size: 12px; color: #666; margin-bottom: 12px; }
+  .status-bar { display: flex; justify-content: center; gap: 16px; margin-bottom: 12px; font-size: 12px; color: #666; }
+  .status-bar .live { color: #ef4444; font-weight: 700; }
+  .status-bar .ready { color: #22c55e; }
+  .current { text-align: center; font-size: 13px; color: #eab308; margin-bottom: 12px; font-weight: 600; }
+  .tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 1px solid #222; }
+  .tab { flex: 1; padding: 10px; text-align: center; font-size: 12px; font-weight: 600; color: #666; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { color: #eab308; border-bottom-color: #eab308; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #555; margin: 12px 0 6px; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px; }
+  .grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .btn {
+    background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
+    color: #fff; padding: 14px 8px; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: all 0.15s; text-align: center;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { background: #333; transform: scale(0.97); }
+  .btn.active { border-color: #eab308; background: #1a1800; color: #eab308; }
+  .btn.cam { background: #0a1628; border-color: #1e3a5f; }
+  .btn.cam.active { background: #0a2040; border-color: #3b82f6; color: #60a5fa; }
+  .btn.sm { padding: 10px 6px; font-size: 11px; }
+  .btn.danger { border-color: #7f1d1d; color: #ef4444; }
+  .btn.success { border-color: #14532d; color: #22c55e; }
+  .msg { text-align: center; font-size: 11px; color: #555; margin-top: 4px; min-height: 16px; }
+  .msg.ok { color: #22c55e; }
+  .msg.err { color: #ef4444; }
+  /* Timeline */
+  .tl-item { display: flex; gap: 10px; padding: 10px; border-left: 3px solid #222; margin-left: 4px; margin-bottom: 2px; transition: all 0.3s; }
+  .tl-item.now { border-left-color: #eab308; background: #1a1800; border-radius: 0 8px 8px 0; }
+  .tl-item.past { opacity: 0.4; }
+  .tl-item.prod { border-left-color: #333; }
+  .tl-item.prod.past { opacity: 0.25; }
+  .tl-time { font-size: 12px; font-weight: 700; color: #888; min-width: 50px; }
+  .tl-item.now .tl-time { color: #eab308; }
+  .tl-content { flex: 1; }
+  .tl-title { font-size: 13px; font-weight: 600; }
+  .tl-stage { font-size: 10px; color: #666; margin-top: 2px; }
+  .tl-desc { font-size: 11px; color: #555; margin-top: 3px; }
+  .tl-now-label { font-size: 9px; color: #eab308; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+  .tl-next-label { font-size: 9px; color: #60a5fa; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+  .tl-item.next { border-left-color: #3b82f6; background: #0a1628; border-radius: 0 8px 8px 0; }
+  .clock { text-align: center; font-size: 28px; font-weight: 700; color: #fff; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+</style>
+</head><body>
+
+<div style="text-align:center;margin-bottom:8px"><img src="https://iris-cdn.sfo3.cdn.digitaloceanspaces.com/assets/freelabel/fl-logo-white.png" alt="FreeLabel" style="height:28px;opacity:0.85" onerror="this.style.display='none'"><span style="display:block;font-size:10px;color:#555;letter-spacing:2px;margin-top:2px">STREAM CONTROL</span></div>
+<h1>${eventData?.title || 'OBS Controller'}</h1>
+<div class="subtitle">${eventData?.venue_name || ''} · ${eventData?.start_date || ''} · ${eventData?.start_time || ''}–${eventData?.end_time || ''}</div>
+
+<div class="clock" id="clock"></div>
+
+<div class="status-bar">
+  <span>Stream: <span id="stream-status" class="${streamActive ? 'live' : 'ready'}">${streamActive ? '● LIVE' : 'Ready'}</span></span>
+  <span>Rec: <span id="record-status" class="${recordActive ? 'live' : 'ready'}">${recordActive ? '● REC' : 'Ready'}</span></span>
+  <span>Scene: <span id="current-scene" style="color:#eab308">${current || '—'}</span></span>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showPanel('cameras')">Cameras</div>
+  <div class="tab" onclick="showPanel('timeline')">Timeline</div>
+  <div class="tab" onclick="showPanel('controls')">Controls</div>
+</div>
+
+<!-- Cameras Panel -->
+<div class="panel active" id="panel-cameras">
+  <div class="section-label">Quick Switch</div>
+  <div class="grid grid-3" id="cam-grid"></div>
+  <div class="section-label">All Scenes</div>
+  <div class="grid" id="scene-grid"></div>
+</div>
+
+<!-- Timeline Panel -->
+<div class="panel" id="panel-timeline">
+  <div id="timeline-list"></div>
+</div>
+
+<!-- Controls Panel -->
+<div class="panel" id="panel-controls">
+  <div class="section-label">Stream</div>
+  <div class="grid grid-3">
+    <button class="btn success sm" onclick="streamAction('start')">▶ Go Live</button>
+    <button class="btn danger sm" onclick="streamAction('stop')">■ End Stream</button>
+    <button class="btn sm" onclick="streamStatus()">📊 Status</button>
+  </div>
+  <div class="section-label">Recording</div>
+  <div class="grid grid-3">
+    <button class="btn success sm" onclick="recordAction('start')">⏺ Start</button>
+    <button class="btn danger sm" onclick="recordAction('stop')">■ Stop</button>
+    <button class="btn sm" onclick="recordStatus()">📊 Status</button>
+  </div>
+  <div class="section-label">Production</div>
+  <div class="grid grid-3">
+    <button class="btn sm" onclick="doMarker()">📌 Marker</button>
+    <button class="btn sm" onclick="switchScene('BE RIGHT BACK')">☕ BRB</button>
+    <button class="btn sm" onclick="switchScene('INTRO')">🎬 Intro</button>
+  </div>
+</div>
+
+<div class="msg" id="msg"></div>
+
+<script>
+const API = 'http://' + location.hostname + ':3200';
+const scenes = ${JSON.stringify(scenes.map(s => s.name))};
+const timeline = ${JSON.stringify(timeline)};
+let currentScene = '${current}';
+
+// Clock
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent = now.toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true});
+  updateTimeline();
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// Tabs
+function showPanel(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// Messages
+function msg(text, type) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (type || '');
+  if (type === 'ok') setTimeout(() => { el.textContent = ''; }, 2000);
+}
+
+// OBS Controls
+async function switchScene(name) {
+  try {
+    msg('Switching...', '');
+    await fetch(API + '/api/obs/scene', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({scene_name: name}) });
+    currentScene = name;
+    document.getElementById('current-scene').textContent = name;
+    updateButtons();
+    msg('✓ ' + name, 'ok');
+  } catch(e) { msg('Failed: ' + e.message, 'err'); }
+}
+
+async function streamAction(action) {
+  try {
+    msg(action === 'start' ? 'Going live...' : 'Stopping...', '');
+    await fetch(API + '/api/obs/stream/' + action, { method: 'POST' });
+    const s = document.getElementById('stream-status');
+    if (action === 'start') { s.textContent = '● LIVE'; s.className = 'live'; }
+    else { s.textContent = 'Ready'; s.className = 'ready'; }
+    msg('✓ Stream ' + action + 'ed', 'ok');
+  } catch(e) { msg('Failed: ' + e.message, 'err'); }
+}
+
+async function streamStatus() {
+  try {
+    const r = await fetch(API + '/api/obs/stream/status').then(r=>r.json());
+    msg(r.active ? 'LIVE ' + (r.timecode||'') + ' | ' + Math.round((r.bytes||0)/1024/1024) + 'MB' : 'Not streaming', r.active ? 'ok' : '');
+  } catch(e) { msg('Cannot reach OBS', 'err'); }
+}
+
+async function recordAction(action) {
+  try {
+    await fetch(API + '/api/obs/record/' + action, { method: 'POST' });
+    const s = document.getElementById('record-status');
+    if (action === 'start') { s.textContent = '● REC'; s.className = 'live'; msg('✓ Recording', 'ok'); }
+    else { s.textContent = 'Ready'; s.className = 'ready'; msg('✓ Stopped', 'ok'); }
+  } catch(e) { msg('Failed', 'err'); }
+}
+
+async function recordStatus() {
+  try {
+    const r = await fetch(API + '/api/obs/record/status').then(r=>r.json());
+    msg(r.active ? 'REC ' + (r.timecode||'') : 'Not recording', r.active ? 'ok' : '');
+  } catch(e) { msg('Cannot reach OBS', 'err'); }
+}
+
+async function doMarker() {
+  try {
+    await fetch(API + '/api/obs/marker', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({description: 'Marker @ ' + new Date().toLocaleTimeString()}) });
+    msg('✓ Marker set', 'ok');
+  } catch(e) { msg('Failed', 'err'); }
+}
+
+function updateButtons() {
+  document.querySelectorAll('[data-scene]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.scene === currentScene);
+  });
+}
+
+// Build camera + scene buttons
+const camGrid = document.getElementById('cam-grid');
+const sceneGrid = document.getElementById('scene-grid');
+const camPatterns = ['cam 1', 'cam 2', 'cam 3', 'eagle', 'webcam solo', 'webcam +'];
+scenes.forEach(name => {
+  const isCam = camPatterns.some(p => name.toLowerCase().includes(p));
+  const btn = document.createElement('button');
+  btn.className = 'btn sm' + (isCam ? ' cam' : '') + (name === currentScene ? ' active' : '');
+  btn.dataset.scene = name;
+  btn.textContent = name;
+  btn.onclick = () => switchScene(name);
+  (isCam ? camGrid : sceneGrid).appendChild(btn);
+});
+
+// Convert 24h "HH:MM" to "H:MM AM/PM"
+function to12h(t) {
+  if (!t) return '';
+  const [h, m] = t.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return h12 + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+}
+
+// Build timeline
+function updateTimeline() {
+  const list = document.getElementById('timeline-list');
+  const now = new Date();
+  const nowTime = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+
+  // Find the last item that has started (its time <= now)
+  let nowIndex = -1;
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    if (timeline[i].time <= nowTime) { nowIndex = i; break; }
+  }
+
+  let html = '';
+  for (let i = 0; i < timeline.length; i++) {
+    const item = timeline[i];
+    const isPast = i < nowIndex;
+    const isNow = i === nowIndex;
+    const cls = item.isProd ? 'tl-item prod' : 'tl-item';
+    const isNext = i === nowIndex + 1;
+    const state = isNow ? ' now' : isNext ? ' next' : isPast ? ' past' : '';
+
+    html += '<div class="' + cls + state + '" id="tl-' + i + '">';
+    html += '<div class="tl-time">' + to12h(item.time) + '</div>';
+    html += '<div class="tl-content">';
+    if (isNow) html += '<div class="tl-now-label">● NOW</div>';
+    if (i === nowIndex + 1) html += '<div class="tl-next-label">▸ NEXT</div>';
+    html += '<div class="tl-title">' + (item.title || '') + '</div>';
+    if (item.stage && !item.isProd) html += '<div class="tl-stage">' + item.stage + (item.end ? ' · until ' + to12h(item.end) : '') + '</div>';
+    if (item.description && !item.isProd) html += '<div class="tl-desc">' + item.description + '</div>';
+    html += '</div></div>';
+  }
+  list.innerHTML = html;
+
+  // Auto-scroll to NOW item
+  const nowEl = document.getElementById('tl-' + nowIndex);
+  if (nowEl) nowEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+updateTimeline();
+
+// Poll OBS status every 5s
+setInterval(async () => {
+  try {
+    const r = await fetch(API + '/api/obs/scenes');
+    const d = await r.json();
+    if (d.current && d.current !== currentScene) {
+      currentScene = d.current;
+      document.getElementById('current-scene').textContent = currentScene;
+      updateButtons();
+    }
+  } catch {}
+}, 5000);
+</script>
+</body></html>`;
+
+  res.type('html').send(html)
+})
+
 // ─── Health ───────────────────────────────────────────────────────
 
 app.get('/health', async (req, res) => {
@@ -387,6 +826,9 @@ app.get('/health', async (req, res) => {
         : { status: 'stopped' },
       imessage: iMessageChannel
         ? iMessageChannel.getStatus()
+        : { status: 'stopped' },
+      obs: obsChannel
+        ? obsChannel.getStatus()
         : { status: 'stopped' }
     }
   })
@@ -691,25 +1133,168 @@ app.get('/api/imessage/conversations', (req, res) => {
 
 /**
  * POST /api/imessage/direct-send
- * Send an iMessage directly to a chat GUID.
- * Body: { chat_guid: string, text: string }
+ * Send an iMessage by chat GUID or phone/email handle.
+ * Body: { chat_guid?: string, handle?: string, text: string }
+ * - chat_guid: send directly to a known chat GUID
+ * - handle: phone number or email — resolves to chat GUID automatically
+ * At least one of chat_guid or handle is required.
  */
 app.post('/api/imessage/direct-send', async (req, res) => {
-  const { chat_guid, text } = req.body
+  const { chat_guid, handle, text } = req.body
 
-  if (!chat_guid || !text) {
-    return res.status(400).json({ error: 'chat_guid and text are required' })
+  if (!text) {
+    return res.status(400).json({ error: 'text is required' })
+  }
+  if (!chat_guid && !handle) {
+    return res.status(400).json({ error: 'chat_guid or handle (phone/email) is required' })
   }
 
-  if (!iMessageChannel || !iMessageChannel.driver) {
-    return res.status(503).json({ error: 'iMessage channel not running. Start it first via POST /api/providers/imessage' })
+  // If we have a chat_guid, require the channel driver
+  if (chat_guid) {
+    if (!iMessageChannel || !iMessageChannel.driver) {
+      return res.status(503).json({ error: 'iMessage channel not running. Start it first via POST /api/providers/imessage' })
+    }
+
+    try {
+      await iMessageChannel.driver.sendMessage(chat_guid, text)
+      return res.json({ ok: true, chat_guid, preview: text.slice(0, 80) })
+    } catch (err) {
+      console.error(`[imessage/direct-send] Failed: ${err.message}`)
+      return res.status(500).json({ error: err.message })
+    }
+  }
+
+  // Handle-based send — try driver resolution first, fallback to AppleScript
+  if (iMessageChannel && iMessageChannel.driver && iMessageChannel.driver.sendToHandle) {
+    try {
+      const result = await iMessageChannel.driver.sendToHandle(handle, text)
+      return res.json({ ok: true, handle, method: result.method || 'chat_guid', preview: text.slice(0, 80) })
+    } catch (err) {
+      console.error(`[imessage/direct-send] Driver sendToHandle failed: ${err.message}`)
+      // Fall through to AppleScript fallback
+    }
+  }
+
+  // Standalone fallback: AppleScript buddy-based send (works even without driver running)
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'iMessage send requires macOS' })
   }
 
   try {
-    await iMessageChannel.driver.sendMessage(chat_guid, text)
-    res.json({ ok: true, chat_guid, preview: text.slice(0, 80) })
+    const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    const script =
+      `tell application "Messages"\n` +
+      `  set targetService to 1st account whose service type = iMessage\n` +
+      `  set targetBuddy to participant "${handle}" of targetService\n` +
+      `  send "${escaped}" to targetBuddy\n` +
+      `end tell`
+
+    const { execFile } = require('child_process')
+    await new Promise((resolve, reject) => {
+      execFile('/usr/bin/osascript', ['-e', script], { timeout: 15000 }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = (stderr || err.message || '').trim()
+          return reject(new Error(msg.slice(0, 300)))
+        }
+        resolve(stdout)
+      })
+    })
+
+    res.json({ ok: true, handle, method: 'applescript_buddy', preview: text.slice(0, 80) })
   } catch (err) {
-    console.error(`[imessage/direct-send] Failed: ${err.message}`)
+    console.error(`[imessage/direct-send] AppleScript fallback failed: ${err.message}`)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/imessage/send
+ * Send an iMessage by phone number or email (handle-first convenience endpoint).
+ * Body: { handle: string, text: string }
+ * Alias for /api/imessage/direct-send with handle param.
+ */
+app.post('/api/imessage/send', async (req, res) => {
+  // Rewrite to direct-send format and forward
+  req.body.handle = req.body.handle || req.body.to || req.body.phone
+  req.url = '/api/imessage/direct-send'
+  app.handle(req, res)
+})
+
+/**
+ * GET /api/imessage/resolve
+ * Resolve a phone number or email to a chat GUID without sending.
+ * Query: ?handle=<phone_or_email>
+ * Returns: { chat_guid, handle_id } or { error }
+ */
+app.get('/api/imessage/resolve', async (req, res) => {
+  const handle = (req.query.handle || '').toString().trim()
+  if (!handle) {
+    return res.status(400).json({ error: 'handle query param is required (phone or email)' })
+  }
+
+  if (iMessageChannel && iMessageChannel.driver && iMessageChannel.driver.resolveHandleToGuid) {
+    try {
+      const guid = await iMessageChannel.driver.resolveHandleToGuid(handle)
+      if (guid) {
+        return res.json({ chat_guid: guid, handle, resolved: true })
+      }
+      return res.json({ chat_guid: null, handle, resolved: false, hint: 'No existing chat found for this handle' })
+    } catch (err) {
+      return res.status(500).json({ error: err.message })
+    }
+  }
+
+  // Standalone fallback: query chat.db directly
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'iMessage resolve requires macOS' })
+  }
+
+  const digits = handle.replace(/\D/g, '')
+  const lower = handle.toLowerCase()
+  const conditions = []
+  if (digits.length >= 7) {
+    conditions.push(
+      `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', ''), ')', '') LIKE '%${digits}%'`
+    )
+  }
+  conditions.push(`LOWER(h.id) LIKE '%${lower.replace(/'/g, "''").replace(/%/g, '')}%'`)
+
+  const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
+  const sql = `
+    SELECT c.guid AS chat_guid, c.chat_identifier, h.id AS handle_id,
+      MAX(m.date) AS last_date
+    FROM chat c
+    INNER JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
+    INNER JOIN handle h ON h.ROWID = chj.handle_id
+    LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+    LEFT JOIN message m ON m.ROWID = cmj.message_id
+    WHERE (${conditions.join(' OR ')})
+    GROUP BY c.guid
+    ORDER BY last_date DESC
+    LIMIT 5`
+
+  try {
+    const { execFile } = require('child_process')
+    const rows = await new Promise((resolve, reject) => {
+      execFile('/usr/bin/sqlite3', ['-readonly', '-json', '-bail', chatDbPath, sql],
+        { timeout: 10000 }, (err, stdout, stderr) => {
+          if (err) {
+            const msg = (stderr || err.message || '').trim()
+            if (msg.includes('unable to open') || msg.includes('authorization denied')) {
+              return reject(new Error('Cannot read chat.db. Grant Full Disk Access.'))
+            }
+            return reject(new Error(msg.slice(0, 300)))
+          }
+          try { resolve(stdout.trim() ? JSON.parse(stdout) : []) }
+          catch (e) { reject(new Error(`parse: ${e.message}`)) }
+        })
+    })
+
+    if (rows.length > 0) {
+      return res.json({ chat_guid: rows[0].chat_guid, handle, handle_id: rows[0].handle_id, resolved: true, all: rows })
+    }
+    res.json({ chat_guid: null, handle, resolved: false, hint: 'No existing chat found' })
+  } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
@@ -725,7 +1310,7 @@ app.post('/api/mail/send', async (req, res) => {
     return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
   }
 
-  const { to_email, to_name, cc_email, subject, body_text, attachments } = req.body
+  const { to_email, to_name, cc_email, subject, body_text, attachments, draft } = req.body
 
   if (!to_email || !subject || !body_text) {
     return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
@@ -756,13 +1341,18 @@ app.post('/api/mail/send', async (req, res) => {
     ).join('\n')
   }
 
+  // draft=true opens compose window without sending; default sends immediately
+  const isDraft = draft === true || draft === 'true'
+  const sendOrShow = isDraft
+    ? `  set visible of msg to true\n  activate`
+    : `  delay 1\n  send msg`
+
   const script = `tell application "Mail"
   set msg to make new outgoing message with properties {subject:"${escapedSubject}", content:"${escapedBody}", visible:false}
   make new to recipient at beginning of to recipients of msg with properties {name:"${escapedName}", address:"${escapedTo}"}
 ${ccLine}
 ${attachmentLines}
-  delay 1
-  send msg
+${sendOrShow}
 end tell`
 
   try {
@@ -777,8 +1367,9 @@ end tell`
       })
     })
 
-    console.log(`[apple-mail] Sent to ${to_email}: ${subject}`)
-    res.json({ ok: true, provider: 'apple-mail', to_email, subject })
+    const action = isDraft ? 'Drafted' : 'Sent'
+    console.log(`[apple-mail] ${action} to ${to_email}: ${subject}`)
+    res.json({ ok: true, provider: 'apple-mail', mode: isDraft ? 'draft' : 'sent', to_email, subject })
   } catch (err) {
     console.error(`[apple-mail] Send failed: ${err.message}`)
     res.status(500).json({ error: `Apple Mail send failed: ${err.message}` })
@@ -890,6 +1481,8 @@ app.get('/api/mail/search', async (req, res) => {
   const days = Math.max(1, Math.min(90, parseInt(req.query.days || '14', 10)))
   const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '20', 10)))
   const includeBody = req.query.include_body === '1' || req.query.include_body === 'true'
+  const maxBody = Math.max(100, Math.min(50000, parseInt(req.query.max_body || '4000', 10)))
+  const subject = (req.query.subject || '').toString().trim()
 
   if (!from) {
     return res.status(400).json({ error: 'from query param is required (email or name substring)' })
@@ -897,26 +1490,42 @@ app.get('/api/mail/search', async (req, res) => {
 
   const escapeForAppleScript = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
   const fromEscaped = escapeForAppleScript(from)
+  const subjectEscaped = subject ? escapeForAppleScript(subject) : ''
 
   // The script returns a delimited string we parse in JS to avoid AppleScript JSON pain.
-  // Format per row: DATE\tSENDER\tSUBJECT\tBODY (body truncated to 800 chars)
+  // Format per row: DATE\tSENDER\tSUBJECT\tBODY (body truncated to max_body chars, default 4000)
+  const subjectFilter = subjectEscaped
+    ? ` and subject contains "${subjectEscaped}"`
+    : ''
   const script = `
 tell application "Mail"
   set output to ""
   set cutoffDate to (current date) - (${days} * days)
   set msgCount to 0
   try
-    set msgs to (messages of inbox whose sender contains "${fromEscaped}" and date received > cutoffDate)
+    set msgs to (messages of inbox whose sender contains "${fromEscaped}"${subjectFilter} and date received > cutoffDate)
     repeat with msg in msgs
       if msgCount >= ${limit} then exit repeat
       set msgCount to msgCount + 1
-      set theDate to (date received of msg) as string
-      set theSender to sender of msg
-      set theSubject to subject of msg
+      try
+        set theDate to (date received of msg) as string
+      on error
+        set theDate to "unknown"
+      end try
+      try
+        set theSender to sender of msg
+      on error
+        set theSender to ""
+      end try
+      try
+        set theSubject to subject of msg
+      on error
+        set theSubject to "(no subject)"
+      end try
       set theBody to ""
       ${includeBody ? `try
         set theBody to content of msg
-        if length of theBody > 800 then set theBody to (text 1 thru 800 of theBody) & "..."
+        if length of theBody > ${maxBody} then set theBody to (text 1 thru ${maxBody} of theBody) & "..."
       end try` : ''}
       set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\n---ROW---\\n"
     end repeat
@@ -965,6 +1574,210 @@ end tell
   } catch (err) {
     console.error(`[mail/search] Failed: ${err.message}`)
     res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/calendar/events
+ * List upcoming events from macOS Calendar.app using AppleScript.
+ * Query: ?days=7&calendar=<name>&limit=20
+ * Returns: { events: [{ title, start_date, end_date, location, notes, calendar, all_day }], count }
+ */
+app.get('/api/calendar/events', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'Calendar.app is only available on macOS' })
+  }
+
+  const days = Math.max(1, Math.min(90, parseInt(req.query.days || '7', 10)))
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
+  const calendarFilter = (req.query.calendar || '').toString().trim()
+
+  const escapeForAppleScript = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+
+  // Build calendar filter clause
+  const calFilter = calendarFilter
+    ? `whose name is "${escapeForAppleScript(calendarFilter)}"`
+    : ''
+
+  const script = `
+tell application "Calendar"
+  set output to ""
+  set startDate to (current date)
+  set hours of startDate to 0
+  set minutes of startDate to 0
+  set seconds of startDate to 0
+  set endDate to startDate + (${days} * days)
+  set eventCount to 0
+  set cals to (calendars ${calFilter})
+  repeat with cal in cals
+    set calName to name of cal
+    try
+      set evts to (every event of cal whose start date >= startDate and start date <= endDate)
+      repeat with evt in evts
+        if eventCount >= ${limit} then exit repeat
+        set eventCount to eventCount + 1
+        set evtTitle to summary of evt
+        set evtStart to (start date of evt) as string
+        set evtEnd to (end date of evt) as string
+        set evtLocation to ""
+        try
+          set evtLocation to location of evt
+        end try
+        set evtNotes to ""
+        try
+          set evtNotes to description of evt
+          if length of evtNotes > 500 then set evtNotes to (text 1 thru 500 of evtNotes) & "..."
+        end try
+        set evtAllDay to allday event of evt
+        set output to output & evtTitle & "\\t" & evtStart & "\\t" & evtEnd & "\\t" & evtLocation & "\\t" & evtNotes & "\\t" & calName & "\\t" & evtAllDay & "\\n---ROW---\\n"
+      end repeat
+    end try
+    if eventCount >= ${limit} then exit repeat
+  end repeat
+  return output
+end tell
+`.trim()
+
+  try {
+    const stdout = await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process')
+      execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = (stderr || err.message || '').trim()
+          if (msg.includes('-1743') || msg.includes('not allowed')) {
+            return reject(new Error(
+              'Calendar.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
+            ))
+          }
+          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
+        }
+        resolve(stdout)
+      })
+    })
+
+    const events = stdout
+      .split(/\n---ROW---\n/)
+      .map((row) => row.trim())
+      .filter((row) => row.length > 0)
+      .map((row) => {
+        const [title, start_date, end_date, location, notes, calendar, all_day] = row.split('\t')
+        return {
+          title: title || '',
+          start_date: start_date || '',
+          end_date: end_date || '',
+          location: location || '',
+          notes: notes || '',
+          calendar: calendar || '',
+          all_day: all_day === 'true',
+        }
+      })
+
+    // Sort by start_date
+    events.sort((a, b) => new Date(a.start_date).getTime() - new Date(b.start_date).getTime())
+
+    res.json({
+      events,
+      count: events.length,
+      days,
+    })
+  } catch (err) {
+    console.error(`[calendar/events] Failed: ${err.message}`)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/calendar/create
+ * Create a new event in macOS Calendar.app using AppleScript.
+ * Body: { title, start_date (ISO), end_date (ISO), location, notes, calendar (default "Meetings"), draft (boolean) }
+ * Returns: { ok: true, title, calendar, start_date }
+ */
+app.post('/api/calendar/create', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'Calendar.app is only available on macOS' })
+  }
+
+  const { title, start_date, end_date, location, notes, calendar, draft } = req.body
+  const calName = calendar || 'Meetings'
+
+  if (!title || !start_date) {
+    return res.status(400).json({ error: 'title and start_date are required' })
+  }
+
+  const escapeForAppleScript = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+
+  // Convert ISO date to AppleScript-friendly format
+  // AppleScript parses dates like: date "Monday, April 14, 2026 at 4:30:00 PM"
+  const formatDateForAppleScript = (isoStr) => {
+    const d = new Date(isoStr)
+    // Use toLocaleString to get the full date string macOS understands
+    return d.toLocaleString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    })
+  }
+
+  const startFormatted = formatDateForAppleScript(start_date)
+  // Default end_date to 1 hour after start if not provided
+  const endIso = end_date || new Date(new Date(start_date).getTime() + 60 * 60 * 1000).toISOString()
+  const endFormatted = formatDateForAppleScript(endIso)
+
+  const locationLine = location
+    ? `set location of newEvent to "${escapeForAppleScript(location)}"`
+    : ''
+  const notesLine = notes
+    ? `set description of newEvent to "${escapeForAppleScript(notes)}"`
+    : ''
+
+  const isDraft = draft === true || draft === 'true'
+  const activateLine = isDraft ? `\n  activate` : ''
+
+  const script = `
+tell application "Calendar"
+  set targetCal to null
+  repeat with cal in calendars
+    if name of cal is "${escapeForAppleScript(calName)}" then
+      set targetCal to cal
+      exit repeat
+    end if
+  end repeat
+  if targetCal is null then
+    error "Calendar \\"${escapeForAppleScript(calName)}\\" not found"
+  end if
+  set newEvent to make new event at end of events of targetCal with properties {summary:"${escapeForAppleScript(title)}", start date:date "${startFormatted}", end date:date "${endFormatted}"}
+  ${locationLine}
+  ${notesLine}${activateLine}
+end tell
+`.trim()
+
+  try {
+    await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process')
+      execFile('/usr/bin/osascript', ['-e', script], { timeout: 20000 }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = (stderr || err.message || '').trim()
+          if (msg.includes('-1743') || msg.includes('not allowed')) {
+            return reject(new Error(
+              'Calendar.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
+            ))
+          }
+          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
+        }
+        resolve(stdout)
+      })
+    })
+
+    console.log(`[calendar] Created event "${title}" in ${calName} at ${start_date}`)
+    res.json({ ok: true, title, calendar: calName, start_date })
+  } catch (err) {
+    console.error(`[calendar/create] Failed: ${err.message}`)
+    res.status(500).json({ error: `Calendar event creation failed: ${err.message}` })
   }
 })
 
