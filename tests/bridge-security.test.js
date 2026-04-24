@@ -4,7 +4,7 @@
  * Tests: bind address, CORS allowlist, auth middleware, PM2 sanitization,
  * fsAuth bypass fix, security.txt endpoint.
  *
- * Covers bugs: #64808, #64813, #64816, #64821, #64831, #64841
+ * Covers bugs: #64808, #64813, #64816, #64821, #64826, #64831, #64841
  */
 
 const { describe, it, before, after } = require('node:test')
@@ -519,5 +519,207 @@ describe('security.txt endpoint', () => {
   it('accessible without auth token', async () => {
     const res = await httpGet(port, '/.well-known/security.txt')
     assert.equal(res.status, 200)
+  })
+})
+
+// ─── HMAC Task Signing Tests (#64826) ─────────────────────────
+
+describe('HMAC task signature verification (#64826)', () => {
+  const { CloudClient } = require('../daemon/cloud-client')
+
+  // Mock task data
+  const API_KEY = 'node_live_test1234567890abcdef'
+  const TASK = {
+    id: '550e8400-e29b-41d4-a716-446655440000',
+    type: 'sandbox_execute',
+    prompt: 'echo "Hello World"',
+    config: { timeout: 30, env_vars: { FOO: 'bar' } }
+  }
+
+  function signTask (task, key) {
+    const signPayload = task.id + ':' + task.type + ':' + (task.prompt || '') + ':' + JSON.stringify(task.config ?? null)
+    return crypto.createHmac('sha256', key).update(signPayload).digest('hex')
+  }
+
+  it('accepts task with valid signature', async () => {
+    const signature = signTask(TASK, API_KEY)
+
+    // Create a mock hub server that returns a signed task
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      res.json({ task: { ...TASK, _signature: signature } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      const task = await client.fetchTask(TASK.id)
+      assert.equal(task.id, TASK.id)
+      assert.equal(task.prompt, TASK.prompt)
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('rejects task with tampered prompt', async () => {
+    const signature = signTask(TASK, API_KEY)
+
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      // Return task with tampered prompt but original signature
+      res.json({ task: { ...TASK, prompt: 'rm -rf /', _signature: signature } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      await assert.rejects(
+        () => client.fetchTask(TASK.id),
+        /signature verification failed/
+      )
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('rejects task with tampered config', async () => {
+    const signature = signTask(TASK, API_KEY)
+
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      res.json({ task: { ...TASK, config: { malicious: true }, _signature: signature } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      await assert.rejects(
+        () => client.fetchTask(TASK.id),
+        /signature verification failed/
+      )
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('rejects task with wrong signing key', async () => {
+    const wrongKeySignature = signTask(TASK, 'node_live_WRONG_KEY_ATTACKER')
+
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      res.json({ task: { ...TASK, _signature: wrongKeySignature } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      await assert.rejects(
+        () => client.fetchTask(TASK.id),
+        /signature verification failed/
+      )
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('rejects task with truncated signature', async () => {
+    const signature = signTask(TASK, API_KEY)
+
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      res.json({ task: { ...TASK, _signature: signature.substring(0, 32) } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      await assert.rejects(
+        () => client.fetchTask(TASK.id),
+        /signature verification failed|DEF_ERR/  // timingSafeEqual throws on length mismatch
+      )
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('allows unsigned tasks with warning (backward compat)', async () => {
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      // No _signature field — old hub
+      res.json({ task: { ...TASK } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      const task = await client.fetchTask(TASK.id)
+      // Should succeed (backward compat) but log a warning
+      assert.equal(task.id, TASK.id)
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
+  })
+
+  it('signature covers task type changes (type tampering)', async () => {
+    const signature = signTask(TASK, API_KEY)
+
+    const express = require('express')
+    const mockHub = express()
+    mockHub.use(express.json())
+    mockHub.get('/api/v6/node-agent/tasks/:id', (req, res) => {
+      // Attacker changes type from sandbox_execute to something else
+      res.json({ task: { ...TASK, type: 'code_generation', _signature: signature } })
+    })
+
+    const hubServer = await new Promise(resolve => {
+      const s = mockHub.listen(0, '127.0.0.1', () => resolve(s))
+    })
+    const hubPort = hubServer.address().port
+
+    try {
+      const client = new CloudClient(`http://127.0.0.1:${hubPort}`, API_KEY)
+      await assert.rejects(
+        () => client.fetchTask(TASK.id),
+        /signature verification failed/
+      )
+    } finally {
+      await new Promise(r => hubServer.close(r))
+    }
   })
 })

@@ -19,6 +19,7 @@
  *   — Browser Use architecture principle, adopted by Hive.
  */
 
+const crypto = require('crypto')
 const https = require('https')
 const http = require('http')
 const { URL } = require('url')
@@ -69,10 +70,28 @@ class CloudClient {
 
   /**
    * Fetch full task details by ID.
+   * Verifies HMAC-SHA256 signature to ensure the task payload is authentic.
    */
   async fetchTask (taskId) {
     const response = await this.get(`/api/v6/node-agent/tasks/${taskId}`)
-    return response.task
+    const task = response.task
+
+    // Verify task signature (hub signs with our api_key as HMAC secret)
+    if (task._signature) {
+      const signPayload = task.id + ':' + task.type + ':' + (task.prompt || '') + ':' + JSON.stringify(task.config ?? null)
+      const expected = crypto.createHmac('sha256', this.apiKey).update(signPayload).digest('hex')
+      const sigBuf = Buffer.from(task._signature, 'hex')
+      const expBuf = Buffer.from(expected, 'hex')
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        throw new Error(`Task ${taskId} signature verification failed — payload may be tampered`)
+      }
+    } else {
+      // Unsigned task — log warning but allow execution for backward compatibility
+      // TODO: make signature required once all hubs are updated
+      console.warn(`[cloud-client] WARNING: Task ${taskId} has no signature — hub may be outdated`)
+    }
+
+    return task
   }
 
   /**
