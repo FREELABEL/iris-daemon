@@ -122,6 +122,61 @@ function loadProjectEnv () {
 }
 
 // Auto-detect freelabel project root (looks for som:creators npm script)
+/**
+ * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
+ * Returns { eligible: number, total: number, skip: boolean, reason: string }
+ */
+async function somPreflightCheck (boardId, strategy) {
+  const apiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
+  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
+  const prefix = '[preflight]'
+
+  try {
+    const url = `${apiBase}/api/v1/leads?bloq_id=${boardId}&per_page=1&page=1`
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    })
+
+    if (!res.ok) {
+      console.log(`${prefix} ⚠️  API returned ${res.status} — skipping preflight, will run anyway`)
+      return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
+    }
+
+    const data = await res.json()
+    const total = data.total || 0
+    const leads = data.data || []
+
+    if (total === 0) {
+      return { eligible: 0, total: 0, skip: true, reason: `Board ${boardId} has 0 leads` }
+    }
+
+    // Check the first page for leads that still need outreach
+    // A lead needs outreach if it doesn't have the strategy's outreach step completed
+    // Quick heuristic: check if ALL leads on page 1 have outreach_status = 'completed'
+    const page1Url = `${apiBase}/api/v1/leads?bloq_id=${boardId}&per_page=100&page=1&outreach_status=pending`
+    const page1Res = await fetch(page1Url, {
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    })
+
+    if (page1Res.ok) {
+      const page1Data = await page1Res.json()
+      const pending = page1Data.total || 0
+      if (pending === 0) {
+        return { eligible: 0, total, skip: true, reason: `All ${total} leads have outreach completed` }
+      }
+      return { eligible: pending, total, skip: false, reason: `${pending} leads pending` }
+    }
+
+    // If the filtered endpoint doesn't work, fall back to running
+    return { eligible: -1, total, skip: false, reason: 'filter_not_supported' }
+  } catch (err) {
+    console.log(`${prefix} ⚠️  Preflight failed: ${err.message} — will run anyway`)
+    return { eligible: -1, total: -1, skip: false, reason: 'preflight_error' }
+  }
+}
+
 function findFreelabelPath () {
   // 1. Explicit env var
   if (process.env.FREELABEL_PATH) {
@@ -469,7 +524,7 @@ class TaskExecutor {
         ? '... (truncated) ...\n' + fullOutput.slice(-MAX_OUTPUT)
         : fullOutput
 
-      // For chainable tasks, non-zero exit doesn't mean total failure —
+      // For browser tasks, non-zero exit doesn't mean total failure —
       // e.g. discover tasks scrape successfully but Playwright exits non-zero
       // because the n8n chat interaction failed or the wait was interrupted.
       const taskStatus = result.exitCode === 0 ? 'completed' : 'completed_with_warnings'
@@ -483,64 +538,11 @@ class TaskExecutor {
 
       console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
 
-      // ── Chain: discover → som_batch (DISABLED by default — use separate scheduled jobs) ──
-      // Chain was fragile: browser OOM, process crashes, YAML override bugs.
-      // Now discover (#761) and som_batch (#762) run as independent daily jobs, 15 min apart.
-      // Set chain_outreach=true explicitly to re-enable for manual dispatch.
-      if (task.type === 'discover' && task.config?.chain_outreach === true) {
-        const chainPrompt = task.config?.outreach_prompt || 'limit=15 enrich=1 warmup=1 warmup_likes=3 warmup_follow=0'
-        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
-        console.log(`[executor] [${ts()}] Chaining: discover complete → som_batch (${chainPrompt})`)
-        try {
-          await this.cloud.submitTask({
-            user_id: chainUserId,
-            title: 'SOM: Outreach Batch (auto)',
-            type: 'som_batch',
-            prompt: chainPrompt,
-            config: { timeout_seconds: 3600, chained_from: taskId },
-            node_id: task.node_id,
-          })
-        } catch (chainErr) {
-          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
-        }
-      }
-
-      // ── Auto-chain: enrich_batch → som_batch ──
-      if (task.type === 'enrich_batch' && task.config?.chain_outreach !== false) {
-        const chainPrompt = task.config?.outreach_prompt || 'limit=15'
-        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
-        console.log(`[executor] [${ts()}] Chaining: enrich complete → som_batch (${chainPrompt})`)
-        try {
-          await this.cloud.submitTask({
-            user_id: chainUserId,
-            title: 'SOM: Outreach Batch (post-enrich)',
-            type: 'som_batch',
-            prompt: chainPrompt,
-            config: { timeout_seconds: 3600, chained_from: taskId },
-            node_id: task.node_id,
-          })
-        } catch (chainErr) {
-          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
-        }
-      }
-
-      // ── Auto-chain: som_batch → inbox_scan (detect replies) ──
-      if (task.type === 'som_batch' && task.config?.chain_inbox !== false) {
-        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
-        console.log(`[executor] [${ts()}] Chaining: som_batch complete → inbox_scan`)
-        try {
-          await this.cloud.submitTask({
-            user_id: chainUserId,
-            title: 'SOM: Inbox Reply Scan (auto)',
-            type: 'inbox_scan',
-            prompt: 'all since=4h wb=1',
-            config: { timeout_seconds: 600, chained_from: taskId },
-            node_id: task.node_id,
-          })
-        } catch (chainErr) {
-          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
-        }
-      }
+      // ── Task chaining REMOVED (Apr 26, 2026) ──
+      // All task types (discover, som_batch, inbox_scan) now run as independent scheduled jobs.
+      // Chaining was elegant but fragile — caused Chrome/Playwright process explosions when
+      // scheduled jobs + chains fired simultaneously (e.g. 3 discovers → 3 som_batches → 3 inbox_scans).
+      // Jobs: #761 (discover, hourly), #762 (som_batch, every 2h), #792 (inbox_scan, hourly).
 
       // ── Auto-chain: remotion/remotion_carousel → upload to CDN + post to Buffer ──
       if ((task.type === 'remotion' || task.type === 'remotion_carousel') && task.config?.auto_publish !== false) {
@@ -780,6 +782,34 @@ class TaskExecutor {
           const campaignConfig = somCampaignConfigs[campaign]
           if (!campaignConfig) {
             console.log(`[executor] ⚠️  Unknown SOM campaign: "${campaign}". Valid: ${Object.keys(somCampaignConfigs).join(', ')}`)
+          }
+
+          // ── Preflight: check for eligible leads before launching Chromium ──
+          if (campaignConfig?.boardId) {
+            const preflight = await somPreflightCheck(campaignConfig.boardId, campaignConfig.strategy)
+            console.log(`[executor] Preflight board ${campaignConfig.boardId}: ${preflight.eligible} eligible / ${preflight.total} total — ${preflight.reason}`)
+            if (preflight.skip) {
+              console.log(`[executor] ⏭️  Skipping ${campaign} — ${preflight.reason}`)
+              // Send Discord notification about exhausted leads
+              try {
+                const webhookUrl = process.env.DISCORD_LMKBOT_WEBHOOK
+                if (webhookUrl) {
+                  await fetch(webhookUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      embeds: [{
+                        title: '🚨 SOM — Leads Exhausted (Skipped)',
+                        description: `📋 Board: ${campaignConfig.boardId} | Strategy: ${campaignConfig.strategy} | Account: @${campaignConfig.igAccount}\n✅ ${preflight.reason}\n⚡ Run \`npm run leadgen:${campaign}\` to discover more leads.\n💡 *Chromium was NOT launched — preflight saved compute.*`,
+                        color: 0xFFA500,
+                      }],
+                    }),
+                  })
+                }
+              } catch { /* non-blocking */ }
+              resolve({ skipped: true, reason: preflight.reason })
+              return
+            }
           }
 
           // Use npx playwright directly with --headed to prevent Chrome crashes
@@ -1172,6 +1202,49 @@ class TaskExecutor {
             reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
             return
           }
+
+          // ── Preflight: check ALL active campaigns for eligible leads ──
+          try {
+            const somConfig = require(path.join(batchRoot, 'tests/e2e/som-config.js'))
+            const allConfigs = somConfig.getDaemonConfigs()
+            const activeAccounts = somConfig.getActiveAccounts()
+            let anyEligible = false
+            const skippedCampaigns = []
+
+            for (const [id, cfg] of Object.entries(activeAccounts)) {
+              if (cfg.boardId) {
+                const pf = await somPreflightCheck(cfg.boardId, cfg.strategy)
+                console.log(`[executor] Preflight ${id} (board ${cfg.boardId}): ${pf.eligible} eligible — ${pf.reason}`)
+                if (!pf.skip) anyEligible = true
+                else skippedCampaigns.push(`${id} (${pf.reason})`)
+              }
+            }
+
+            if (!anyEligible && Object.keys(activeAccounts).length > 0) {
+              console.log(`[executor] ⏭️  ALL campaigns exhausted — skipping som_batch entirely`)
+              try {
+                const webhookUrl = process.env.DISCORD_LMKBOT_WEBHOOK
+                if (webhookUrl) {
+                  await fetch(webhookUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      embeds: [{
+                        title: '⏭️ SOM Batch — All Campaigns Exhausted (Skipped)',
+                        description: skippedCampaigns.map(c => `• ${c}`).join('\n') + '\n\n💡 *Chromium was NOT launched — preflight saved compute.*',
+                        color: 0xFFA500,
+                      }],
+                    }),
+                  })
+                }
+              } catch { /* non-blocking */ }
+              resolve({ skipped: true, reason: 'all_campaigns_exhausted', campaigns: skippedCampaigns })
+              return
+            }
+          } catch (err) {
+            console.log(`[executor] ⚠️  Batch preflight failed: ${err.message} — running anyway`)
+          }
+
           cmd = 'npm'
           args = ['run', 'som:all', '--', ...batchArgs]
           workspace.projectDir = batchRoot
@@ -1990,18 +2063,17 @@ exit 1
       const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
       const timeout = (explicit || typeDefault) * 1000
       const timeoutLabel = timeout / 1000
-      const chainableTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan']
-      const isChainable = chainableTypes.includes(task.type)
+      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan']
+      const isGraceful = gracefulTypes.includes(task.type)
 
       const timer = setTimeout(() => {
         child.kill('SIGTERM')
         setTimeout(() => {
           if (!child.killed) child.kill('SIGKILL')
         }, 5000)
-        // Chainable tasks must still reach chain logic even on timeout —
-        // e.g. discover scrape + n8n paste already happened, just the wait
-        // got killed. Resolve so chains fire; report exit code for status.
-        if (isChainable) {
+        // Browser tasks resolve even on timeout — partial work (scrape, DMs sent)
+        // is still valuable. Report exit code 124 so status shows the timeout.
+        if (isGraceful) {
           resolve({ exitCode: 124, timedOut: true })
         } else {
           reject(new Error(`Task timed out after ${timeoutLabel}s`))
@@ -2010,10 +2082,9 @@ exit 1
 
       child.on('close', (code) => {
         clearTimeout(timer)
-        // Chainable tasks always resolve so the chain logic runs,
-        // even when Playwright exits non-zero (browser closed early,
-        // n8n chat issue, Ctrl+C, etc.)
-        if (code === 0 || isChainable) {
+        // Browser tasks resolve even on non-zero exit — Playwright often exits
+        // non-zero for benign reasons (browser closed early, nav timeout, etc.)
+        if (code === 0 || isGraceful) {
           resolve({ exitCode: code || 0 })
         } else {
           reject(new Error(`Process exited with code ${code}`))
