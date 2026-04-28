@@ -140,11 +140,27 @@ class Daemon {
     this.hardwareProfile = await detectProfile()
     console.log(`[daemon] Hardware: ${this.hardwareProfile.cpu.model} | ${this.hardwareProfile.memory.total_gb}GB RAM | GPU: ${this.hardwareProfile.gpu.available ? this.hardwareProfile.gpu.name : 'none'}`)
 
-    // Step 1: Authenticate with cloud and register as online
+    // Step 1: Authenticate with cloud and register as online (with retry for transient failures)
     console.log('[daemon] Authenticating with cloud...')
-    const heartbeatResult = await this.cloud.sendHeartbeat({
-      hardware_profile: this.hardwareProfile
-    })
+    let heartbeatResult = null
+    const maxRetries = 5
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        heartbeatResult = await this.cloud.sendHeartbeat({
+          hardware_profile: this.hardwareProfile
+        })
+        break
+      } catch (err) {
+        const isRetryable = /530|502|503|504|timeout|ECONNRESET|ENOTFOUND/i.test(err.message)
+        if (isRetryable && attempt < maxRetries) {
+          const delay = Math.min(attempt * 5, 30) // 5s, 10s, 15s, 20s, 25s
+          console.log(`[daemon] Auth attempt ${attempt}/${maxRetries} failed (${err.message}) — retrying in ${delay}s...`)
+          await new Promise(r => setTimeout(r, delay * 1000))
+        } else {
+          throw err
+        }
+      }
+    }
     this.nodeId = heartbeatResult.node_id
 
     console.log(`[daemon] Node registered: ${this.nodeId}`)
