@@ -2093,6 +2093,41 @@ exit 1
           break
         }
 
+        case 'youtube_to_clip': {
+          // Clip cutter runs locally (residential IP for YouTube downloads, local LUT files)
+          // prompt format: "url=YOUTUBE_URL start=0:00 duration=90 brand=discover text=Caption"
+          const clipParams = {}
+          const clipParts = task.prompt.trim().split(/\s+/)
+          for (const part of clipParts) {
+            const eqIdx = part.indexOf('=')
+            if (eqIdx > 0) {
+              clipParams[part.substring(0, eqIdx)] = part.substring(eqIdx + 1)
+            }
+          }
+
+          const clipRoot = this.freelabelPath || findFreelabelPath()
+          if (!clipRoot) {
+            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            return
+          }
+
+          // Build artisan command — uses local yt-dlp, ffmpeg, and LUT files
+          const clipArgs = [
+            `--youtube_url=${clipParams.url || task.config?.youtube_url || ''}`,
+            `--duration=${clipParams.duration || task.config?.duration || '90'}`,
+            `--start=${clipParams.start || task.config?.start || '0:00'}`,
+          ]
+          if (clipParams.brand || task.config?.brand) clipArgs.push(`--brand=${clipParams.brand || task.config.brand}`)
+          if (clipParams.text || task.config?.text) clipArgs.push(`--text=${clipParams.text || task.config.text}`)
+          if (task.config?.publish_to_social) clipArgs.push('--publish')
+
+          cmd = 'docker'
+          args = ['compose', 'exec', '-T', 'api', 'php', 'artisan', 'clip:process', ...clipArgs]
+          workspace.projectDir = path.join(clipRoot, 'fl-docker-dev')
+          console.log(`[executor] Clip cutter: ${clipParams.url || task.config?.youtube_url} (local processing)`)
+          break
+        }
+
         default:
           // Default: treat prompt as a shell command
           cmd = '/bin/bash'
