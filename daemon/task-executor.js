@@ -121,6 +121,79 @@ function loadProjectEnv () {
   return _projectEnvCache
 }
 
+// ── DB-driven campaign config (Phase 2) ──────────────────────────────────
+// Fetches campaign configs from iris-api /api/v1/campaign-templates/daemon-configs
+// Falls back to som-config.js if API is unavailable or returns empty.
+// Cached for 5 minutes to avoid hammering the API on every task dispatch.
+let _dbCampaignCache = null
+let _dbCampaignCacheTs = 0
+const DB_CAMPAIGN_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+
+async function fetchDbCampaignConfigs () {
+  const now = Date.now()
+  if (_dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
+    return _dbCampaignCache
+  }
+
+  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
+  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
+  const userId = process.env.HEYIRIS_USER_ID || '1'
+
+  try {
+    const url = `${apiBase}/api/v1/campaign-templates/daemon-configs?user_id=${userId}`
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    })
+
+    if (!res.ok) {
+      console.log(`[executor] DB campaign config API returned ${res.status} — falling back to som-config.js`)
+      return null
+    }
+
+    const data = await res.json()
+    if (data.configs && Object.keys(data.configs).length > 0) {
+      _dbCampaignCache = data
+      _dbCampaignCacheTs = now
+      console.log(`[executor] Loaded ${Object.keys(data.configs).length} campaign configs from DB (source: ${data.source})`)
+      return data
+    }
+
+    return null
+  } catch (err) {
+    console.log(`[executor] DB campaign config fetch failed: ${err.message} — falling back to som-config.js`)
+    return null
+  }
+}
+
+/**
+ * Get campaign configs — DB-first, som-config.js fallback.
+ * Returns { configs: { id: { boardId, strategy, igAccount } }, activeAccounts: [...] }
+ */
+async function getCampaignConfigs (freelabelRoot) {
+  // Try DB first
+  const dbData = await fetchDbCampaignConfigs()
+  if (dbData?.configs && Object.keys(dbData.configs).length > 0) {
+    return {
+      configs: dbData.configs,
+      activeAccounts: dbData.active_accounts || [],
+      source: 'database',
+    }
+  }
+
+  // Fallback to som-config.js
+  try {
+    const somConfig = require(path.join(freelabelRoot, 'tests/e2e/som-config.js'))
+    return {
+      configs: somConfig.getDaemonConfigs(),
+      activeAccounts: Object.values(somConfig.getActiveAccounts()),
+      source: 'som-config.js',
+    }
+  } catch {
+    return { configs: {}, activeAccounts: [], source: 'none' }
+  }
+}
+
 // Auto-detect freelabel project root (looks for som:creators npm script)
 /**
  * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
@@ -796,17 +869,10 @@ class TaskExecutor {
             return
           }
 
-          // ── Campaign config registry (single source of truth) ──
-          // Prevents mismatched board/strategy/account from bad dispatches
-          // Campaign configs from shared source of truth
-          let somCampaignConfigs
-          try {
-            const somConfig = require(path.join(freelabelRoot, 'tests/e2e/som-config.js'))
-            somCampaignConfigs = somConfig.getDaemonConfigs()
-          } catch {
-            // Fallback if shared config not found
-            somCampaignConfigs = {}
-          }
+          // ── Campaign config registry (DB-first, som-config.js fallback) ──
+          // Phase 2: reads from iris-api /campaign-templates/daemon-configs
+          const { configs: somCampaignConfigs, source: configSource } = await getCampaignConfigs(freelabelRoot)
+          console.log(`[executor] Campaign configs loaded from ${configSource}`)
 
           const campaignConfig = somCampaignConfigs[campaign]
           if (!campaignConfig) {
@@ -1232,24 +1298,24 @@ class TaskExecutor {
             return
           }
 
-          // ── Preflight: check ALL active campaigns for eligible leads ──
+          // ── Preflight: check ALL active campaigns for eligible leads (DB-first) ──
           try {
-            const somConfig = require(path.join(batchRoot, 'tests/e2e/som-config.js'))
-            const allConfigs = somConfig.getDaemonConfigs()
-            const activeAccounts = somConfig.getActiveAccounts()
+            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(batchRoot)
+            console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts)`)
             let anyEligible = false
             const skippedCampaigns = []
 
-            for (const [id, cfg] of Object.entries(activeAccounts)) {
+            for (const cfg of activeAccountsList) {
               if (cfg.boardId) {
-                const pf = await somPreflightCheck(cfg.boardId, cfg.strategy)
-                console.log(`[executor] Preflight ${id} (board ${cfg.boardId}): ${pf.eligible} eligible — ${pf.reason}`)
+                const strategy = allConfigs[cfg.id]?.strategy || null
+                const pf = await somPreflightCheck(cfg.boardId, strategy)
+                console.log(`[executor] Preflight ${cfg.id} (board ${cfg.boardId}): ${pf.eligible} eligible — ${pf.reason}`)
                 if (!pf.skip) anyEligible = true
-                else skippedCampaigns.push(`${id} (${pf.reason})`)
+                else skippedCampaigns.push(`${cfg.id} (${pf.reason})`)
               }
             }
 
-            if (!anyEligible && Object.keys(activeAccounts).length > 0) {
+            if (!anyEligible && activeAccountsList.length > 0) {
               console.log(`[executor] ⏭️  ALL campaigns exhausted — skipping som_batch entirely`)
               try {
                 const webhookUrl = process.env.DISCORD_LMKBOT_WEBHOOK
@@ -1260,7 +1326,7 @@ class TaskExecutor {
                     body: JSON.stringify({
                       embeds: [{
                         title: '⏭️ SOM Batch — All Campaigns Exhausted (Skipped)',
-                        description: skippedCampaigns.map(c => `• ${c}`).join('\n') + '\n\n💡 *Chromium was NOT launched — preflight saved compute.*',
+                        description: skippedCampaigns.map(c => `• ${c}`).join('\n') + `\n\n💡 *Config source: ${source}*`,
                         color: 0xFFA500,
                       }],
                     }),
@@ -1293,15 +1359,14 @@ class TaskExecutor {
             return
           }
 
-          // Use shared config — same source of truth as som.js, som-all.js
+          // Use DB-first config — same source of truth as SOM outreach
           let scanAccounts
           try {
-            const somConfig = require(path.join(scanRoot, 'tests/e2e/som-config.js'))
-            const activeAccountsObj = somConfig.getActiveAccounts()
-            const activeAccounts = Object.values(activeAccountsObj)
+            const { activeAccounts: allActive, source } = await getCampaignConfigs(scanRoot)
+            console.log(`[executor] Inbox scan config from ${source}`)
             scanAccounts = scanTarget === 'all'
-              ? activeAccounts
-              : activeAccounts.filter(a => a.igAccount === scanTarget || a.id === scanTarget)
+              ? allActive
+              : allActive.filter(a => a.igAccount === scanTarget || a.id === scanTarget)
           } catch {
             // Fallback: scan heyiris.io only
             scanAccounts = [{ id: 'courses', igAccount: 'heyiris.io', boardId: '38' }]

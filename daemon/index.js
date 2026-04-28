@@ -36,6 +36,61 @@ const IRIS_DIR = path.join(os.homedir(), '.iris')
 const STATUS_FILE = path.join(IRIS_DIR, 'status.json')
 const CONFIG_FILE = path.join(IRIS_DIR, 'config.json')
 
+// ─── Colored console logging ────────────────────────────────────────
+// Tags get colored by category so streaming logs are scannable at a glance.
+const C = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  bold: '\x1b[1m',
+  cyan: '\x1b[36m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  magenta: '\x1b[35m',
+  blue: '\x1b[34m',
+  white: '\x1b[37m',
+}
+const TAG_COLORS = {
+  daemon: C.cyan,
+  executor: C.green,
+  pusher: C.magenta,
+  heartbeat: C.blue,
+  mesh: C.dim,
+  'mesh-discovery': C.dim,
+  'mesh-energy': C.dim,
+  resource: C.dim,
+  a2a: C.blue,
+  discord: C.magenta,
+  imessage: C.green,
+  'native-imessage': C.green,
+  'auto-start': C.yellow,
+  startup: C.cyan,
+}
+// Wrap console.log to colorize [tag] prefixes
+const _origLog = console.log.bind(console)
+const _origError = console.error.bind(console)
+console.log = (...args) => {
+  if (typeof args[0] === 'string') {
+    const m = args[0].match(/^\[([^\]]+)\](.*)/)
+    if (m) {
+      const color = TAG_COLORS[m[1]] || C.white
+      // Color errors/warnings in the message body
+      let body = m[2]
+      if (/error|fail|crash/i.test(body)) body = `${C.red}${body}${C.reset}`
+      else if (/warn|skip|reject|dedup/i.test(body)) body = `${C.yellow}${body}${C.reset}`
+      else if (/✓|success|completed|ready|connected|online/i.test(body)) body = `${C.green}${body}${C.reset}`
+      args[0] = `${color}[${m[1]}]${C.reset}${body}`
+    }
+  }
+  _origLog(...args)
+}
+console.error = (...args) => {
+  if (typeof args[0] === 'string') {
+    args[0] = `${C.red}${args[0]}${C.reset}`
+  }
+  _origError(...args)
+}
+
 class Daemon {
   constructor (config) {
     this.config = config
@@ -1295,6 +1350,79 @@ LIMIT ${limit}
         res.json({ messages: result, count: result.length, handle, days })
       } catch (err) {
         console.error(`[imessage/search] Failed: ${err.message}`)
+        res.status(500).json({ error: err.message })
+      }
+    })
+
+    /**
+     * GET /api/imessage/group-chats?handle=<email_or_phone>&days=30&limit=10
+     * Discover group chats that include a participant matching the handle.
+     * Returns chat IDs + display names + recent message count.
+     */
+    app.get(`${prefix}/api/imessage/group-chats`, async (req, res) => {
+      if (process.platform !== 'darwin') {
+        return res.status(503).json({ error: 'iMessage group chat discovery is only available on macOS' })
+      }
+
+      const handle = (req.query.handle || '').toString().trim()
+      const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
+      const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)))
+
+      if (!handle) {
+        return res.status(400).json({ error: 'handle query param is required (email or phone)' })
+      }
+
+      const digits = handle.replace(/\D/g, '')
+      const lower = handle.toLowerCase().replace(/'/g, "''")
+      const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
+
+      // Find group chats where this handle is a participant
+      const sql = `
+SELECT DISTINCT
+  c.chat_identifier,
+  c.display_name,
+  c.style AS chat_style,
+  (SELECT COUNT(*) FROM message m2
+   JOIN chat_message_join cmj2 ON cmj2.message_id = m2.ROWID
+   WHERE cmj2.chat_id = c.ROWID
+     AND m2.date > (strftime('%s','now','-${days} days') - strftime('%s','2001-01-01')) * 1000000000
+  ) AS recent_count
+FROM chat c
+JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
+JOIN handle h ON h.ROWID = chj.handle_id
+WHERE c.style = 43
+  AND (
+    ${digits ? `REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', '') LIKE '%${digits}%' OR ` : ''}
+    LOWER(h.id) LIKE '%${lower}%'
+  )
+ORDER BY recent_count DESC
+LIMIT ${limit}
+`.trim()
+
+      try {
+        const result = await new Promise((resolve, reject) => {
+          const { execFile } = require('child_process')
+          execFile(
+            '/usr/bin/sqlite3',
+            ['-readonly', '-json', '-bail', chatDbPath, sql],
+            { timeout: 15000, maxBuffer: 2 * 1024 * 1024 },
+            (err, stdout, stderr) => {
+              if (err) {
+                const msg = (stderr || err.message || '').trim()
+                return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
+              }
+              try {
+                resolve(stdout.trim() ? JSON.parse(stdout) : [])
+              } catch (parseErr) {
+                reject(new Error(`sqlite3 JSON parse: ${parseErr.message}`))
+              }
+            }
+          )
+        })
+
+        res.json({ group_chats: result, count: result.length, handle, days })
+      } catch (err) {
+        console.error(`[imessage/group-chats] Failed: ${err.message}`)
         res.status(500).json({ error: err.message })
       }
     })
