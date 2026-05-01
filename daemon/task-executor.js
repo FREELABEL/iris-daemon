@@ -1356,8 +1356,28 @@ class TaskExecutor {
           const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
           const clipThreshold = clipParams.find(p => p.startsWith('threshold='))?.split('=')[1] || '70'
 
-          const flApiUrl = this.config?.flApiUrl || process.env.FL_API_URL || 'https://raichu.heyiris.io'
-          const flApiToken = this.config?.flApiToken || process.env.FL_API_TOKEN || process.env.FL_RAICHU_API_TOKEN || ''
+          const flApiUrl = process.env.FL_API_URL || 'https://raichu.heyiris.io'
+          // Resolve FL_API_TOKEN: env → ~/.iris/sdk/.env → daemon config
+          let flApiToken = process.env.FL_API_TOKEN || ''
+          if (!flApiToken) {
+            try {
+              const sdkEnvPath = path.join(os.homedir(), '.iris', 'sdk', '.env')
+              if (fs.existsSync(sdkEnvPath)) {
+                const envContent = fs.readFileSync(sdkEnvPath, 'utf-8')
+                const match = envContent.match(/^FL_API_TOKEN=(.+)$/m)
+                if (match) flApiToken = match[1].trim()
+              }
+            } catch {}
+          }
+          if (!flApiToken) {
+            try {
+              const configPath = path.join(os.homedir(), '.iris', 'config.json')
+              if (fs.existsSync(configPath)) {
+                const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+                flApiToken = cfg.flApiToken || cfg.fl_api_token || ''
+              }
+            } catch {}
+          }
 
           const clipQueryParams = new URLSearchParams({
             brand: clipBrand,
