@@ -1347,39 +1347,34 @@ class TaskExecutor {
         }
 
         case 'clip_cutter': {
-          // Pick a recent unclipped video and dispatch a clip job to Instagram
-          // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1"
-          // Uses the artisan command clips:cut-scheduled which handles:
-          //   - Querying latest 20 videos from tv table
-          //   - Picking first unclipped one (clipped_at IS NULL)
-          //   - Dispatching ProcessVideoClip job with brand caption (three-layer closer)
-          //   - Publishing to Instagram as Reel via Buffer
+          // AI-scored clip cutter — calls PRODUCTION fl-api API endpoint
+          // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1" or "threshold=80"
+          // Calls POST /api/v1/clips/cut-scheduled on production fl-api (raichu.heyiris.io)
+          // which queries the production DB for the latest discover page content
           const clipParams = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
           const clipBrand = clipParams.find(p => p.startsWith('brand='))?.split('=')[1] || 'discover'
           const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
+          const clipThreshold = clipParams.find(p => p.startsWith('threshold='))?.split('=')[1] || '70'
 
-          if (!this.flApiPath) {
-            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
-            return
-          }
+          const flApiUrl = this.config?.flApiUrl || process.env.FL_API_URL || 'https://raichu.heyiris.io'
+          const flApiToken = this.config?.flApiToken || process.env.FL_API_TOKEN || process.env.FL_RAICHU_API_TOKEN || ''
 
-          if (this.dockerMode === null) {
-            this.dockerMode = isDockerMode()
-          }
+          const clipQueryParams = new URLSearchParams({
+            brand: clipBrand,
+            threshold: clipThreshold,
+            ...(clipDry ? { dry_run: '1' } : {}),
+          })
 
-          const clipArtisanArgs = [`clips:cut-scheduled`, `--brand=${clipBrand}`]
-          if (clipDry) clipArtisanArgs.push('--dry-run')
-
-          if (this.dockerMode) {
-            const dockerRoot = path.resolve(this.flApiPath, '..')
-            cmd = 'docker'
-            args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
-            workspace.projectDir = dockerRoot
-          } else {
-            cmd = 'php'
-            args = ['artisan', ...clipArtisanArgs]
-            workspace.projectDir = this.flApiPath
-          }
+          // Use curl to call the production API
+          cmd = 'curl'
+          args = [
+            '-s', '--http1.1', '-X', 'POST',
+            `${flApiUrl}/api/v1/clips/cut-scheduled?${clipQueryParams}`,
+            '-H', `Authorization: Bearer ${flApiToken}`,
+            '-H', 'Accept: application/json',
+            '-H', 'Content-Type: application/json',
+          ]
+          workspace.projectDir = this.freelabelPath || process.cwd()
           break
         }
 
