@@ -810,9 +810,33 @@ class TaskExecutor {
           ].join('\n')
           fs.writeFileSync(path.join(workspace.dir, 'playwright.config.ts'), pwConfig, 'utf-8')
 
-          cmd = 'npx'
-          args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
-          workspace.projectDir = workspace.dir
+          // Resolve a hosting project that has @playwright/test installed.
+          // Tries IRIS_PLAYWRIGHT_HOST, then freelabel root, then iris-code root.
+          let hostDir = process.env.IRIS_PLAYWRIGHT_HOST
+            || path.resolve(os.homedir(), 'Sites/freelabel')
+            || path.resolve(os.homedir(), 'Sites/freelabel/iris-code')
+          const hostPwPkg = path.join(hostDir, 'node_modules/@playwright/test/package.json')
+          if (!fs.existsSync(hostPwPkg)) {
+            hostDir = null
+          }
+
+          if (hostDir) {
+            // Run from the host project (which has playwright installed) but pointing at our spec.
+            // Uses --config to load OUR generated playwright.config.ts so timeout etc. apply.
+            cmd = 'npx'
+            args = ['playwright', 'test', scriptPath, '--config', path.join(workspace.dir, 'playwright.config.ts'), '--headed', `--timeout=${timeoutMs}`]
+            workspace.projectDir = hostDir
+          } else {
+            // Fallback: install @playwright/test into the workspace first
+            console.log('[executor] custom_playwright: no host project found, installing @playwright/test in workspace...')
+            await new Promise((resolve, reject) => {
+              const p = spawn('npm', ['install', '--no-save', '@playwright/test@latest'], { cwd: workspace.dir, stdio: 'inherit' })
+              p.on('close', code => code === 0 ? resolve() : reject(new Error(`npm install playwright failed (exit ${code})`)))
+            })
+            cmd = 'npx'
+            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
+            workspace.projectDir = workspace.dir
+          }
           break
         }
 
@@ -1347,54 +1371,38 @@ class TaskExecutor {
         }
 
         case 'clip_cutter': {
-          // AI-scored clip cutter — calls PRODUCTION fl-api API endpoint
+          // AI-scored clip cutter — runs artisan command on LOCAL Docker (has ffmpeg + assets)
+          // The artisan command queries the production DB for fresh discover content
           // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1" or "threshold=80"
-          // Calls POST /api/v1/clips/cut-scheduled on production fl-api (raichu.heyiris.io)
-          // which queries the production DB for the latest discover page content
           const clipParams = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
           const clipBrand = clipParams.find(p => p.startsWith('brand='))?.split('=')[1] || 'discover'
           const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
           const clipThreshold = clipParams.find(p => p.startsWith('threshold='))?.split('=')[1] || '70'
+          const clipUrl = clipParams.find(p => p.startsWith('url='))?.split('=').slice(1).join('=') || ''
 
-          const flApiUrl = process.env.FL_API_URL || 'https://raichu.heyiris.io'
-          // Resolve FL_API_TOKEN: env → ~/.iris/sdk/.env → daemon config
-          let flApiToken = process.env.FL_API_TOKEN || ''
-          if (!flApiToken) {
-            try {
-              const sdkEnvPath = path.join(os.homedir(), '.iris', 'sdk', '.env')
-              if (fs.existsSync(sdkEnvPath)) {
-                const envContent = fs.readFileSync(sdkEnvPath, 'utf-8')
-                const match = envContent.match(/^FL_API_TOKEN=(.+)$/m)
-                if (match) flApiToken = match[1].trim()
-              }
-            } catch {}
-          }
-          if (!flApiToken) {
-            try {
-              const configPath = path.join(os.homedir(), '.iris', 'config.json')
-              if (fs.existsSync(configPath)) {
-                const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
-                flApiToken = cfg.flApiToken || cfg.fl_api_token || ''
-              }
-            } catch {}
+          if (!this.flApiPath) {
+            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
+            return
           }
 
-          const clipQueryParams = new URLSearchParams({
-            brand: clipBrand,
-            threshold: clipThreshold,
-            ...(clipDry ? { dry_run: '1' } : {}),
-          })
+          if (this.dockerMode === null) {
+            this.dockerMode = isDockerMode()
+          }
 
-          // Use curl to call the production API
-          cmd = 'curl'
-          args = [
-            '-s', '--http1.1', '-X', 'POST',
-            `${flApiUrl}/api/v1/clips/cut-scheduled?${clipQueryParams}`,
-            '-H', `Authorization: Bearer ${flApiToken}`,
-            '-H', 'Accept: application/json',
-            '-H', 'Content-Type: application/json',
-          ]
-          workspace.projectDir = this.freelabelPath || process.cwd()
+          const clipArtisanArgs = ['clips:cut-scheduled', `--brand=${clipBrand}`, `--threshold=${clipThreshold}`]
+          if (clipDry) clipArtisanArgs.push('--dry-run')
+          if (clipUrl) clipArtisanArgs.push(`--url=${clipUrl}`)
+
+          if (this.dockerMode) {
+            const dockerRoot = path.resolve(this.flApiPath, '..')
+            cmd = 'docker'
+            args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
+            workspace.projectDir = dockerRoot
+          } else {
+            cmd = 'php'
+            args = ['artisan', ...clipArtisanArgs]
+            workspace.projectDir = this.flApiPath
+          }
           break
         }
 
