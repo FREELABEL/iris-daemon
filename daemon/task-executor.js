@@ -629,7 +629,16 @@ class TaskExecutor {
       // For browser tasks, non-zero exit doesn't mean total failure —
       // e.g. discover tasks scrape successfully but Playwright exits non-zero
       // because the n8n chat interaction failed or the wait was interrupted.
-      const taskStatus = result.exitCode === 0 ? 'completed' : 'completed_with_warnings'
+      // EXCEPTION: custom_playwright (requirement tests) — non-zero IS a real test
+      // failure that needs to flow back as 'failed' so the webhook reports correctly.
+      let taskStatus
+      if (result.exitCode === 0) {
+        taskStatus = 'completed'
+      } else if (task.type === 'custom_playwright') {
+        taskStatus = 'failed'
+      } else {
+        taskStatus = 'completed_with_warnings'
+      }
       await this.cloud.submitResult(taskId, {
         status: taskStatus,
         output: truncatedOutput,
@@ -2270,7 +2279,8 @@ exit 1
       const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
       const timeout = (explicit || typeDefault) * 1000
       const timeoutLabel = timeout / 1000
-      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan']
+      // custom_playwright: failures = test results, not crashes — preserve output
+      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'custom_playwright']
       const isGraceful = gracefulTypes.includes(task.type)
 
       const timer = setTimeout(() => {
