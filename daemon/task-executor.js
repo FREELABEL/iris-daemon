@@ -847,8 +847,10 @@ class TaskExecutor {
             } catch (e) {
               console.log(`[executor] symlink failed (${e.message}), falling back to NODE_PATH`)
             }
+            // --workers=2 runs 2 tests in parallel within a single spec (speeds up multi-check requirement runs)
+            const workers = process.env.PLAYWRIGHT_WORKERS || '2'
             cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
+            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`, `--workers=${workers}`]
             workspace.projectDir = workspace.dir
             // Belt-and-suspenders: also set NODE_PATH so module resolution can find it
             workspace.env = { ...(workspace.env || {}), NODE_PATH: path.join(hostDir, 'node_modules') }
