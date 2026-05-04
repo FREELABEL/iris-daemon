@@ -639,12 +639,22 @@ class TaskExecutor {
       } else {
         taskStatus = 'completed_with_warnings'
       }
+      // iris-api's NodeTaskController validator only accepts:
+      //   completed, failed, skipped, timeout
+      // `completed_with_warnings` triggers HTTP 422 "selected status is invalid",
+      // which silently drops the result write — the work succeeded but iris-api
+      // never sees it. Map down to `completed` and stash the original under metadata
+      // so we don't lose the warning signal.
+      const wireStatus = taskStatus === 'completed_with_warnings' ? 'completed' : taskStatus
       await this.cloud.submitResult(taskId, {
-        status: taskStatus,
+        status: wireStatus,
         output: truncatedOutput,
         files,
         duration_ms: Date.now() - startTime,
-        metadata: { exit_code: result.exitCode }
+        metadata: {
+          exit_code: result.exitCode,
+          ...(taskStatus !== wireStatus ? { internal_status: taskStatus } : {}),
+        },
       })
 
       console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
@@ -778,8 +788,13 @@ class TaskExecutor {
       // like the listed type's grammar, trust the title. This is a workaround until iris-api
       // stops collapsing types — keeps the daemon resilient regardless.
       if (task.type === 'leadgen' && task.title === 'inbox_scan') {
-        console.log(`[executor] [type-remap] task ${task.id?.substring(0,8)} title=inbox_scan but type=leadgen — routing as inbox_scan`)
+        // Also normalize the prompt: iris-api's stub prompt "execute" isn't a valid
+        // campaign target for the inbox_scan handler — default to "all" so we scan
+        // every active SOM account.
+        const normalizedPrompt = (!task.prompt || task.prompt.trim() === 'execute') ? 'all' : task.prompt
+        console.log(`[executor] [type-remap] task ${task.id?.substring(0,8)} title=inbox_scan but type=leadgen — routing as inbox_scan (prompt: "${task.prompt}" → "${normalizedPrompt}")`)
         task.type = 'inbox_scan'
+        task.prompt = normalizedPrompt
       }
 
       switch (task.type) {
