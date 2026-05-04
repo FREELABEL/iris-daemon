@@ -772,6 +772,16 @@ class TaskExecutor {
     return new Promise(async (resolve, reject) => {
       let cmd, args
 
+      // Type-collapse remap — iris-api's NodeTaskController has historically classified
+      // some chained tasks under the wrong `type` (e.g. inbox_scan dispatched as type=leadgen,
+      // prompt="execute"). When the title is a known task type and the prompt doesn't look
+      // like the listed type's grammar, trust the title. This is a workaround until iris-api
+      // stops collapsing types — keeps the daemon resilient regardless.
+      if (task.type === 'leadgen' && task.title === 'inbox_scan') {
+        console.log(`[executor] [type-remap] task ${task.id?.substring(0,8)} title=inbox_scan but type=leadgen — routing as inbox_scan`)
+        task.type = 'inbox_scan'
+      }
+
       switch (task.type) {
         case 'code_generation':
           // Use iris-code for code generation tasks
@@ -1063,14 +1073,35 @@ class TaskExecutor {
 
           const lgApiBase = process.env.FL_API_URL || 'https://raichu.heyiris.io'
 
+          // Resolve user_id: task → env → ~/.iris/sdk/.env (IRIS_USER_ID).
+          // fl-api requires user_id query param on most /leads endpoints.
+          let lgUserId = task.user_id || process.env.IRIS_USER_ID || null
+          if (!lgUserId) {
+            try {
+              const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
+              if (fs.existsSync(sdkEnv)) {
+                const m = fs.readFileSync(sdkEnv, 'utf-8').match(/^IRIS_USER_ID=(.+)$/m)
+                if (m) lgUserId = m[1].trim()
+              }
+            } catch { /* ignore */ }
+          }
+          if (!lgUserId) {
+            reject(new Error('leadgen: no user_id (set task.user_id, IRIS_USER_ID env, or ~/.iris/sdk/.env)'))
+            return
+          }
+
           const lgScript = `
 const TOKEN = ${JSON.stringify(lgToken)};
 const API = ${JSON.stringify(lgApiBase)};
+const USER_ID = ${JSON.stringify(String(lgUserId))};
 const ACTION = ${JSON.stringify(lgAction)};
 const PARAMS = ${JSON.stringify(lgParams)};
 
+function withUser(p) { return p + (p.includes('?') ? '&' : '?') + 'user_id=' + USER_ID; }
+
 async function call(method, p, body) {
-  const res = await fetch(API + p, {
+  const url = API + withUser(p);
+  const res = await fetch(url, {
     method,
     headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: body ? JSON.stringify(body) : undefined
@@ -1084,7 +1115,7 @@ async function call(method, p, body) {
 (async () => {
   if (ACTION === 'create') {
     if (!PARAMS.handle || !PARAMS.bloq_id) throw new Error('create requires handle= and bloq_id=');
-    const created = await call('POST', '/api/v1/leads', { handle: PARAMS.handle, bloq_id: Number(PARAMS.bloq_id) });
+    const created = await call('POST', '/api/v1/leads', { handle: PARAMS.handle, bloq_id: Number(PARAMS.bloq_id), user_id: Number(USER_ID) });
     const id = created.id || created.data?.id;
     console.log('[leadgen] created lead ' + id + ' (' + PARAMS.handle + ')');
     if (id && PARAMS.enrich !== '0') {
@@ -1098,7 +1129,10 @@ async function call(method, p, body) {
   if (ACTION === 'enrich') {
     if (!PARAMS.bloq_id) throw new Error('enrich requires bloq_id=');
     const limit = Number(PARAMS.limit || 20);
-    const list = await call('GET', '/api/v1/leads?bloq_id=' + PARAMS.bloq_id + '&per_page=' + limit, null);
+    // fl-api LeadController::index reads userId from the ROUTE param, not the query string,
+    // and the SDK Bearer token doesn't resolve to auth()->user() — so we must hit the
+    // user-scoped path. Bug surfaced as 400 "User ID required" on the daemon (May 4).
+    const list = await call('GET', '/api/v1/users/' + USER_ID + '/leads?bloq_id=' + PARAMS.bloq_id + '&per_page=' + limit, null);
     const leads = list.data || list.leads || (Array.isArray(list) ? list : []);
     console.log('[leadgen] fetched ' + leads.length + ' lead(s) from bloq ' + PARAMS.bloq_id);
     let ok = 0, fail = 0;
