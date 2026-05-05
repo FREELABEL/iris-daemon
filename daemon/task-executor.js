@@ -1593,6 +1593,10 @@ async function call(method, p, body) {
         case 'inbox_scan': {
           // Scan IG inbox for replies across all active SOM accounts
           // prompt format: "all [since=4h] [wb=1] [dry=1]" or "{account} [since=24h] [wb=1]"
+          // Normalize: iris-api dispatches with prompt="execute" which isn't a valid target
+          if (!task.prompt || task.prompt.trim() === 'execute') {
+            task.prompt = 'all'
+          }
           const scanParts = parseKeyValuePrompt(task.prompt.trim())
           const scanTarget = scanParts[0] || 'all'
           const scanArgs = scanParts.slice(1)
