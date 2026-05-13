@@ -382,14 +382,35 @@ function startDaemon () {
   const isLocalFlag = args.includes('--local')
   const isProductionFlag = args.includes('--production') || args.includes('--prod')
 
+  // Stale DO URLs from before the Railway migration (Apr 2026) — auto-fix
+  const STALE_URLS = [
+    'fl-iris-api-v5-mnmol.ondigitalocean.app',
+    'main.heyiris.io',
+    'apiv2.heyiris.io',
+  ]
+
+  function migrateStaleUrl (url) {
+    if (!url) return url
+    if (STALE_URLS.some(stale => url.includes(stale))) {
+      console.log(`[daemon] Migrating stale API URL: ${url} → ${PRODUCTION_URL}`)
+      // Auto-fix config.json so this only happens once
+      if (fileConfig.api_url && STALE_URLS.some(s => fileConfig.api_url.includes(s))) {
+        fileConfig.api_url = PRODUCTION_URL
+        try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(fileConfig, null, 2)) } catch {}
+      }
+      return PRODUCTION_URL
+    }
+    return url
+  }
+
   function resolveApiUrl () {
     if (isLocalFlag) return LOCAL_URL
     if (isProductionFlag) return PRODUCTION_URL
     const explicit = getArg('--api-url') || process.env.IRIS_API_URL
-    if (explicit) return explicit
+    if (explicit) return migrateStaleUrl(explicit)
     const configUrl = fileConfig.api_url || fileConfig.iris_api_url
     if (configUrl && !/local\.|localhost|127\.0\.0\.1/.test(configUrl)) {
-      return configUrl
+      return migrateStaleUrl(configUrl)
     }
     return PRODUCTION_URL
   }
