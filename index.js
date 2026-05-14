@@ -23,7 +23,7 @@ const CORS_ALLOWLIST = new Set([
   'https://freelabel.net',
   'https://web.freelabel.net',
   'https://heyiris.io',
-  'https://web.heyiris.io',
+  'https://freelabel.net',
   'https://app.heyiris.io',
   ...(process.env.BRIDGE_CORS_ORIGINS || '').split(',').filter(Boolean)
 ])
@@ -65,7 +65,7 @@ app.use(bridgeAuth({
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude'
 const OPENCODE_BIN = process.env.OPENCODE_BIN || '/opt/homebrew/bin/opencode'
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'
-const IRIS_API_URL = process.env.IRIS_API_URL || 'https://web.heyiris.io'
+const IRIS_API_URL = process.env.IRIS_API_URL || 'https://freelabel.net'
 const BRIDGE_VERSION = require('./package.json').version
 
 // ─── Messaging Bot State ────────────────────────────────────────
@@ -77,6 +77,16 @@ const discordBots = new Map() // token → { client, bloqId, botUsername, apiBas
 // ─── Embedded Daemon State ──────────────────────────────────────
 
 let embeddedDaemon = null
+
+/**
+ * Allow daemon.js to inject its Daemon instance so the /health
+ * endpoint reports daemon status correctly when running via
+ * `node daemon.js` (wrapper mode) instead of `node index.js`.
+ */
+function setEmbeddedDaemon (daemon) {
+  embeddedDaemon = daemon
+}
+module.exports = { setEmbeddedDaemon }
 
 // ─── iMessage Channel (OpenClaw pattern) ────────────────────────
 
@@ -3324,7 +3334,7 @@ async function autoStartDaemon () {
     const { Daemon } = require('./daemon/index')
     const daemonConfig = {
       apiKey,
-      apiUrl: apiUrl || 'https://iris-api.freelabel.net',
+      apiUrl: apiUrl || 'https://freelabel.net',
       dataDir: process.env.DAEMON_DATA_DIR || path.join(__dirname, '..', 'daemon-data'),
       flApiPath: process.env.FL_API_PATH || null,
       pusherKey,

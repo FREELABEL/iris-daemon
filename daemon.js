@@ -471,6 +471,14 @@ function startDaemon () {
 
     const daemon = new Daemon(config)
 
+    // Inject daemon into bridge's health endpoint so /health reports daemon status
+    try {
+      const bridge = require('./index')
+      if (bridge && typeof bridge.setEmbeddedDaemon === 'function') {
+        bridge.setEmbeddedDaemon(daemon)
+      }
+    } catch { /* bridge not available — daemon-only mode */ }
+
     // ─── IPC Server: Handle commands from CLI ─────────────────
     const ipcServer = net.createServer((conn) => {
       conn.on('data', (data) => {
