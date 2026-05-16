@@ -6,7 +6,16 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 
-const TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+// Token is injected by daemon via HEYIRIS_TOKEN env var (from SDK ~/.iris/sdk/.env)
+// Fallback is Freelabel's internal token — clients must have HEYIRIS_TOKEN set
+const TOKEN = process.env.HEYIRIS_TOKEN || (() => {
+  try {
+    const envPath = require('path').join(require('os').homedir(), '.iris', 'sdk', '.env');
+    const content = require('fs').readFileSync(envPath, 'utf-8');
+    const match = content.match(/IRIS_API_KEY=(.+)/);
+    return match?.[1]?.trim() || '';
+  } catch { return ''; }
+})();
 // Frontend auth needs a JWT (Passport OAuth token), not the simple API key.
 // Use IRIS_FRONTEND_TOKEN env var (full repo .env won't exist on daemon machines).
 const FRONTEND_TOKEN = process.env.IRIS_FRONTEND_TOKEN || TOKEN;
@@ -131,7 +140,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     }
   } else {
     console.log(`⚠️  No instagram-auth-${IG_ACCOUNT}.json found — run save-instagram-session first`);
-    console.log(`   IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\n`);
+    console.log(`   IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID\n`);
   }
 
   // ── PREFLIGHT: validate IG session before wasting time loading workspace ──
@@ -150,7 +159,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (onLogin || hasForm || hasLoggedOutSplash) {
         console.log(`\n${'='.repeat(70)}`);
         console.log(`  SESSION EXPIRED: @${IG_ACCOUNT}`);
-        console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`);
+        console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID`);
         console.log(`${'='.repeat(70)}\n`);
         const screenshotDir = path.join(__dirname, 'test-results/screenshots');
         fs.mkdirSync(screenshotDir, { recursive: true });
@@ -793,11 +802,11 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           const igSplashLogout = await igPage.locator('a:has-text("Log in"), button:has-text("Log in")').first().isVisible({ timeout: 1000 }).catch(() => false)
             && !(await igPage.locator('svg[aria-label="Home"]').isVisible({ timeout: 500 }).catch(() => false));
           if (isLoginPage || hasLoginForm || igSplashLogout) {
-            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`;
+            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID`;
             console.log(`\n\x1b[31m${'='.repeat(70)}\x1b[0m`);
             console.log(`\x1b[31m  SESSION EXPIRED: @${IG_ACCOUNT}\x1b[0m`);
             console.log(`\x1b[31m  Instagram redirected to login page: ${igUrl.substring(0, 80)}\x1b[0m`);
-            console.log(`\x1b[31m  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\x1b[0m`);
+            console.log(`\x1b[31m  Fix: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID\x1b[0m`);
             console.log(`\x1b[31m${'='.repeat(70)}\x1b[0m\n`);
             const screenshotDir = path.join(__dirname, 'test-results/screenshots');
             fs.mkdirSync(screenshotDir, { recursive: true });

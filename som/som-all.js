@@ -26,7 +26,14 @@ const campaignRegistry = somConfig.getCampaignRegistry();
 const { preflightCheck } = somConfig;
 
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
-const API_TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+const API_TOKEN = process.env.HEYIRIS_TOKEN || (() => {
+  try {
+    const envPath = require('path').join(require('os').homedir(), '.iris', 'sdk', '.env');
+    const content = require('fs').readFileSync(envPath, 'utf-8');
+    const match = content.match(/IRIS_API_KEY=(.+)/);
+    return match?.[1]?.trim() || '';
+  } catch { return ''; }
+})();
 const reset = '\x1b[0m';
 
 const somScript = path.join(__dirname, 'som.js');

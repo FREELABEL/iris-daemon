@@ -204,7 +204,14 @@ async function preflightCheck (boardId, strategy, opts = {}) {
   const mode = opts.mode || 'new'
   const waitDays = opts.waitDays ?? 2
   const apiBase = opts.apiUrl || process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
-  const apiToken = opts.token || process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
+  const apiToken = opts.token || process.env.HEYIRIS_TOKEN || (() => {
+    try {
+      const envPath = require('path').join(require('os').homedir(), '.iris', 'sdk', '.env')
+      const content = require('fs').readFileSync(envPath, 'utf-8')
+      const match = content.match(/IRIS_API_KEY=(.+)/)
+      return match?.[1]?.trim() || ''
+    } catch { return '' }
+  })()
 
   try {
     let url = `${apiBase}/api/v1/leads/outreach-funnel?bloq_id=${boardId}`
