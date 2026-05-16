@@ -194,90 +194,34 @@ async function getCampaignConfigs (freelabelRoot) {
   }
 }
 
-// Auto-detect freelabel project root (looks for som:creators npm script)
-/**
- * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
- * Uses /leads/outreach-funnel for step-by-step breakdown.
- * Returns { eligible: number, total: number, skip: boolean, reason: string, nextStep: object|null }
- */
-async function somPreflightCheck (boardId, strategy) {
-  const apiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
-  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
-  const prefix = '[preflight]'
-
+// SOM Preflight — delegated to som-config.js (single source of truth).
+// Lazy-loaded because freelabel path may not be resolved yet at module load time.
+let _somPreflightCheck = null
+function getSomPreflightCheck () {
+  if (_somPreflightCheck) return _somPreflightCheck
   try {
-    let url = `${apiBase}/api/v1/leads/outreach-funnel?bloq_id=${boardId}`
-    if (strategy) url += `&strategy=${encodeURIComponent(strategy)}`
-
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    })
-
-    if (!res.ok) {
-      // Fallback to /leads/stats if funnel endpoint not available
-      console.log(`${prefix} ⚠️  Funnel API returned ${res.status} — falling back to stats`)
-      const statsUrl = `${apiBase}/api/v1/leads/stats?bloq_id=${boardId}`
-      const statsRes = await fetch(statsUrl, {
-        headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!statsRes.ok) return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
-      const statsJson = await statsRes.json()
-      const eng = statsJson.data?.engagement || {}
-      const eligible = (eng.never_contacted || 0) + (eng.outreach_pending || 0)
-      const total = statsJson.data?.total_leads || 0
-      if (eligible === 0) return { eligible: 0, total, skip: true, reason: `All ${total} leads completed` }
-      return { eligible, total, skip: false, reason: `${eligible} eligible (fallback)` }
-    }
-
-    const json = await res.json()
-    const data = json.data || {}
-    const total = data.total_leads || 0
-    const neverContacted = data.never_contacted || 0
-    const steps = data.steps || []
-    const nextAction = data.next_action
-    const summary = data.summary || {}
-
-    if (total === 0) {
-      return { eligible: 0, total: 0, skip: true, reason: `Board ${boardId} has 0 leads` }
-    }
-
-    // Log the funnel for visibility
-    if (steps.length > 0) {
-      for (const s of steps) {
-        console.log(`${prefix}   Step ${s.step} "${s.title}": ${s.completed}/${s.eligible} (${s.conversion}%)`)
+    const freelabelRoot = findFreelabelPath()
+    if (freelabelRoot) {
+      const somConfig = require(path.join(freelabelRoot, 'tests', 'e2e', 'som-config.js'))
+      if (somConfig.preflightCheck) {
+        _somPreflightCheck = somConfig.preflightCheck
+        return _somPreflightCheck
       }
     }
-    if (neverContacted > 0) {
-      console.log(`${prefix}   Never contacted: ${neverContacted}`)
-    }
-
-    // Skip decision: Playwright's default mode is filter=new — it only contacts leads
-    // that have NO outreach steps at all (.fa-paper-plane icon absent in UI).
-    // So "never_contacted" is the correct signal for the skip decision.
-    // The funnel steps (DM Invite → Follow Up → etc.) are for visibility/dashboards,
-    // but the daemon should skip when there are NO new leads to contact.
-    if (neverContacted === 0) {
-      // Log what's left in the pipeline for visibility
-      const stepSummary = steps.filter(s => s.pending > 0).map(s => `${s.title}: ${s.pending} pending`).join(', ')
-      return {
-        eligible: 0, total, skip: true,
-        reason: `All ${total} leads already contacted` + (stepSummary ? ` (follow-up pipeline: ${stepSummary})` : ''),
-        nextStep: nextAction,
-      }
-    }
-
-    return {
-      eligible: neverContacted, total, skip: false,
-      reason: `${neverContacted} new leads to contact` + (nextAction ? ` (next: ${nextAction.action})` : ''),
-      nextStep: nextAction,
-    }
-  } catch (err) {
-    console.log(`${prefix} ⚠️  Preflight failed: ${err.message} — will run anyway`)
-    return { eligible: -1, total: -1, skip: false, reason: 'preflight_error' }
+  } catch { /* fall through */ }
+  // Fallback: inline minimal check (shouldn't happen if freelabel path is found)
+  _somPreflightCheck = async (boardId) => {
+    console.log('[preflight] WARNING: using inline fallback — som-config.js not found')
+    return { eligible: -1, total: -1, skip: false, reason: 'fallback' }
   }
+  return _somPreflightCheck
 }
+async function somPreflightCheck (boardId, strategy, opts = {}) {
+  const check = getSomPreflightCheck()
+  return check(boardId, strategy, opts)
+}
+
+// Auto-detect freelabel project root (looks for som:creators npm script)
 
 function findFreelabelPath () {
   // 1. Explicit env var
@@ -299,7 +243,14 @@ function findFreelabelPath () {
   // 3. Relative paths from daemon/ directory
   const candidates = [
     path.resolve(__dirname, '../../..'),  // fl-docker-dev/coding-agent-bridge/daemon/ → freelabel root
-    path.resolve(__dirname, '../../../..') // one level up
+    path.resolve(__dirname, '../../../..'), // one level up
+    // 4. Common developer paths
+    path.join(os.homedir(), 'Sites', 'freelabel'),
+    path.join(os.homedir(), 'projects', 'freelabel'),
+    path.join(os.homedir(), 'code', 'freelabel'),
+    path.join(os.homedir(), 'dev', 'freelabel'),
+    path.join(os.homedir(), 'Developer', 'freelabel'),
+    path.join(os.homedir(), 'workspace', 'freelabel'),
   ]
   for (const c of candidates) {
     const pkg = path.join(c, 'package.json')
@@ -411,7 +362,7 @@ class TaskExecutor {
 
     // ── Dedup: reject if same task type is already running ──
     // Prevents duplicate som_batch / discover when scheduler fires faster than execution
-    const singletonTypes = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan']
+    const singletonTypes = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter', 'venue_enrich']
     if (singletonTypes.includes(task.type)) {
       const runningOfSameType = (this._runningTasks || []).filter(t => t.type === task.type)
       if (runningOfSameType.length > 0) {
@@ -428,9 +379,28 @@ class TaskExecutor {
       }
     }
 
+    // ── Dedup: reject duplicate custom_playwright for same requirement_id ──
+    if (task.type === 'custom_playwright' && task.config?.requirement_id) {
+      const runningReq = (this._runningTasks || []).find(
+        t => t.type === 'custom_playwright' && t.requirementId === task.config.requirement_id
+      )
+      if (runningReq) {
+        console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate custom_playwright for requirement ${task.config.requirement_id} — already running`)
+        try {
+          await this.cloud.submitResult(taskId, {
+            status: 'failed',
+            error: `Duplicate custom_playwright for requirement ${task.config.requirement_id} rejected`,
+            output: '',
+            duration_ms: 0
+          })
+        } catch {}
+        return
+      }
+    }
+
     // Track running tasks for dedup (cleaned up in finally block at end of execute)
     if (!this._runningTasks) this._runningTasks = []
-    this._runningTasks.push({ id: taskId, type: task.type })
+    this._runningTasks.push({ id: taskId, type: task.type, requirementId: task.config?.requirement_id || null })
     const _cleanupRunning = () => {
       this._runningTasks = (this._runningTasks || []).filter(t => t.id !== taskId)
     }
@@ -508,6 +478,27 @@ class TaskExecutor {
     }
 
     try {
+      // ── Short-circuit: message type needs no subprocess (any runtime) ──
+      if (task.type === 'message') {
+        const msgConfig = task.config || {}
+        const senderName = msgConfig.sender_name || 'Unknown'
+        const msgText = (task.prompt || '').trim()
+        const tsNow = new Date().toLocaleTimeString('en-US', { hour12: false })
+        console.log(`\n[${tsNow}] \x1b[36m${senderName}\x1b[0m: ${msgText}\n`)
+        try {
+          const notifText = msgText.length > 200 ? msgText.substring(0, 197) + '...' : msgText
+          execSync(`osascript -e 'display notification "${notifText.replace(/["\\]/g, '')}" with title "IRIS Message from ${senderName.replace(/["\\]/g, '')}"'`, { timeout: 5000, stdio: 'ignore' })
+        } catch { /* non-macOS or notification failed */ }
+        clearInterval(progressInterval)
+        await this.cloud.submitResult(taskId, {
+          status: 'completed',
+          output: `Message delivered from ${senderName}`,
+          duration_ms: Date.now() - startTime,
+        })
+        this.notifyDiscord(task, 'completed', Date.now() - startTime, [`Message from ${senderName}: ${msgText}`]).catch(() => {})
+        return
+      }
+
       // Delegate to runtime-specific executor if not iris_agent
       let result
       if (runtime !== 'iris_agent') {
@@ -517,6 +508,18 @@ class TaskExecutor {
       }
 
       clearInterval(progressInterval)
+
+      // ── Retry comms_sync on instant death (exit code null = signal kill) ──
+      // Bun-compiled iris binary sometimes crashes on concurrent spawn (tempfile race).
+      // One retry after 3s delay typically succeeds.
+      if (task.type === 'comms_sync' && result.exitCode === null && (Date.now() - startTime) < 5000) {
+        console.log(`[executor] comms_sync: instant death (exit null, ${Date.now() - startTime}ms) — retrying in 3s`)
+        await new Promise(r => setTimeout(r, 3000))
+        const retryLines = []
+        result = await this.runProcess(task, workspace, retryLines)
+        outputLines.push('[executor] === RETRY ATTEMPT ===', ...retryLines)
+        console.log(`[executor] comms_sync retry: exit=${result.exitCode}`)
+      }
 
       // ── Handle login expired — detect [LOGIN_EXPIRED] sentinel in output ──
       const loginExpired = outputLines.some(line => line.includes('[LOGIN_EXPIRED]'))
@@ -663,7 +666,7 @@ class TaskExecutor {
       // All task types (discover, som_batch, inbox_scan) now run as independent scheduled jobs.
       // Chaining was elegant but fragile — caused Chrome/Playwright process explosions when
       // scheduled jobs + chains fired simultaneously (e.g. 3 discovers → 3 som_batches → 3 inbox_scans).
-      // Jobs: #761 (discover, hourly), #762 (som_batch, every 2h), #792 (inbox_scan, hourly).
+      // Jobs: #761 (discover, hourly), #762 (som_batch, every 2h), #792 (inbox_scan, every 2h).
 
       // ── Auto-chain: remotion/remotion_carousel → upload to CDN + post to Buffer ──
       if ((task.type === 'remotion' || task.type === 'remotion_carousel') && task.config?.auto_publish !== false) {
@@ -775,6 +778,20 @@ class TaskExecutor {
       this.runningTasks.delete(taskId)
       // Clean up workspace after a delay (keep for debugging)
       setTimeout(() => this.workspaces.cleanup(taskId), 60000)
+
+      // Clean up any orphaned Playwright/Chrome processes from this task
+      try {
+        const { execSync } = require('child_process')
+        const pwCount = parseInt(execSync("ps aux | grep '[p]laywright' | wc -l", { timeout: 3000 }).toString().trim(), 10) || 0
+        if (pwCount > 8) {
+          console.log(`[executor] Cleaning ${pwCount} stale Playwright processes...`)
+          execSync("pkill -f 'playwright.*test' 2>/dev/null || true", { timeout: 5000 })
+          // Give Chrome processes a moment to exit gracefully
+          setTimeout(() => {
+            try { execSync("pkill -f 'Google Chrome.*playwright' 2>/dev/null || true", { timeout: 5000 }) } catch {}
+          }, 3000)
+        }
+      } catch {}
     }
   }
 
@@ -795,6 +812,22 @@ class TaskExecutor {
         console.log(`[executor] [type-remap] task ${task.id?.substring(0,8)} title=inbox_scan but type=leadgen — routing as inbox_scan (prompt: "${task.prompt}" → "${normalizedPrompt}")`)
         task.type = 'inbox_scan'
         task.prompt = normalizedPrompt
+      }
+
+      // venue-search dispatched as sandbox_execute — remap to venue_search so
+      // the prompt is treated as a search query, not a bash script.
+      // Two variants: (a) prompt is a plain query, (b) prompt is a full bash/Playwright script.
+      // For (b), the script already handles itself — leave as sandbox_execute.
+      // For (a), remap to venue_search.
+      if (task.type === 'sandbox_execute' && (task.title || '').startsWith('venue-search')) {
+        const prompt = (task.prompt || '').trim()
+        const isScript = prompt.startsWith('#!') || prompt.startsWith('set ') || prompt.includes('node ') || prompt.includes('npx ')
+        if (!isScript) {
+          const query = prompt || (task.title || '').replace(/^venue-search:\s*/i, '')
+          console.log(`[executor] [type-remap] task ${task.id?.substring(0,8)} title="${task.title}" but type=sandbox_execute — routing as venue_search (query: "${query}")`)
+          task.type = 'venue_search'
+          task.prompt = query
+        }
       }
 
       switch (task.type) {
@@ -842,6 +875,16 @@ class TaskExecutor {
           const irisAbsPath = path.join(os.homedir(), '.iris', 'bin', 'iris')
           cmd = fs.existsSync(irisAbsPath) ? irisAbsPath : 'iris'
           args = ['leads', 'sync-comms', ...leadIds.map(String), '--days', String(days), '--limit', String(limit)]
+
+          // Stagger comms_sync start by 2s to avoid concurrent Bun binary spawn races.
+          // The iris binary (Bun-compiled) can crash with exit code null when multiple
+          // instances initialize simultaneously (shared tempfile/lockfile contention).
+          const otherIrisTasks = (this._runningTasks || []).filter(t => t.type === 'comms_sync' || t.type === 'inbox_scan')
+          if (otherIrisTasks.length > 0) {
+            console.log(`[executor] comms_sync: waiting 3s — another iris task running`)
+            await new Promise(r => setTimeout(r, 3000))
+          }
+
           console.log(`[executor] comms_sync: ${leadIds.length} lead(s), days=${days}, cmd=${cmd}`)
           break
         }
@@ -968,14 +1011,17 @@ class TaskExecutor {
           const somExtraArgs = somParts.slice(1) // mode=scrape target=... limit=...
 
           const freelabelRoot = this.freelabelPath || findFreelabelPath()
-          if (!freelabelRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+          // Bundled SOM specs (shipped with daemon package) — used when full repo isn't available
+          const bundledSomDir = path.join(__dirname, '..', 'som')
+          const hasBundledSom = fs.existsSync(path.join(bundledSomDir, 'batch-with-login.spec.ts'))
+          if (!freelabelRoot && !hasBundledSom) {
+            reject(new Error('Freelabel project root not found and no bundled SOM specs. Set FREELABEL_PATH env var or install bridge update.'))
             return
           }
 
           // ── Campaign config registry (DB-first, som-config.js fallback) ──
           // Phase 2: reads from iris-api /campaign-templates/daemon-configs
-          const { configs: somCampaignConfigs, source: configSource } = await getCampaignConfigs(freelabelRoot)
+          const { configs: somCampaignConfigs, source: configSource } = await getCampaignConfigs(freelabelRoot || bundledSomDir)
           console.log(`[executor] Campaign configs loaded from ${configSource}`)
 
           const campaignConfig = somCampaignConfigs[campaign]
@@ -985,8 +1031,12 @@ class TaskExecutor {
 
           // ── Preflight: check for eligible leads before launching Chromium ──
           if (campaignConfig?.boardId) {
-            const preflight = await somPreflightCheck(campaignConfig.boardId, campaignConfig.strategy)
-            console.log(`[executor] Preflight board ${campaignConfig.boardId}: ${preflight.eligible} eligible / ${preflight.total} total — ${preflight.reason}`)
+            const filterArg = somExtraArgs.find(a => a.toLowerCase().startsWith('filter='))
+            const preflightMode = filterArg ? filterArg.split('=')[1].toLowerCase() : 'new'
+            const waitArg = somExtraArgs.find(a => a.toLowerCase().startsWith('wait_days='))
+            const preflightWait = waitArg ? parseInt(waitArg.split('=')[1], 10) : 2
+            const preflight = await somPreflightCheck(campaignConfig.boardId, campaignConfig.strategy, { mode: preflightMode, waitDays: preflightWait })
+            console.log(`[executor] Preflight board ${campaignConfig.boardId} (${preflightMode}): ${preflight.eligible} eligible / ${preflight.total} total — ${preflight.reason}`)
             if (preflight.skip) {
               console.log(`[executor] ⏭️  Skipping ${campaign} — ${preflight.reason}`)
               // Send Discord notification about exhausted leads
@@ -1014,9 +1064,13 @@ class TaskExecutor {
           // Use npx playwright directly with --headed to prevent Chrome crashes
           // (channel: 'chrome' in playwright.config uses system Chrome which needs a visible window)
           cmd = 'npx'
-          const somSpec = somParts.some(p => p.startsWith('mode='))
+          const somSpecRelative = somParts.some(p => p.startsWith('mode='))
             ? undefined // non-default mode — som.js picks the right spec
-            : 'tests/e2e/batch-with-login.spec.ts'
+            : null // outreach mode — resolve below
+          // Resolve spec path: prefer full repo, fall back to bundled som/ directory
+          const somSpec = somSpecRelative === undefined ? undefined
+            : freelabelRoot ? 'tests/e2e/batch-with-login.spec.ts'
+            : path.join(bundledSomDir, 'batch-with-login.spec.ts')
 
           if (somSpec) {
             // Direct playwright invocation for outreach mode (most common)
@@ -1046,10 +1100,16 @@ class TaskExecutor {
             task.config.env_vars = { ...(task.config.env_vars || {}), ...somEnv }
           } else {
             // Non-outreach mode (scrape, engage, email) — let som.js handle it
-            cmd = 'npm'
-            args = ['run', `som:${campaign}`, '--', ...somExtraArgs]
+            if (freelabelRoot) {
+              cmd = 'npm'
+              args = ['run', `som:${campaign}`, '--', ...somExtraArgs]
+            } else {
+              // Use bundled som.js from daemon package
+              cmd = 'node'
+              args = [path.join(bundledSomDir, 'som.js'), campaign, ...somExtraArgs]
+            }
           }
-          workspace.projectDir = freelabelRoot
+          workspace.projectDir = freelabelRoot || bundledSomDir
           break
         }
 
@@ -1466,6 +1526,29 @@ async function call(method, p, body) {
           break
         }
 
+        case 'venue_search': {
+          // Search for venues via IRIS CLI (uses Serper Places or browser fallback)
+          // prompt is the search query, e.g. "coffee shops with event space Dallas TX"
+          const vsQuery = (task.prompt || '').trim()
+          if (!vsQuery) {
+            reject(new Error('venue_search: no search query provided'))
+            return
+          }
+          const vsSave = task.config?.save !== false // default: save results
+          const vsLimit = task.config?.limit || 10
+          const vsType = task.config?.venue_type || 'venue'
+          const irisBin = [
+            path.join(process.env.HOME || '', '.iris/bin/iris'),
+            '/usr/local/bin/iris',
+            'iris'
+          ].find(p => { try { return p === 'iris' || fs.existsSync(p) } catch { return false } }) || 'iris'
+          cmd = irisBin
+          args = ['venues', 'search', vsQuery, '--limit', String(vsLimit), '--type', vsType]
+          if (vsSave) args.push('--save')
+          args.push('--json')
+          break
+        }
+
         case 'enrich_scrape': {
           // Browser-based venue enrichment — Googles businesses, scrapes websites for emails
           // prompt format: "{board_id} [limit=20] [dry=1]"
@@ -1494,6 +1577,22 @@ async function call(method, p, body) {
           break
         }
 
+        case 'venue_enrich': {
+          // Enrich venues via Google Places API + create leads with outreach
+          // prompt format: "city=Austin limit=10 [board_id=292] [strategy_id=37] [dry_run=1]"
+          const venueEnrichArgs = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
+          const venueEnrichRoot = this.freelabelPath || findFreelabelPath()
+          if (!venueEnrichRoot) {
+            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            return
+          }
+
+          cmd = 'node'
+          args = ['fl-docker-dev/coding-agent-bridge/scripts/venue-enrich-outreach.js', ...venueEnrichArgs]
+          workspace.projectDir = venueEnrichRoot
+          break
+        }
+
         case 'som_batch': {
           // Run all outreach campaigns via som-all.js (parallel by default)
           // prompt format: "[key=value ...]"
@@ -1501,22 +1600,29 @@ async function call(method, p, body) {
           // Enrichment is built into som-all.js — auto-runs for email mode
           const batchArgs = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
           const batchRoot = this.freelabelPath || findFreelabelPath()
-          if (!batchRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+          const batchBundledSomDir = path.join(__dirname, '..', 'som')
+          const batchHasBundledSom = fs.existsSync(path.join(batchBundledSomDir, 'som-all.js'))
+          if (!batchRoot && !batchHasBundledSom) {
+            reject(new Error('Freelabel project root not found and no bundled SOM specs. Set FREELABEL_PATH env var.'))
             return
           }
 
           // ── Preflight: check ALL active campaigns for eligible leads (DB-first) ──
           try {
-            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(batchRoot)
-            console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts)`)
+            const batchFilterArg = batchArgs.find(a => a.toLowerCase().startsWith('filter='))
+            const batchMode = batchFilterArg ? batchFilterArg.split('=')[1].toLowerCase() : 'new'
+            const batchWaitArg = batchArgs.find(a => a.toLowerCase().startsWith('wait_days='))
+            const batchWait = batchWaitArg ? parseInt(batchWaitArg.split('=')[1], 10) : 2
+
+            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(batchRoot || batchBundledSomDir)
+            console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts, mode=${batchMode})`)
             let anyEligible = false
             const skippedCampaigns = []
 
             for (const cfg of activeAccountsList) {
               if (cfg.boardId) {
                 const strategy = allConfigs[cfg.id]?.strategy || null
-                const pf = await somPreflightCheck(cfg.boardId, strategy)
+                const pf = await somPreflightCheck(cfg.boardId, strategy, { mode: batchMode, waitDays: batchWait })
                 console.log(`[executor] Preflight ${cfg.id} (board ${cfg.boardId}): ${pf.eligible} eligible — ${pf.reason}`)
                 if (!pf.skip) anyEligible = true
                 else skippedCampaigns.push(`${cfg.id} (${pf.reason})`)
@@ -1548,9 +1654,15 @@ async function call(method, p, body) {
             console.log(`[executor] ⚠️  Batch preflight failed: ${err.message} — running anyway`)
           }
 
-          cmd = 'npm'
-          args = ['run', 'som:all', '--', ...batchArgs]
-          workspace.projectDir = batchRoot
+          if (batchRoot) {
+            cmd = 'npm'
+            args = ['run', 'som:all', '--', ...batchArgs]
+          } else {
+            // Use bundled som-all.js from daemon package
+            cmd = 'node'
+            args = [path.join(batchBundledSomDir, 'som-all.js'), ...batchArgs]
+          }
+          workspace.projectDir = batchRoot || batchBundledSomDir
           break
         }
 
@@ -1569,24 +1681,23 @@ async function call(method, p, body) {
             return
           }
 
-          if (this.dockerMode === null) {
-            this.dockerMode = isDockerMode()
+          // Re-check Docker on every run (container may have stopped since last check)
+          this.dockerMode = isDockerMode()
+
+          if (!this.dockerMode) {
+            // No Docker = no ffmpeg/assets container = clip_cutter can't run
+            reject(new Error('clip_cutter requires Docker (api container with ffmpeg). Docker is not running.'))
+            return
           }
 
           const clipArtisanArgs = ['clips:cut-scheduled', `--brand=${clipBrand}`, `--threshold=${clipThreshold}`]
           if (clipDry) clipArtisanArgs.push('--dry-run')
           if (clipUrl) clipArtisanArgs.push(`--url=${clipUrl}`)
 
-          if (this.dockerMode) {
-            const dockerRoot = path.resolve(this.flApiPath, '..')
-            cmd = 'docker'
-            args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
-            workspace.projectDir = dockerRoot
-          } else {
-            cmd = 'php'
-            args = ['artisan', ...clipArtisanArgs]
-            workspace.projectDir = this.flApiPath
-          }
+          const dockerRoot = path.resolve(this.flApiPath, '..')
+          cmd = 'docker'
+          args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
+          workspace.projectDir = dockerRoot
           break
         }
 
@@ -1636,7 +1747,7 @@ async function call(method, p, body) {
 
           // Run sequentially — one browser per account
           const runnerScript = scanAccounts.map(a =>
-            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} LIMIT=30 npx playwright test tests/e2e/inbox-followup.spec.ts --headed --timeout=120000`
+            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} LIMIT=100 npx playwright test tests/e2e/inbox-followup.spec.ts --headed --timeout=180000`
           ).join(' && ')
           cmd = 'bash'
           args = ['-c', runnerScript]
@@ -2376,6 +2487,27 @@ exit 1
           break
         }
 
+        case 'message': {
+          // P2P message from another Hive node — show notification + terminal output
+          const msgConfig = task.config || {}
+          const senderName = msgConfig.sender_name || 'Unknown'
+          const msgText = (task.prompt || '').trim()
+
+          // Print to daemon terminal with timestamp
+          const ts = new Date().toLocaleTimeString('en-US', { hour12: false })
+          console.log(`\n[${ts}] \x1b[36m${senderName}\x1b[0m: ${msgText}\n`)
+
+          // macOS notification (non-blocking, best-effort)
+          try {
+            const notifText = msgText.length > 200 ? msgText.substring(0, 197) + '...' : msgText
+            execSync(`osascript -e 'display notification "${notifText.replace(/["\\]/g, '')}" with title "IRIS Message from ${senderName.replace(/["\\]/g, '')}"'`, { timeout: 5000, stdio: 'ignore' })
+          } catch { /* non-macOS or notification failed — not critical */ }
+
+          // Resolve immediately — no subprocess needed
+          resolve({ output: `Message delivered from ${senderName}`, files: [] })
+          return
+        }
+
         default:
           // Default: treat prompt as a shell command
           cmd = '/bin/bash'
@@ -2442,7 +2574,7 @@ exit 1
       const timeout = (explicit || typeDefault) * 1000
       const timeoutLabel = timeout / 1000
       // custom_playwright: failures = test results, not crashes — preserve output
-      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'custom_playwright']
+      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'comms_sync', 'custom_playwright']
       const isGraceful = gracefulTypes.includes(task.type)
 
       const timer = setTimeout(() => {
