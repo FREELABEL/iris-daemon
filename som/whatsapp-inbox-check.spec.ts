@@ -11,12 +11,37 @@ const LIMIT = parseInt(process.env.LIMIT || '20', 10);
 const WA_ACCOUNT = process.env.WA_ACCOUNT || 'default';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 
-// Hive credential protocol: BROWSER_SESSION_FILE points to a directory for WA
-// (unlike IG which uses a JSON file — WA needs persistent context for IndexedDB)
-const SESSION_DIR = process.env.BROWSER_SESSION_FILE
+// Hive credential protocol: BROWSER_SESSION_FILE can be:
+//   1. A directory path (persistent browser profile) — used directly
+//   2. A .tar.gz/.tgz archive — extracted to temp dir on start
+//   3. A .json file — NOT supported for WA (needs IndexedDB, not just cookies)
+const SESSION_INPUT = process.env.BROWSER_SESSION_FILE
   || process.env.WA_SESSION_DIR
   || path.join(os.homedir(), '.iris', 'whatsapp-sessions', WA_ACCOUNT);
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
+
+/** Resolve session input to a usable directory, extracting archives if needed */
+function resolveSessionDir(input: string): { dir: string; cleanup: boolean } {
+  // Archive: extract to temp dir
+  if (input.endsWith('.tar.gz') || input.endsWith('.tgz')) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-session-'));
+    const { execSync } = require('child_process');
+    execSync(`tar -xzf "${input}" -C "${tmpDir}"`, { stdio: 'pipe' });
+    console.log(`  Extracted session archive to ${tmpDir}`);
+    return { dir: tmpDir, cleanup: true };
+  }
+
+  // JSON file: unsupported — WhatsApp needs persistent context (IndexedDB)
+  if (input.endsWith('.json')) {
+    console.log(`  ERROR: JSON session files not supported for WhatsApp.`);
+    console.log(`  WhatsApp stores auth in IndexedDB, not cookies.`);
+    console.log(`  Run: WA_ACCOUNT=${WA_ACCOUNT} npx playwright test som/save-whatsapp-session.spec.ts --headed`);
+    return { dir: '', cleanup: false };
+  }
+
+  // Directory: use as-is
+  return { dir: input, cleanup: false };
+}
 
 const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
   'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
@@ -51,17 +76,30 @@ function phoneMatch(a: string, b: string): boolean {
   return na === nb;
 }
 
-/** Fuzzy name match (fallback when phone not available) */
+/** Fuzzy name match — safe for short names (no "Al" matching "Alice") */
 function nameMatch(a: string, b: string): boolean {
   const na = a.toLowerCase().replace(/[^a-z0-9._]/g, '').trim();
   const nb = b.toLowerCase().replace(/[^a-z0-9._]/g, '').trim();
   if (!na || !nb || na.length < 2 || nb.length < 2) return false;
-  return na.includes(nb) || nb.includes(na) || na === nb;
+  if (na === nb) return true;
+  // Short names (< 5 chars): exact match only — prevents "Al" matching "Albert"
+  if (na.length < 5 || nb.length < 5) return false;
+  // Longer names: substring match only if shorter is >= 40% of longer
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length > nb.length ? na : nb;
+  if (shorter.length / longer.length < 0.4) return false;
+  return longer.includes(shorter);
 }
 
 test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async () => {
   test.setTimeout(600000); // 10 minutes for full inbox scan
-  // ── Validate session directory ──
+
+  // ── Resolve session (directory, archive, or error) ──
+  const resolved = resolveSessionDir(SESSION_INPUT);
+  if (!resolved.dir) return; // JSON file or other unsupported format
+
+  const SESSION_DIR = resolved.dir;
+
   if (!fs.existsSync(SESSION_DIR) || !fs.readdirSync(SESSION_DIR).length) {
     console.log(`No session found: ${SESSION_DIR}`);
     console.log(`Run: WA_ACCOUNT=${WA_ACCOUNT} npx playwright test som/save-whatsapp-session.spec.ts --headed`);
@@ -415,5 +453,9 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
     }
   } finally {
     await context.close();
+    // Clean up extracted temp directory if we unpacked an archive
+    if (resolved.cleanup && fs.existsSync(SESSION_DIR)) {
+      try { fs.rmSync(SESSION_DIR, { recursive: true }); } catch {}
+    }
   }
 });

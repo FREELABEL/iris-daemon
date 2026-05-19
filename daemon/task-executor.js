@@ -314,7 +314,10 @@ function findFlApiPath () {
 // Detect if fl-api is running inside Docker
 function isDockerMode () {
   try {
-    execSync('docker compose ps api --quiet', { stdio: 'pipe', timeout: 5000 })
+    // Must run from fl-docker-dev where docker-compose.yml lives
+    const dockerRoot = findFlApiPath()
+    const cwd = dockerRoot ? path.resolve(dockerRoot, '..') : undefined
+    execSync('docker compose ps api --quiet', { stdio: 'pipe', timeout: 5000, cwd })
     return true
   } catch {
     return false
@@ -322,12 +325,19 @@ function isDockerMode () {
 }
 
 class TaskExecutor {
+  // Task types that spawn Playwright/Chromium — only 1 browser at a time.
+  // This prevents 5 Chromium windows opening simultaneously when schedules cluster.
+  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright']
+
   constructor (cloudClient, workspaceManager) {
     this.cloud = cloudClient
     this.workspaces = workspaceManager
     this.runningTasks = new Map() // taskId → childProcess
     this.flApiPath = findFlApiPath()
     this.dockerMode = null // lazily detected
+    this._browserQueue = []   // queued browser tasks waiting for their turn
+    this._browserRunning = false // true when a browser task is executing
+    this._executedTaskIds = new Map() // taskId -> timestamp (prevents re-execution from duplicate Pusher events)
     const verbose = process.env.DAEMON_VERBOSE || process.env.FL_API_PATH || process.env.FREELABEL_PATH
     if (this.flApiPath) {
       if (verbose) console.log(`[executor] fl-api path: ${this.flApiPath}`)
@@ -360,13 +370,33 @@ class TaskExecutor {
 
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
+    // ── Task ID dedup: reject if we've already executed/are executing this exact task ──
+    const now = Date.now()
+    for (const [id, seenTs] of this._executedTaskIds) {
+      if (now - seenTs > 3600000) this._executedTaskIds.delete(id)
+    }
+    if (this._executedTaskIds.has(taskId)) {
+      console.log(`[executor] [${ts()}] Duplicate task ${taskId.substring(0, 12)} — already executed/executing. Ignoring.`)
+      return
+    }
+    this._executedTaskIds.set(taskId, now)
+
+    // Track running tasks IMMEDIATELY (before any await) so concurrent calls see it
+    if (!this._runningTasks) this._runningTasks = []
+    this._runningTasks.push({ id: taskId, type: task.type, requirementId: task.config?.requirement_id || null })
+    const _cleanupRunning = () => {
+      this._runningTasks = (this._runningTasks || []).filter(t => t.id !== taskId)
+    }
+
     // ── Dedup: reject if same task type is already running ──
     // Prevents duplicate som_batch / discover when scheduler fires faster than execution
     const singletonTypes = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter', 'venue_enrich']
     if (singletonTypes.includes(task.type)) {
-      const runningOfSameType = (this._runningTasks || []).filter(t => t.type === task.type)
+      // Count others of same type (exclude self — we just pushed above)
+      const runningOfSameType = this._runningTasks.filter(t => t.type === task.type && t.id !== taskId)
       if (runningOfSameType.length > 0) {
         console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate ${task.type} — already running (${runningOfSameType[0].id.substring(0, 12)})`)
+        _cleanupRunning()
         try {
           await this.cloud.submitResult(taskId, {
             status: 'failed',
@@ -381,11 +411,12 @@ class TaskExecutor {
 
     // ── Dedup: reject duplicate custom_playwright for same requirement_id ──
     if (task.type === 'custom_playwright' && task.config?.requirement_id) {
-      const runningReq = (this._runningTasks || []).find(
-        t => t.type === 'custom_playwright' && t.requirementId === task.config.requirement_id
+      const runningReq = this._runningTasks.find(
+        t => t.type === 'custom_playwright' && t.requirementId === task.config.requirement_id && t.id !== taskId
       )
       if (runningReq) {
         console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate custom_playwright for requirement ${task.config.requirement_id} — already running`)
+        _cleanupRunning()
         try {
           await this.cloud.submitResult(taskId, {
             status: 'failed',
@@ -398,12 +429,30 @@ class TaskExecutor {
       }
     }
 
-    // Track running tasks for dedup (cleaned up in finally block at end of execute)
-    if (!this._runningTasks) this._runningTasks = []
-    this._runningTasks.push({ id: taskId, type: task.type, requirementId: task.config?.requirement_id || null })
-    const _cleanupRunning = () => {
-      this._runningTasks = (this._runningTasks || []).filter(t => t.id !== taskId)
+    // ── Browser concurrency gate: max 1 Chromium at a time ──
+    // When a browser task arrives while another is running, queue it locally
+    // and execute it when the current one finishes. Prevents 5 Chromium windows.
+    const isBrowserTask = TaskExecutor.BROWSER_TYPES.includes(task.type)
+    if (isBrowserTask && this._browserRunning) {
+      const queueLen = this._browserQueue.length
+      if (queueLen >= 3) {
+        console.log(`[executor] [${ts()}] ⏭ Browser queue full (${queueLen}) — rejecting ${task.type} ${taskId.substring(0, 12)}`)
+        _cleanupRunning()
+        try {
+          await this.cloud.submitResult(taskId, {
+            status: 'failed',
+            error: `Browser queue full (${queueLen} waiting) — task rejected to prevent resource exhaustion`,
+            output: '',
+            duration_ms: 0
+          })
+        } catch {}
+        return
+      }
+      console.log(`[executor] [${ts()}] ⏳ Browser busy — queuing ${task.type} ${taskId.substring(0, 12)} (position ${queueLen + 1})`)
+      this._browserQueue.push(task)
+      return
     }
+    if (isBrowserTask) this._browserRunning = true
 
     const taskShort = taskId.substring(0, 12)
     const timeoutSec = task.timeout_seconds || task.config?.timeout_seconds || 'default'
@@ -462,8 +511,25 @@ class TaskExecutor {
             Object.assign(task.config.env_vars, credResult.env_vars)
             console.log(`[executor] Injected ${Object.keys(credResult.env_vars).length} env vars from ${task.config.platform} credentials`)
           }
-          // For browser_session credentials, write to file
-          if (credResult.credential_type !== 'api_key') {
+          // For browser_profile credentials (WhatsApp), extract archive to directory
+          if (credResult.credential_type === 'browser_profile') {
+            const profileDir = path.join(workspace.dir, 'browser-profile')
+            fs.mkdirSync(profileDir, { recursive: true })
+            // credentials contains base64-encoded tar.gz of the browser profile
+            const archivePath = path.join(workspace.dir, 'session-profile.tar.gz')
+            const archiveData = Buffer.from(credResult.credentials.archive || credResult.credentials, 'base64')
+            fs.writeFileSync(archivePath, archiveData)
+            fs.chmodSync(archivePath, '600')
+            const { execSync } = require('child_process')
+            execSync(`tar -xzf "${archivePath}" -C "${profileDir}"`, { stdio: 'pipe' })
+            fs.unlinkSync(archivePath) // remove archive after extraction
+            task.config.env_vars = task.config.env_vars || {}
+            task.config.env_vars.BROWSER_SESSION_FILE = profileDir
+            credentialFilePath = profileDir
+            console.log(`[executor] Browser profile extracted to ${profileDir}`)
+          }
+          // For browser_session credentials (IG/LinkedIn), write to JSON file
+          else if (credResult.credential_type !== 'api_key') {
             credentialFilePath = path.join(workspace.dir, 'session-auth.json')
             fs.writeFileSync(credentialFilePath, JSON.stringify(credResult.credentials), 'utf-8')
             fs.chmodSync(credentialFilePath, '600')
@@ -662,6 +728,67 @@ class TaskExecutor {
 
       console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
 
+      // ── Upload Playwright videos as lead deliverables ──
+      if (task.type === 'custom_playwright' && task.config?.lead_id) {
+        try {
+          const taskDir = path.join(this.workspaces.tasksDir, taskId)
+          const testResultsDir = path.join(taskDir, 'test-results')
+          const videoFiles = []
+          // Playwright puts videos in test-results/<test-hash>/*.webm
+          if (fs.existsSync(testResultsDir)) {
+            const walk = (dir) => {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name)
+                if (entry.isDirectory()) walk(full)
+                else if (entry.name.endsWith('.webm') || entry.name.endsWith('.mp4')) videoFiles.push(full)
+              }
+            }
+            walk(testResultsDir)
+          }
+
+          if (videoFiles.length > 0) {
+            const flApiUrl = process.env.FL_API_URL || 'https://raichu.heyiris.io'
+            let flApiToken = process.env.IRIS_API_KEY || process.env.FL_RAICHU_API_TOKEN || ''
+            if (!flApiToken) {
+              // Read from SDK env file
+              try {
+                const sdkEnv = fs.readFileSync(path.join(os.homedir(), '.iris', 'sdk', '.env'), 'utf-8')
+                const match = sdkEnv.match(/IRIS_API_KEY=(.+)/)
+                if (match) flApiToken = match[1].trim()
+              } catch {}
+            }
+            const leadId = task.config.lead_id
+            const reqName = task.config?.requirement_name || task.title || 'Requirement Test'
+            const statusLabel = taskStatus === 'completed' ? 'PASSED' : 'FAILED'
+
+            for (const videoPath of videoFiles.slice(0, 3)) { // max 3 videos per test
+              try {
+                const FormData = (await import('undici')).FormData
+                const form = new FormData()
+                form.append('type', 'file')
+                form.append('title', `${reqName} — ${statusLabel}`)
+                form.append('file', new Blob([fs.readFileSync(videoPath)], { type: 'video/webm' }), path.basename(videoPath))
+
+                const uploadRes = await fetch(`${flApiUrl}/api/v1/leads/${leadId}/deliverables`, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${flApiToken}` },
+                  body: form,
+                })
+                if (uploadRes.ok) {
+                  console.log(`[executor] Uploaded video deliverable for lead ${leadId}: ${path.basename(videoPath)}`)
+                } else {
+                  console.log(`[executor] Video upload failed: ${uploadRes.status} ${uploadRes.statusText}`)
+                }
+              } catch (uploadErr) {
+                console.log(`[executor] Video upload error: ${uploadErr.message}`)
+              }
+            }
+          }
+        } catch (videoErr) {
+          console.log(`[executor] Video collection error: ${videoErr.message}`)
+        }
+      }
+
       // ── Task chaining REMOVED (Apr 26, 2026) ──
       // All task types (discover, som_batch, inbox_scan) now run as independent scheduled jobs.
       // Chaining was elegant but fragile — caused Chrome/Playwright process explosions when
@@ -776,6 +903,18 @@ class TaskExecutor {
       }
       _cleanupRunning() // Remove from dedup tracking
       this.runningTasks.delete(taskId)
+
+      // ── Browser queue drain: run next queued browser task ──
+      if (isBrowserTask) {
+        this._browserRunning = false
+        if (this._browserQueue.length > 0) {
+          const next = this._browserQueue.shift()
+          console.log(`[executor] [${ts()}] 🔄 Browser slot free — executing queued ${next.type} ${next.id.substring(0, 12)} (${this._browserQueue.length} remaining)`)
+          // Small delay to let Chromium processes fully exit
+          setTimeout(() => this.execute(next), 3000)
+        }
+      }
+
       // Clean up workspace after a delay (keep for debugging)
       setTimeout(() => this.workspaces.cleanup(taskId), 60000)
 
@@ -905,11 +1044,18 @@ class TaskExecutor {
 
           // Write minimal playwright config so script runs standalone in workspace
           const timeoutMs = ((task.timeout_seconds || task.config?.timeout_seconds || 600) * 1000)
+          const videoDir = path.join(workspace.dir, 'test-videos')
+          fs.mkdirSync(videoDir, { recursive: true })
           const pwConfig = [
             "import { defineConfig } from '@playwright/test';",
             'export default defineConfig({',
             `  timeout: ${timeoutMs},`,
-            '  use: { headless: false },',
+            '  use: {',
+            '    headless: false,',
+            `    video: { mode: 'on', size: { width: 1280, height: 720 } },`,
+            `    screenshot: 'on',`,
+            '  },',
+            '  outputDir: "test-results",',
             '});'
           ].join('\n')
           fs.writeFileSync(path.join(workspace.dir, 'playwright.config.ts'), pwConfig, 'utf-8')
@@ -1096,10 +1242,19 @@ class TaskExecutor {
               const [k, ...v] = arg.split('=')
               if (k && v.length) somEnv[k.toUpperCase()] = v.join('=')
             }
+            // Pass action as SOM_MODE so som.js can resolve the correct spec
+            const somAction = task.data?.action || task.config?.action
+            if (somAction) somEnv.SOM_MODE = somAction
             task.config = task.config || {}
             task.config.env_vars = { ...(task.config.env_vars || {}), ...somEnv }
           } else {
-            // Non-outreach mode (scrape, engage, email) — let som.js handle it
+            // Non-outreach mode (scrape, engage, email, inbox checks) — let som.js handle it
+            const somAction = task.data?.action || task.config?.action
+            const somEnvVars = {}
+            if (somAction) somEnvVars.SOM_MODE = somAction
+            // Pass task config fields as env vars for specs that need them
+            if (task.config?.target_handle) somEnvVars.TARGET_HANDLE = task.config.target_handle
+            if (task.config?.ig_account) somEnvVars.IG_ACCOUNT = task.config.ig_account
             if (freelabelRoot) {
               cmd = 'npm'
               args = ['run', `som:${campaign}`, '--', ...somExtraArgs]
@@ -1108,6 +1263,8 @@ class TaskExecutor {
               cmd = 'node'
               args = [path.join(bundledSomDir, 'som.js'), campaign, ...somExtraArgs]
             }
+            task.config = task.config || {}
+            task.config.env_vars = { ...(task.config.env_vars || {}), ...somEnvVars }
           }
           workspace.projectDir = freelabelRoot || bundledSomDir
           break

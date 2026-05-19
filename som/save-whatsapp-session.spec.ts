@@ -74,6 +74,20 @@ test(`Save WhatsApp Session — ${WA_ACCOUNT}`, async () => {
     console.log(`\nSession saved successfully!`);
     console.log(`  Account: ${WA_ACCOUNT}`);
     console.log(`  Directory: ${SESSION_DIR}`);
+
+    // Export portable archive for Hive credential sharing
+    const archivePath = `${SESSION_DIR}.tar.gz`;
+    try {
+      const { execSync } = require('child_process');
+      execSync(`tar -czf "${archivePath}" -C "${path.dirname(SESSION_DIR)}" "${path.basename(SESSION_DIR)}"`, { stdio: 'pipe' });
+      const sizeMB = (fs.statSync(archivePath).size / 1024 / 1024).toFixed(1);
+      console.log(`  Archive: ${archivePath} (${sizeMB} MB)`);
+      console.log(`\nTo use on another machine:`);
+      console.log(`  BROWSER_SESSION_FILE=${archivePath} npx playwright test som/whatsapp-inbox-check.spec.ts`);
+    } catch {
+      console.log(`  Archive export skipped (tar not available)`);
+    }
+
     console.log(`\nSession persists on disk. Next run will skip QR scan.`);
   } else {
     console.log(`\nTimeout: QR code was not scanned within 5 minutes.`);

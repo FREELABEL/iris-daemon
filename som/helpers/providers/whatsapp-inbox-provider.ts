@@ -81,29 +81,19 @@ export class WhatsAppInboxProvider extends BaseDiscoveryProvider {
           // Skip system channels and notification accounts
           if (['Instagram', 'Meta AI', 'WhatsApp', 'Archived'].includes(name)) continue;
 
-          // Detect groups: SVG icon OR multiple-person avatar OR community sub-channels
-          const hasGroupIcon = !!row.querySelector('svg[data-testid="default-group-refreshed"]') ||
-                              !!row.querySelector('svg[data-testid="default-group"]');
-          const hasGroupAvatar = !!row.querySelector('[data-testid="group-chat-profile-picture"]') ||
-                                !!row.querySelector('span[data-testid="default-group"]');
-          // Community channels often have " - " in names like "Saddle Pass - Texas..."
-          // or "Developer Channel" as sub-channel names
-          const isGroup = hasGroupIcon || hasGroupAvatar;
-
           // Detect phone number in contact name (unsaved contacts show as phone)
           const phonePattern = /^[+\d\s().-]{7,}$/;
           const phoneNumber = phonePattern.test(name.replace(/[^+\d\s().-]/g, '')) ? name.replace(/[^+\d]/g, '') : '';
 
           seenNames.add(name);
 
-          // Last message preview
+          // Last message preview (extracted before group check so we can use it as heuristic)
           let lastMessage = '';
           const lastMsgEl = row.querySelector('span[data-testid="last-msg-status"]');
           if (lastMsgEl) {
             lastMessage = lastMsgEl.getAttribute('title') || lastMsgEl.textContent?.trim() || '';
           }
           if (!lastMessage) {
-            // Fallback: find the preview text span
             const secondaryContainer = row.querySelector('div[data-testid="cell-frame-secondary"]');
             if (secondaryContainer) {
               const spans = secondaryContainer.querySelectorAll('span[dir="auto"]');
@@ -121,6 +111,16 @@ export class WhatsAppInboxProvider extends BaseDiscoveryProvider {
             const timeSpan = timeContainer.querySelector('span');
             timestamp = timeSpan?.textContent?.trim() || '';
           }
+
+          // Detect groups: SVG icon, group avatar, OR last-message heuristics
+          const hasGroupIcon = !!row.querySelector('svg[data-testid="default-group-refreshed"]') ||
+                              !!row.querySelector('svg[data-testid="default-group"]');
+          const hasGroupAvatar = !!row.querySelector('[data-testid="group-chat-profile-picture"]') ||
+                                !!row.querySelector('span[data-testid="default-group"]');
+          // Heuristic: "~Name:" prefix = group sender, or system group messages
+          const hasGroupMsgPattern = /^~[^:]+:/.test(lastMessage) ||
+            /(changed the group|added you|created group|left$|joined using)/i.test(lastMessage);
+          const isGroup = hasGroupIcon || hasGroupAvatar || hasGroupMsgPattern;
 
           results.push({ name, lastMessage, timestamp, isGroup, phoneNumber });
         }
