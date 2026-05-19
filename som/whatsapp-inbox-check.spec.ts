@@ -11,7 +11,10 @@ const LIMIT = parseInt(process.env.LIMIT || '20', 10);
 const WA_ACCOUNT = process.env.WA_ACCOUNT || 'default';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 
-const SESSION_DIR = process.env.WA_SESSION_DIR
+// Hive credential protocol: BROWSER_SESSION_FILE points to a directory for WA
+// (unlike IG which uses a JSON file — WA needs persistent context for IndexedDB)
+const SESSION_DIR = process.env.BROWSER_SESSION_FILE
+  || process.env.WA_SESSION_DIR
   || path.join(os.homedir(), '.iris', 'whatsapp-sessions', WA_ACCOUNT);
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
 
@@ -154,7 +157,7 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
 
     // ── Detect replies ──
     const taggedLeads: { name: string; leadId: number; contact: string; lastMsg: string }[] = [];
-    const unmatched: { contact: string; lastMsg: string }[] = [];
+    const unmatched: { contact: string; phone: string; lastMsg: string }[] = [];
     let alreadyTaggedCount = 0;
 
     for (const profile of inboxResult.profiles) {
@@ -225,7 +228,11 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
       }
 
       if (!matchedLead) {
-        unmatched.push({ contact: contactName, lastMsg: (lastMessage || fullMessages || '').substring(0, 80) });
+        unmatched.push({
+          contact: contactName,
+          phone: contactPhone,
+          lastMsg: (lastMessage || fullMessages || '').substring(0, 80),
+        });
         continue;
       }
 
@@ -284,6 +291,23 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
       } catch (err: any) {
         console.log(`    Tag error: ${err.message}`);
       }
+
+      // ── Self-enrich: if we have a phone from WA but lead has none, add enrichment note ──
+      if (contactPhone && matchedLead.phone === '') {
+        const enrichMsg = `[wa-enrich] WhatsApp phone detected: ${contactPhone} (from conversation with "${contactName}"). Run \`iris leads update ${matchedLead.id} --phone ${contactPhone}\` to confirm.`;
+        if (!DRY_RUN) {
+          try {
+            await fetch(`${API_BASE}/api/v1/leads/${matchedLead.id}/notes`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+              body: JSON.stringify({ message: enrichMsg, type: 'system' }),
+            });
+            console.log(`    Enrichment note added (phone: ${contactPhone})`);
+          } catch {}
+        } else {
+          console.log(`    [DRY RUN] Would add enrichment note: phone ${contactPhone}`);
+        }
+      }
     }
 
     // ── Summary ──
@@ -305,9 +329,11 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
     if (unmatched.length > 0) {
       console.log(`\n  Unmatched conversations with replies (not on board):`);
       for (const u of unmatched.slice(0, 10)) {
-        console.log(`    - ${u.contact}: "${u.lastMsg}"`);
+        const phoneTag = u.phone ? ` [phone: ${u.phone}]` : '';
+        console.log(`    - ${u.contact}${phoneTag}: "${u.lastMsg}"`);
       }
       if (unmatched.length > 10) console.log(`    ... and ${unmatched.length - 10} more`);
+      console.log(`\n  Tip: Use \`iris leads search "<name>"\` to find + link these contacts.`);
     }
     console.log('='.repeat(60));
 
@@ -367,15 +393,25 @@ test(`WhatsApp Inbox Reply Check — ${WA_ACCOUNT} / Board ${BOARD_ID}`, async (
       }
     }
 
-    if (taggedLeads.length > 0 && !DRY_RUN) {
-      const lines = taggedLeads.slice(0, 10).map(t =>
-        `  - **${t.name}** (#${t.leadId}) -- ${t.contact}`
-      ).join('\n');
-      await sendDiscordAlert(
-        `**WA Inbox Check -- ${taggedLeads.length} Replies Found**\n` +
-        `Account: \`${WA_ACCOUNT}\` | Board: \`${BOARD_ID}\`\n` +
-        `${lines}`
-      );
+    if (!DRY_RUN && (taggedLeads.length > 0 || unmatched.length > 0)) {
+      let alertMsg = '';
+      if (taggedLeads.length > 0) {
+        const tagLines = taggedLeads.slice(0, 10).map(t =>
+          `  - **${t.name}** (#${t.leadId}) -- ${t.contact}`
+        ).join('\n');
+        alertMsg += `**WA Inbox Check -- ${taggedLeads.length} Replies Found**\n` +
+          `Account: \`${WA_ACCOUNT}\` | Board: \`${BOARD_ID}\`\n${tagLines}`;
+      }
+      if (unmatched.length > 0) {
+        const unmatchedWithPhones = unmatched.filter(u => u.phone);
+        if (unmatchedWithPhones.length > 0) {
+          const unmLines = unmatchedWithPhones.slice(0, 5).map(u =>
+            `  - ${u.contact} (${u.phone})`
+          ).join('\n');
+          alertMsg += `\n\n**Unmatched contacts with phone numbers** (run \`iris leads search\` to link):\n${unmLines}`;
+        }
+      }
+      if (alertMsg) await sendDiscordAlert(alertMsg);
     }
   } finally {
     await context.close();

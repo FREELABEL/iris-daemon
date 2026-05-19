@@ -78,12 +78,17 @@ export class WhatsAppInboxProvider extends BaseDiscoveryProvider {
           const name = nameSpan?.getAttribute('title')?.trim() || '';
           if (!name || name.length < 2 || seenNames.has(name)) continue;
 
-          // Skip system channels
-          if (name === 'Instagram' || name === 'Meta AI' || name === 'WhatsApp') continue;
+          // Skip system channels and notification accounts
+          if (['Instagram', 'Meta AI', 'WhatsApp', 'Archived'].includes(name)) continue;
 
-          // Detect groups: check for group icon SVG
-          const isGroup = !!row.querySelector('svg[data-testid="default-group-refreshed"]') ||
-                         !!row.querySelector('svg[data-testid="default-group"]');
+          // Detect groups: SVG icon OR multiple-person avatar OR community sub-channels
+          const hasGroupIcon = !!row.querySelector('svg[data-testid="default-group-refreshed"]') ||
+                              !!row.querySelector('svg[data-testid="default-group"]');
+          const hasGroupAvatar = !!row.querySelector('[data-testid="group-chat-profile-picture"]') ||
+                                !!row.querySelector('span[data-testid="default-group"]');
+          // Community channels often have " - " in names like "Saddle Pass - Texas..."
+          // or "Developer Channel" as sub-channel names
+          const isGroup = hasGroupIcon || hasGroupAvatar;
 
           // Detect phone number in contact name (unsaved contacts show as phone)
           const phonePattern = /^[+\d\s().-]{7,}$/;

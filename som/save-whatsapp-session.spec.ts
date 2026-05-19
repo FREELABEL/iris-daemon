@@ -18,7 +18,8 @@ import * as fs from 'fs';
  */
 
 const WA_ACCOUNT = process.env.WA_ACCOUNT || 'default';
-const SESSION_DIR = process.env.WA_SESSION_DIR
+const SESSION_DIR = process.env.BROWSER_SESSION_FILE
+  || process.env.WA_SESSION_DIR
   || path.join(os.homedir(), '.iris', 'whatsapp-sessions', WA_ACCOUNT);
 
 test(`Save WhatsApp Session — ${WA_ACCOUNT}`, async () => {
