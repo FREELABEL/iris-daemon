@@ -44,6 +44,11 @@ const specs = {
   scrape:   path.join(__dirname, 'leadgen-scraper.spec.ts'),
   followup: path.join(__dirname, 'inbox-followup.spec.ts'),
   venue:    path.join(__dirname, 'venue-outreach.spec.ts'),
+  instagram_inbox_check: path.join(__dirname, 'instagram-inbox-check.spec.ts'),
+  linkedin_inbox_check:  path.join(__dirname, 'linkedin-inbox-check.spec.ts'),
+  instagram_follow_up:   path.join(__dirname, 'instagram-follow-up.spec.ts'),
+  instagram_inbox:       path.join(__dirname, 'instagram-inbox.spec.ts'),
+  whatsapp_inbox_check:  path.join(__dirname, 'whatsapp-inbox-check.spec.ts'),
 };
 
 // Short strategy aliases (from shared config + som.js-only extras)
@@ -79,6 +84,7 @@ if (!campaign || !campaigns[campaign]) {
   console.log('    board=<id>         Override board/bloq ID');
   console.log('    bloq=<id>          Override board/bloq ID (alias)');
   console.log('    dry=1              Screenshot but don\'t act');
+  console.log('    pace=N             Seconds to wait between leads (default: 0)');
   console.log('    enrich=1           Auto-enrich leads without email before outreach');
   console.log('    repeat=Nh|Nm       Sleep N hours/minutes between runs');
   console.log('    loop=N             Max number of runs (default: infinite with repeat)');
@@ -100,6 +106,9 @@ if (!campaign || !campaigns[campaign]) {
   console.log('    target=<url>       Post/tweet URL to scrape commenters from');
   console.log('    scrape_limit=50    Max handles to collect');
   console.log('    source=<label>     Lead source label');
+  console.log('\n  Ledger & debug options:');
+  console.log('    retry=1            Re-run only retryable failures from today\'s ledger');
+  console.log('    debug_lead=<id>    Debug one lead with screenshots + Playwright tracing');
   console.log('\n  Follow-up options:');
   console.log('    since=24h          Check replies from last N hours/days (default: 24h)');
   console.log('    wb=1               Write-back: add notes + tags to leads');
@@ -111,7 +120,7 @@ if (!campaign || !campaigns[campaign]) {
   process.exit(campaign ? 1 : 0);
 }
 
-const env = { ...campaigns[campaign] };
+const env = { ...campaigns[campaign], SOM_CAMPAIGN_NAME: campaign };
 
 // Campaign-level default mode overrides (some campaigns are email-first)
 const campaignDefaultMode = {
@@ -126,7 +135,10 @@ const aliases = { IG: 'IG_ACCOUNT', DRY: 'DRY_RUN', TW: 'TW_ACCOUNT', ENRICH: 'A
 // Pull out repeat/loop/mode/platform before passing to playwright
 let repeatMs = 0;
 let maxLoops = 0; // 0 = infinite
-let mode = campaignDefaultMode[campaign] || 'outreach';
+let paceMs = 0; // pace between leads in ms
+let retryMode = false;
+let debugLeadId = null;
+let mode = process.env.SOM_MODE || campaignDefaultMode[campaign] || 'outreach';
 let platform = mode === 'email' ? 'email' : 'ig';
 
 for (const arg of process.argv.slice(3)) {
@@ -149,6 +161,19 @@ for (const arg of process.argv.slice(3)) {
     }
     if (key === 'LOOP') {
       maxLoops = parseInt(val, 10);
+      continue;
+    }
+    if (key === 'PACE') {
+      const seconds = parseFloat(val);
+      paceMs = (!isNaN(seconds) && seconds > 0) ? Math.round(seconds * 1000) : 0;
+      continue;
+    }
+    if (key === 'RETRY') {
+      retryMode = val === '1' || val === 'true';
+      continue;
+    }
+    if (key === 'DEBUG_LEAD') {
+      debugLeadId = val;
       continue;
     }
 
@@ -212,17 +237,20 @@ if (env.TARGET) {
   delete env.TARGET;
 }
 
+// Pass pace to the Playwright spec as env var
+if (paceMs > 0) env.PACE_MS = String(paceMs);
+
 // Scale timeout: 90s per lead, minimum 10 min (scrape/venue get extra time)
 const limit = parseInt(env.LIMIT || env.SCRAPE_LIMIT || '5', 10);
 const baseTimeout = (mode === 'scrape' || mode === 'venue') ? 900000 : 600000;
 const perLeadMs = mode === 'venue' ? 120000 : 90000; // venue: 2min/lead (browser scraping)
-const timeout = Math.max(baseTimeout, limit * perLeadMs);
+const timeout = Math.max(baseTimeout, limit * perLeadMs + limit * paceMs);
 
 const spec = specs[mode];
 const cmd = `npx playwright test ${spec} --headed --timeout ${timeout}`;
 
 // ── Mode labels ─────────────────────────────────────────────────────
-const modeLabels = { outreach: 'DM OUTREACH', email: 'EMAIL OUTREACH', engage: 'ORGANIC ENGAGE', scrape: 'LEAD SCRAPE', followup: 'INBOX FOLLOW-UP', venue: 'VENUE OUTREACH' };
+const modeLabels = { outreach: 'DM OUTREACH', email: 'EMAIL OUTREACH', engage: 'ORGANIC ENGAGE', scrape: 'LEAD SCRAPE', followup: 'INBOX FOLLOW-UP', venue: 'VENUE OUTREACH', instagram_inbox_check: 'IG INBOX CHECK', linkedin_inbox_check: 'LINKEDIN INBOX CHECK', instagram_inbox: 'IG INBOX READ', whatsapp_inbox_check: 'WA INBOX CHECK' };
 const platformLabels = { ig: 'Instagram', twitter: 'Twitter/X', email: 'Email' };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -295,15 +323,72 @@ async function main() {
   console.log(`  ║  SOM — ${(modeLabels[mode] || mode.toUpperCase()).padEnd(42)}║`);
   console.log(`  ║  Campaign: ${campaign.padEnd(39)}║`);
   console.log(`  ║  Platform: ${(platformLabels[platform] || platform).padEnd(39)}║`);
+  if (paceMs > 0) {
+    const paceStr = `${(paceMs / 1000).toFixed(1)}s between leads`;
+    console.log(`  ║  Pacing: ${paceStr.padEnd(41)}║`);
+  }
   if (mode === 'scrape' && env.TARGET_URL) {
     const truncUrl = env.TARGET_URL.length > 37 ? env.TARGET_URL.slice(0, 34) + '...' : env.TARGET_URL;
     console.log(`  ║  Target: ${truncUrl.padEnd(41)}║`);
   }
   console.log('  ╚══════════════════════════════════════════════════╝');
 
+  // ── DEBUG MODE — single lead with tracing ──
+  if (debugLeadId) {
+    env.LIMIT = '1';
+    env.SOM_RETRY_LEAD_IDS = debugLeadId;
+    env.SOM_DEBUG = '1';
+    console.log(`\n  DEBUG MODE: lead ${debugLeadId} with screenshots + tracing\n`);
+    const debugCmd = `npx playwright test ${spec} --headed --timeout ${timeout} --trace on`;
+    try {
+      execSync(debugCmd, { stdio: 'inherit', env: { ...process.env, ...env } });
+    } catch (e) {
+      process.exit(e.status || 1);
+    }
+    return;
+  }
+
+  // ── RETRY MODE — re-run only retryable failures from today's ledger ──
+  if (retryMode) {
+    const fs = require('fs');
+    const os = require('os');
+    const ledgerDate = new Date().toISOString().slice(0, 10);
+    const ledgerFile = require('path').join(os.homedir(), '.iris', 'som-ledger', `${campaign}-${ledgerDate}.jsonl`);
+
+    if (!fs.existsSync(ledgerFile)) {
+      console.log(`\n  No ledger file for today: ${ledgerFile}\n`);
+      process.exit(0);
+    }
+
+    const lines = fs.readFileSync(ledgerFile, 'utf-8').trim().split('\n').filter(Boolean);
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    // Find retryable leads that don't have a subsequent dm_sent
+    const sentIds = new Set(entries.filter(e => e.result === 'dm_sent').map(e => e.lead_id));
+    const retryable = entries.filter(e => e.retryable && e.lead_id && !sentIds.has(e.lead_id));
+    const uniqueIds = [...new Set(retryable.map(e => e.lead_id))];
+
+    if (uniqueIds.length === 0) {
+      console.log('\n  No retryable failures in today\'s ledger.\n');
+      process.exit(0);
+    }
+
+    console.log(`\n  RETRY MODE: ${uniqueIds.length} retryable leads from today's ledger`);
+    for (const id of uniqueIds.slice(0, 20)) {
+      const entry = retryable.find(e => e.lead_id === id);
+      console.log(`    #${id} ${entry.lead_name} — ${entry.result}`);
+    }
+    if (uniqueIds.length > 20) console.log(`    ... and ${uniqueIds.length - 20} more`);
+    console.log('');
+
+    env.SOM_RETRY_LEAD_IDS = uniqueIds.join(',');
+    env.LIMIT = String(uniqueIds.length);
+  }
+
   // ── PRE-FLIGHT CHECK — skip Chromium launch if no eligible leads ──
   // Only applies to outreach + followup modes (scrape/engage don't need leads)
-  if (mode === 'outreach' || mode === 'followup' || mode === 'email') {
+  // Skip in retry mode — we already have specific lead IDs from the ledger
+  if (!retryMode && (mode === 'outreach' || mode === 'followup' || mode === 'email')) {
     const { preflightCheck } = require('./som-config');
     const boardId = env.BOARD_ID;
     const strategy = env.STRATEGY;
