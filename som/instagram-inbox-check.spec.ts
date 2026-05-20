@@ -1,0 +1,97 @@
+import { test } from '@playwright/test';
+import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
+import { dismissInstagramPopups } from './helpers/providers/base-provider';
+import {
+  fetchBoardLeads, runInboxScan, syncInbox, printSummary, sendResultAlert,
+  sendDiscordAlert, Lead, ScanConfig,
+} from './helpers/inbox-scanner';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+const BOARD_ID = parseInt(process.env.BOARD_ID || '38', 10);
+const LIMIT = parseInt(process.env.LIMIT || '30', 10);
+const IG_ACCOUNT = process.env.IG_ACCOUNT || 'heyiris.io';
+const IG_USER_NAME = process.env.IG_USER_NAME || '';
+const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
+
+const IG_AUTH_FILE = process.env.BROWSER_SESSION_FILE
+  || path.join(__dirname, `instagram-auth-${IG_ACCOUNT}.json`);
+const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
+
+const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
+  'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
+
+test(`Instagram Inbox Reply Check — @${IG_ACCOUNT} / Board ${BOARD_ID}`, async ({ page, context }) => {
+  // ── Load IG session ──
+  if (!fs.existsSync(IG_AUTH_FILE)) {
+    console.log(`No session file: ${IG_AUTH_FILE}`);
+    console.log(`Run: iris hive credentials save-session --platform instagram --bloq ${BOARD_ID}`);
+    return;
+  }
+  const state = JSON.parse(fs.readFileSync(IG_AUTH_FILE, 'utf-8'));
+  if (!state.cookies || state.cookies.length === 0) {
+    console.log('Session file has no cookies.');
+    return;
+  }
+  await context.addCookies(state.cookies);
+  console.log(`IG session loaded for @${IG_ACCOUNT} (${state.cookies.length} cookies)`);
+
+  // ── Session preflight ──
+  console.log('Validating Instagram session...');
+  await page.goto('https://www.instagram.com/', { timeout: 15000, waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2000);
+  const checkUrl = page.url();
+  const onLogin = checkUrl.includes('/accounts/login') || checkUrl.includes('/challenge/');
+  const hasForm = await page.locator('input[name="username"]').first().isVisible({ timeout: 2000 }).catch(() => false);
+  if (onLogin || hasForm) {
+    console.log(`SESSION EXPIRED: @${IG_ACCOUNT} — re-save session`);
+    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Inbox Check — Session Expired** @${IG_ACCOUNT}`);
+    return;
+  }
+  console.log(`Session valid for @${IG_ACCOUNT}`);
+
+  // ── Fetch board leads ──
+  console.log(`\nFetching leads from board ${BOARD_ID}...`);
+  const boardLeads = await fetchBoardLeads<Lead>(API_BASE, TOKEN, BOARD_ID, (l) => {
+    const name = (l.name || l.full_name || '').trim();
+    const igHandle = name.startsWith('@') ? name.slice(1) : name;
+    return { id: l.id, name, igHandle };
+  });
+  console.log(`Loaded ${boardLeads.length} leads from board ${BOARD_ID}`);
+  if (boardLeads.length === 0) {
+    console.log('No leads found on board — nothing to match against.');
+    return;
+  }
+
+  // ── Scan inbox ──
+  console.log(`\nScanning Instagram inbox (limit: ${LIMIT} conversations)...`);
+  const provider = new InstagramInboxProvider();
+  const inboxResult = await provider.discover(page, context, {
+    targetUrl: 'https://www.instagram.com/direct/inbox/',
+    limit: LIMIT,
+    scrollAttempts: 20,
+    scrollDelay: 3000,
+  });
+  console.log(`\nInbox scan complete: ${inboxResult.profiles.length} conversations read`);
+  if (inboxResult.errors.length > 0) {
+    console.log(`Errors: ${inboxResult.errors.join(', ')}`);
+  }
+
+  // ── Detect replies + tag leads ──
+  const config: ScanConfig = {
+    platform: 'instagram', account: IG_ACCOUNT, boardId: BOARD_ID,
+    apiBase: API_BASE, token: TOKEN, dryRun: DRY_RUN,
+    ourName: IG_USER_NAME || IG_ACCOUNT, discordWebhook: DISCORD_WEBHOOK,
+  };
+
+  const result = await runInboxScan(config, inboxResult.profiles, boardLeads);
+  printSummary(config, result);
+
+  // ── Sync to inbox-sync API ──
+  if (!DRY_RUN && inboxResult.profiles.length > 0) {
+    await syncInbox(API_BASE, TOKEN, BOARD_ID, 'instagram', IG_ACCOUNT, inboxResult.profiles, config.ourName);
+  }
+
+  await sendResultAlert(config, result);
+});
