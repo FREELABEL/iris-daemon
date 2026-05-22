@@ -1366,7 +1366,7 @@ app.post('/api/mail/send', async (req, res) => {
     return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
   }
 
-  const { to_email, to_name, cc_email, subject, body_text, attachments, draft } = req.body
+  const { to_email, to_name, cc_email, from_email, subject, body_text, attachments, draft } = req.body
 
   if (!to_email || !subject || !body_text) {
     return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
@@ -1397,6 +1397,23 @@ app.post('/api/mail/send', async (req, res) => {
     ).join('\n')
   }
 
+  // Resolve sender account if from_email specified
+  let senderLine = ''
+  if (from_email) {
+    const escapedFrom = escapeForAppleScript(from_email)
+    senderLine = `  set senderAccount to null
+  repeat with acct in accounts
+    repeat with addr in email addresses of acct
+      if address of addr is "${escapedFrom}" then
+        set senderAccount to acct
+        exit repeat
+      end if
+    end repeat
+    if senderAccount is not null then exit repeat
+  end repeat
+  if senderAccount is not null then set sender of msg to "${escapedFrom}"`
+  }
+
   // draft=true opens compose window without sending; default sends immediately
   const isDraft = draft === true || draft === 'true'
   const sendOrShow = isDraft
@@ -1406,6 +1423,7 @@ app.post('/api/mail/send', async (req, res) => {
   const script = `tell application "Mail"
   set msg to make new outgoing message with properties {subject:"${escapedSubject}", content:"${escapedBody}", visible:false}
   make new to recipient at beginning of to recipients of msg with properties {name:"${escapedName}", address:"${escapedTo}"}
+${senderLine}
 ${ccLine}
 ${attachmentLines}
 ${sendOrShow}
@@ -1516,6 +1534,128 @@ LIMIT ${limit}
   } catch (err) {
     console.error(`[imessage/search] Failed: ${err.message}`)
     res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/whatsapp/search
+ * Search WhatsApp Web conversations by phone number using a persistent
+ * Playwright session at ~/.iris/whatsapp-sessions/{account}/.
+ * Query: ?handle=<phone>&days=30&limit=50&account=default
+ * Returns: { messages: [{ ts, from_me, sender, text }], count, handle, days }
+ *
+ * Pre-req: authenticate once with:
+ *   WA_ACCOUNT=default npx playwright test som/save-whatsapp-session.spec.ts --headed
+ */
+app.get('/api/whatsapp/search', async (req, res) => {
+  const handle = (req.query.handle || '').toString().trim()
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '50', 10)))
+  const account = (req.query.account || 'default').toString().trim()
+
+  if (!handle) {
+    return res.status(400).json({ error: 'handle query param is required (phone number)' })
+  }
+
+  const sessionDir = path.join(process.env.HOME, '.iris', 'whatsapp-sessions', account)
+  if (!fs.existsSync(sessionDir)) {
+    return res.status(404).json({
+      error: `WhatsApp session "${account}" not found. Authenticate first: WA_ACCOUNT=${account} npx playwright test som/save-whatsapp-session.spec.ts --headed`,
+      messages: [], count: 0,
+    })
+  }
+
+  let context = null
+  try {
+    const { chromium } = require('playwright')
+    const digits = handle.replace(/\D/g, '')
+
+    // Launch with persistent session (headless, reuses WhatsApp auth)
+    context = await chromium.launchPersistentContext(sessionDir, {
+      headless: true,
+      args: ['--disable-blink-features=AutomationControlled'],
+      timeout: 15000,
+    })
+
+    const page = context.pages()[0] || await context.newPage()
+    await page.goto('https://web.whatsapp.com/', { waitUntil: 'domcontentloaded', timeout: 15000 })
+
+    // Wait for either chat list (authenticated) or QR code (expired)
+    const loaded = await Promise.race([
+      page.waitForSelector('[aria-label="Chat list"], [data-testid="chat-list"]', { timeout: 15000 }).then(() => 'authenticated'),
+      page.waitForSelector('canvas[aria-label="Scan this QR code"], [data-testid="qrcode"]', { timeout: 15000 }).then(() => 'expired'),
+    ]).catch(() => 'timeout')
+
+    if (loaded !== 'authenticated') {
+      await context.close()
+      return res.json({
+        messages: [], count: 0, handle, days,
+        error: `WhatsApp session expired. Re-authenticate: WA_ACCOUNT=${account} npx playwright test som/save-whatsapp-session.spec.ts --headed`,
+      })
+    }
+
+    // Search for the contact by phone digits
+    const searchBox = await page.$('[data-testid="chat-list-search"], [contenteditable="true"][data-tab="3"]')
+    if (!searchBox) {
+      // Try clicking the search icon first
+      const searchBtn = await page.$('[data-testid="search-icon"], [aria-label="Search or start new chat"]')
+      if (searchBtn) await searchBtn.click()
+      await page.waitForTimeout(500)
+    }
+
+    const searchInput = await page.$('[data-testid="chat-list-search"], [contenteditable="true"][data-tab="3"]')
+    if (searchInput) {
+      await searchInput.click()
+      await searchInput.fill('')
+      await page.keyboard.type(digits.length > 10 ? digits.slice(-10) : digits, { delay: 30 })
+      await page.waitForTimeout(2000)
+    }
+
+    // Click first matching result
+    const firstResult = await page.$('[data-testid="cell-frame-container"], [data-testid="chat-list"] [role="listitem"]')
+    if (!firstResult) {
+      await context.close()
+      return res.json({ messages: [], count: 0, handle, days, note: 'No matching conversation found' })
+    }
+    await firstResult.click()
+    await page.waitForTimeout(1500)
+
+    // Extract messages from the conversation
+    const messages = await page.evaluate((msgLimit) => {
+      const msgs = []
+      const bubbles = document.querySelectorAll('[data-testid^="conv-msg-"], .message-in, .message-out')
+      const items = Array.from(bubbles).slice(-msgLimit)
+
+      for (const bubble of items) {
+        const isOut = bubble.classList.contains('message-out') ||
+          bubble.closest('.message-out') !== null ||
+          bubble.getAttribute('data-testid')?.includes('msg-true')
+        const textEl = bubble.querySelector('span.selectable-text span, span[dir="ltr"]')
+        const text = textEl?.textContent?.trim() || ''
+        if (!text) continue
+
+        // Try to get timestamp from data-pre-plain-text attr or meta
+        const meta = bubble.querySelector('[data-pre-plain-text]')
+        const ts = meta?.getAttribute('data-pre-plain-text')?.match(/\[(.+?)\]/)?.[1] || ''
+
+        msgs.push({
+          ts: ts || new Date().toISOString(),
+          from_me: isOut,
+          sender: isOut ? 'me' : 'them',
+          text,
+        })
+      }
+      return msgs
+    }, limit)
+
+    await context.close()
+    context = null
+
+    res.json({ messages, count: messages.length, handle, days })
+  } catch (err) {
+    if (context) { try { await context.close() } catch {} }
+    console.error(`[whatsapp/search] Failed: ${err.message}`)
+    res.status(500).json({ error: err.message, messages: [], count: 0 })
   }
 })
 
@@ -3287,6 +3427,12 @@ async function autoStartBots () {
 // ─── Auto-Start Daemon (Embedded Mode) ────────────────────────────
 
 async function autoStartDaemon () {
+  // Skip if daemon.js already started its own daemon (prevents double Pusher subscription)
+  if (process.env._DAEMON_STARTED === '1') {
+    console.log('[daemon] Skipping embedded daemon — daemon.js already started one')
+    return
+  }
+
   // Check for daemon credentials: env vars or ~/.iris/config.json
   const isLocalMode = process.argv.includes('--local') || process.env.IRIS_LOCAL === '1'
   const LOCAL_IRIS_URL = 'https://local.iris.freelabel.net'
