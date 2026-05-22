@@ -1572,7 +1572,7 @@ app.get('/api/whatsapp/search', async (req, res) => {
 
     // Launch with persistent session (headless, reuses WhatsApp auth)
     context = await chromium.launchPersistentContext(sessionDir, {
-      headless: true,
+      headless: false,
       args: ['--disable-blink-features=AutomationControlled'],
       timeout: 15000,
     })
@@ -1586,6 +1586,7 @@ app.get('/api/whatsapp/search', async (req, res) => {
       page.waitForSelector('canvas[aria-label="Scan this QR code"], [data-testid="qrcode"]', { timeout: 15000 }).then(() => 'expired'),
     ]).catch(() => 'timeout')
 
+    console.log(`[whatsapp/search] Session state: ${loaded}`)
     if (loaded !== 'authenticated') {
       await context.close()
       return res.json({
@@ -1594,48 +1595,86 @@ app.get('/api/whatsapp/search', async (req, res) => {
       })
     }
 
-    // Search for the contact by phone digits
-    const searchBox = await page.$('[data-testid="chat-list-search"], [contenteditable="true"][data-tab="3"]')
-    if (!searchBox) {
-      // Try clicking the search icon first
-      const searchBtn = await page.$('[data-testid="search-icon"], [aria-label="Search or start new chat"]')
-      if (searchBtn) await searchBtn.click()
-      await page.waitForTimeout(500)
-    }
+    // Find and click the matching conversation in the sidebar
+    const searchQuery = digits.length >= 10 ? digits.slice(-10) : handle
+    console.log(`[whatsapp/search] Looking for: "${searchQuery}"`)
 
-    const searchInput = await page.$('[data-testid="chat-list-search"], [contenteditable="true"][data-tab="3"]')
-    if (searchInput) {
-      await searchInput.click()
-      await searchInput.fill('')
-      await page.keyboard.type(digits.length > 10 ? digits.slice(-10) : digits, { delay: 30 })
-      await page.waitForTimeout(2000)
-    }
+    // Scan sidebar titles to find matching chat index
+    const matchIndex = await page.evaluate((query) => {
+      const lowerQuery = query.toLowerCase()
+      const titles = document.querySelectorAll('span[title]')
+      for (let i = 0; i < titles.length; i++) {
+        const title = (titles[i].getAttribute('title') || '').toLowerCase()
+        if (title.includes(lowerQuery) || lowerQuery.includes(title)) {
+          return { idx: i, title: titles[i].getAttribute('title'), total: titles.length }
+        }
+      }
+      if (/^\d+$/.test(query)) {
+        for (let i = 0; i < titles.length; i++) {
+          const titleDigits = (titles[i].getAttribute('title') || '').replace(/\D/g, '')
+          if (titleDigits.includes(query) || query.includes(titleDigits.slice(-10))) {
+            return { idx: i, title: titles[i].getAttribute('title'), total: titles.length }
+          }
+        }
+      }
+      return { idx: -1, total: titles.length }
+    }, searchQuery)
 
-    // Click first matching result
-    const firstResult = await page.$('[data-testid="cell-frame-container"], [data-testid="chat-list"] [role="listitem"]')
-    if (!firstResult) {
+    console.log(`[whatsapp/search] Match:`, JSON.stringify(matchIndex))
+
+    if (matchIndex.idx < 0) {
       await context.close()
-      return res.json({ messages: [], count: 0, handle, days, note: 'No matching conversation found' })
+      return res.json({
+        messages: [], count: 0, handle, days,
+        note: `No conversation matching "${searchQuery}" found (scanned ${matchIndex.total} chats)`,
+      })
     }
-    await firstResult.click()
-    await page.waitForTimeout(1500)
+
+    // Use Playwright's native click on the nth span[title] element
+    await page.locator('span[title]').nth(matchIndex.idx).click()
+    console.log(`[whatsapp/search] Clicked chat: "${matchIndex.title}"`)
+    // Wait for conversation messages to load
+    await page.waitForSelector(
+      '[data-testid="conversation-panel-messages"], #main .copyable-text, .message-in, .message-out',
+      { timeout: 8000 }
+    ).catch(() => console.log('[whatsapp/search] Conversation panel selector timeout — trying anyway'))
+    await page.waitForTimeout(2000)
 
     // Extract messages from the conversation
+    // Use multiple selector strategies since WhatsApp Web DOM changes frequently
     const messages = await page.evaluate((msgLimit) => {
       const msgs = []
-      const bubbles = document.querySelectorAll('[data-testid^="conv-msg-"], .message-in, .message-out')
+
+      // Strategy 1: role="row" message containers (current WhatsApp Web 2024+)
+      let bubbles = document.querySelectorAll('div[role="row"] div.message-in, div[role="row"] div.message-out')
+      // Strategy 2: data-testid pattern
+      if (bubbles.length === 0) bubbles = document.querySelectorAll('[data-testid^="conv-msg-"]')
+      // Strategy 3: class-based
+      if (bubbles.length === 0) bubbles = document.querySelectorAll('.message-in, .message-out')
+      // Strategy 4: broadest — any copyable-text inside the conversation panel
+      if (bubbles.length === 0) {
+        const panel = document.querySelector('[data-testid="conversation-panel-messages"]') || document.querySelector('#main')
+        if (panel) bubbles = panel.querySelectorAll('.copyable-text')
+      }
+
       const items = Array.from(bubbles).slice(-msgLimit)
 
       for (const bubble of items) {
-        const isOut = bubble.classList.contains('message-out') ||
-          bubble.closest('.message-out') !== null ||
-          bubble.getAttribute('data-testid')?.includes('msg-true')
-        const textEl = bubble.querySelector('span.selectable-text span, span[dir="ltr"]')
+        const msgRow = bubble.closest('.message-in, .message-out, [data-testid^="conv-msg-"]') || bubble
+        const isOut = msgRow.classList.contains('message-out') ||
+          msgRow.closest('.message-out') !== null ||
+          (msgRow.getAttribute('data-testid') || '').includes('true')
+
+        // Text extraction: multiple fallbacks
+        const textEl = msgRow.querySelector('span.selectable-text span')
+          || msgRow.querySelector('.selectable-text')
+          || msgRow.querySelector('span[dir="ltr"]')
+          || msgRow.querySelector('.copyable-text span')
         const text = textEl?.textContent?.trim() || ''
         if (!text) continue
 
-        // Try to get timestamp from data-pre-plain-text attr or meta
-        const meta = bubble.querySelector('[data-pre-plain-text]')
+        // Timestamp from data-pre-plain-text
+        const meta = msgRow.querySelector('[data-pre-plain-text]')
         const ts = meta?.getAttribute('data-pre-plain-text')?.match(/\[(.+?)\]/)?.[1] || ''
 
         msgs.push({
@@ -1645,13 +1684,16 @@ app.get('/api/whatsapp/search', async (req, res) => {
           text,
         })
       }
-      return msgs
+      return { msgs, debug: { bubblesFound: items.length, strategies: bubbles.length } }
     }, limit)
+
+    console.log(`[whatsapp/search] Extracted ${messages.msgs?.length || 0} messages (bubbles: ${messages.debug?.bubblesFound}, strategies: ${messages.debug?.strategies})`)
 
     await context.close()
     context = null
 
-    res.json({ messages, count: messages.length, handle, days })
+    const finalMessages = messages.msgs || []
+    res.json({ messages: finalMessages, count: finalMessages.length, handle, days })
   } catch (err) {
     if (context) { try { await context.close() } catch {} }
     console.error(`[whatsapp/search] Failed: ${err.message}`)
@@ -1679,6 +1721,8 @@ app.get('/api/mail/search', async (req, res) => {
   const includeBody = req.query.include_body === '1' || req.query.include_body === 'true'
   const maxBody = Math.max(100, Math.min(50000, parseInt(req.query.max_body || '4000', 10)))
   const subject = (req.query.subject || '').toString().trim()
+  const includeAttachments = req.query.include_attachments === '1' || req.query.include_attachments === 'true'
+  const saveAttachments = req.query.save_attachments === '1' || req.query.save_attachments === 'true'
 
   if (!from) {
     return res.status(400).json({ error: 'from query param is required (email or name substring)' })
@@ -1723,7 +1767,40 @@ tell application "Mail"
         set theBody to content of msg
         if length of theBody > ${maxBody} then set theBody to (text 1 thru ${maxBody} of theBody) & "..."
       end try` : ''}
-      set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\n---ROW---\\n"
+      set theAttachments to ""
+      ${includeAttachments || saveAttachments ? `try
+        set attList to mail attachments of msg
+        set attCount to count of attList
+        if attCount > 0 then
+          repeat with att in attList
+            try
+              set attName to "unknown"
+              set attMime to "unknown"
+              set attSize to 0
+              try
+                set attName to name of att
+              end try
+              try
+                set attMime to MIME type of att
+              end try
+              try
+                set attSize to file size of att
+              end try
+              set theAttachments to theAttachments & attName & "|" & attMime & "|" & attSize
+              ${saveAttachments ? `try
+                set savePath to "${escapeForAppleScript(require('os').tmpdir())}/iris-mail-attachments/"
+                do shell script "mkdir -p " & quoted form of savePath
+                save att in POSIX file (savePath & attName)
+                set theAttachments to theAttachments & "|" & savePath & attName
+              on error saveErr
+                set theAttachments to theAttachments & "|SAVE_ERROR:" & saveErr
+              end try` : ''}
+              if att is not last item of attList then set theAttachments to theAttachments & ";;;"
+            end try
+          end repeat
+        end if
+      end try` : ''}
+      set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\t" & theAttachments & "\\n---ROW---\\n"
     end repeat
   end try
   return output
@@ -1752,13 +1829,25 @@ end tell
       .map((row) => row.trim())
       .filter((row) => row.length > 0)
       .map((row) => {
-        const [date, sender, subject, ...bodyParts] = row.split('\t')
-        return {
-          date: date || '',
-          sender: sender || '',
-          subject: subject || '',
-          body: bodyParts.join('\t') || '',
+        const parts = row.split('\t')
+        const date = parts[0] || ''
+        const sender = parts[1] || ''
+        const subject = parts[2] || ''
+        const body = parts[3] || ''
+        const attachmentsRaw = parts[4] || ''
+        const result = { date, sender, subject, body }
+        if (attachmentsRaw) {
+          result.attachments = attachmentsRaw.split(';;;').filter(a => a).map(a => {
+            const [name, mime, size, savedPath] = a.split('|')
+            const att = { name: name || '', mime_type: mime || '', size: parseInt(size || '0', 10) }
+            if (savedPath && !savedPath.startsWith('SAVE_ERROR')) att.saved_path = savedPath
+            if (savedPath && savedPath.startsWith('SAVE_ERROR')) att.save_error = savedPath
+            return att
+          })
+        } else {
+          result.attachments = []
         }
+        return result
       })
 
     res.json({
