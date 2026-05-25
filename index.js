@@ -833,6 +833,126 @@ setInterval(async () => {
   res.type('html').send(html)
 })
 
+// ─── Instagram Post Scraper (Playwright + saved session) ─────────
+
+app.post('/api/scrape/instagram', async (req, res) => {
+  const { url, account } = req.body || {}
+  if (!url || !url.includes('instagram.com')) {
+    return res.status(400).json({ error: 'url is required and must be an instagram.com URL' })
+  }
+
+  // Find IG session — try specified account, then default accounts
+  const somDir = path.join(__dirname, 'som')
+  const testsDir = path.join(__dirname, '..', 'tests', 'e2e')
+  const candidates = account
+    ? [`instagram-auth-${account}.json`]
+    : ['instagram-auth-thediscoverpage_.json', 'instagram-auth-freelabelnet.json', 'instagram-auth-hourdemayo.json', 'instagram-auth.json']
+
+  let sessionFile = null
+  for (const f of candidates) {
+    const p1 = path.join(somDir, f)
+    const p2 = path.join(testsDir, f)
+    if (fs.existsSync(p1)) { sessionFile = p1; break }
+    if (fs.existsSync(p2)) { sessionFile = p2; break }
+  }
+
+  if (!sessionFile) {
+    return res.status(404).json({
+      error: 'No Instagram session found. Save one first: iris hive credentials save-session --platform instagram',
+      candidates,
+    })
+  }
+
+  let context = null
+  try {
+    const { chromium } = require('playwright')
+    const storageState = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
+
+    context = await chromium.launch({
+      headless: true,
+      args: ['--disable-blink-features=AutomationControlled'],
+    })
+    const ctx = await context.newContext({
+      storageState,
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
+    const page = await ctx.newPage()
+
+    console.log(`[ig-scrape] Navigating to ${url}`)
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 })
+    await page.waitForTimeout(3000)
+
+    // Dismiss any popups (login modal, cookie consent)
+    try {
+      const notNow = page.locator('button:has-text("Not Now"), button:has-text("Not now"), [role="button"]:has-text("Not Now")')
+      if (await notNow.first().isVisible({ timeout: 2000 })) await notNow.first().click()
+    } catch {}
+
+    // Extract post data from DOM
+    const postData = await page.evaluate(() => {
+      // Caption — try multiple selectors
+      const captionEl = document.querySelector('div[class*="Caption"] span') ||
+                        document.querySelector('h1') ||
+                        document.querySelector('meta[property="og:title"]')
+      const caption = captionEl?.textContent?.trim() ||
+                      captionEl?.getAttribute?.('content') || ''
+
+      // OG description as fallback
+      const ogDesc = document.querySelector('meta[property="og:description"]')?.getAttribute('content') || ''
+
+      // Images — get all post images (carousel or single)
+      const images = []
+      // Carousel images
+      document.querySelectorAll('img[class*="x5yr21d"], img[style*="object-fit"], article img').forEach(img => {
+        const src = img.src || img.getAttribute('srcset')?.split(',')[0]?.trim()?.split(' ')[0]
+        if (src && src.startsWith('http') && !src.includes('profile_pic') && !src.includes('s150x150') && img.width > 100) {
+          images.push(src)
+        }
+      })
+      // OG image as fallback
+      const ogImage = document.querySelector('meta[property="og:image"]')?.getAttribute('content')
+      if (ogImage && !images.includes(ogImage)) images.unshift(ogImage)
+
+      // Location
+      const locationEl = document.querySelector('a[href*="/explore/locations/"]') ||
+                         document.querySelector('a[href*="/locations/"]')
+      const location = locationEl?.textContent?.trim() || null
+
+      // Author
+      const authorEl = document.querySelector('a[class*="notranslate"]') ||
+                       document.querySelector('header a[href*="/"]')
+      const author = authorEl?.textContent?.trim() || null
+
+      // Timestamp
+      const timeEl = document.querySelector('time[datetime]')
+      const timestamp = timeEl?.getAttribute('datetime') || null
+
+      return { caption: caption || ogDesc, images, location, author, timestamp }
+    })
+
+    await context.close()
+    context = null
+
+    console.log(`[ig-scrape] Extracted: caption=${(postData.caption || '').length}chars, images=${postData.images.length}, location=${postData.location}`)
+
+    res.json({
+      success: true,
+      url,
+      caption: postData.caption,
+      images: postData.images,
+      flyerUrl: postData.images[0] || null,
+      location: postData.location ? { name: postData.location } : null,
+      author: postData.author,
+      timestamp: postData.timestamp,
+      sessionUsed: path.basename(sessionFile),
+    })
+  } catch (err) {
+    if (context) await context.close().catch(() => {})
+    console.error(`[ig-scrape] Error:`, err.message)
+    res.status(500).json({ error: err.message, url })
+  }
+})
+
 // ─── Security disclosure ─────────────────────────────────────────
 
 app.get('/.well-known/security.txt', (req, res) => {
