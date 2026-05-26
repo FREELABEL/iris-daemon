@@ -327,7 +327,7 @@ function isDockerMode () {
 class TaskExecutor {
   // Task types that spawn Playwright/Chromium — only 1 browser at a time.
   // This prevents 5 Chromium windows opening simultaneously when schedules cluster.
-  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright']
+  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover']
 
   constructor (cloudClient, workspaceManager) {
     this.cloud = cloudClient
@@ -918,19 +918,7 @@ class TaskExecutor {
       // Clean up workspace after a delay (keep for debugging)
       setTimeout(() => this.workspaces.cleanup(taskId), 60000)
 
-      // Clean up any orphaned Playwright/Chrome processes from this task
-      try {
-        const { execSync } = require('child_process')
-        const pwCount = parseInt(execSync("ps aux | grep '[p]laywright' | wc -l", { timeout: 3000 }).toString().trim(), 10) || 0
-        if (pwCount > 8) {
-          console.log(`[executor] Cleaning ${pwCount} stale Playwright processes...`)
-          execSync("pkill -f 'playwright.*test' 2>/dev/null || true", { timeout: 5000 })
-          // Give Chrome processes a moment to exit gracefully
-          setTimeout(() => {
-            try { execSync("pkill -f 'Google Chrome.*playwright' 2>/dev/null || true", { timeout: 5000 }) } catch {}
-          }, 3000)
-        }
-      } catch {}
+      // Browser gate (BROWSER_TYPES + max 1) prevents concurrent Chromium — no cleanup needed
     }
   }
 
@@ -970,6 +958,59 @@ class TaskExecutor {
       }
 
       switch (task.type) {
+        case 'playbook_run':
+        case 'skill_run': {
+          // Run a playbook (or legacy skill) via the iris CLI binary
+          // task.prompt = playbook name (e.g., "production-deploy")
+          // task.config.args = playbook args object (e.g., { action: "status", service: "fl-api" })
+          const irisPath = this.findIris()
+          const skillName = (task.prompt || '').trim()
+          if (!skillName) throw new Error('skill_run requires a skill name in task.prompt')
+          const skillArgs = []
+          if (task.config?.args && typeof task.config.args === 'object') {
+            for (const [key, value] of Object.entries(task.config.args)) {
+              skillArgs.push(`--${key}=${String(value)}`)
+            }
+          }
+          cmd = irisPath
+          args = ['playbook', 'run', skillName, ...skillArgs, '--yes', '--json']
+          // Set cwd to project root if available (so playbooks can find .iris/playbooks/)
+          if (task.config?.cwd) {
+            cwd = task.config.cwd
+          }
+          break
+        }
+
+        case 'shell': {
+          // Run a shell command directly — task.prompt is the command
+          cmd = 'sh'
+          args = ['-c', task.prompt]
+          break
+        }
+
+        case 'notification': {
+          // Send a macOS notification — task.prompt is the message
+          const notifTitle = task.config?.title || 'IRIS Hive'
+          const notifSubtitle = task.config?.subtitle || ''
+          const notifMsg = (task.prompt || 'Ping!').replace(/'/g, "'\\''")
+          cmd = 'osascript'
+          args = ['-e', `display notification "${notifMsg}" with title "${notifTitle}"${notifSubtitle ? ` subtitle "${notifSubtitle}"` : ''}`]
+          break
+        }
+
+        case 'hive_script': {
+          // Run a Node.js script that can require the IRIS SDK
+          // task.prompt = the JS script content
+          cmd = 'node'
+          const hiveScriptPath = path.join(workspace.dir, 'hive-script.js')
+          // Prepend process.chdir so require('./iris-sdk') resolves to daemon/ directory
+          const sdkDir = path.resolve(__dirname)
+          const wrappedScript = `process.chdir(${JSON.stringify(sdkDir)});\n${task.prompt}`
+          fs.writeFileSync(hiveScriptPath, wrappedScript, 'utf-8')
+          args = [hiveScriptPath]
+          break
+        }
+
         case 'code_generation':
           // Use iris-code for code generation tasks
           cmd = this.findIrisCode()
@@ -3074,6 +3115,23 @@ exit 1
       req.write(payload)
       req.end()
     })
+  }
+
+  /**
+   * Find iris CLI binary (~/.iris/bin/iris). Installed by the IRIS installer.
+   */
+  findIris () {
+    const locations = [
+      path.join(process.env.HOME || '', '.iris/bin/iris'),
+      '/usr/local/bin/iris',
+      'iris' // fallback to PATH
+    ]
+    for (const loc of locations) {
+      try {
+        if (loc === 'iris' || fs.existsSync(loc)) return loc
+      } catch { /* continue */ }
+    }
+    throw new Error('iris binary not found — install with: curl heyiris.io/install-code | bash')
   }
 
   /**
