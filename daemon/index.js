@@ -36,61 +36,6 @@ const IRIS_DIR = path.join(os.homedir(), '.iris')
 const STATUS_FILE = path.join(IRIS_DIR, 'status.json')
 const CONFIG_FILE = path.join(IRIS_DIR, 'config.json')
 
-// ─── Colored console logging ────────────────────────────────────────
-// Tags get colored by category so streaming logs are scannable at a glance.
-const C = {
-  reset: '\x1b[0m',
-  dim: '\x1b[2m',
-  bold: '\x1b[1m',
-  cyan: '\x1b[36m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  red: '\x1b[31m',
-  magenta: '\x1b[35m',
-  blue: '\x1b[34m',
-  white: '\x1b[37m',
-}
-const TAG_COLORS = {
-  daemon: C.cyan,
-  executor: C.green,
-  pusher: C.magenta,
-  heartbeat: C.blue,
-  mesh: C.dim,
-  'mesh-discovery': C.dim,
-  'mesh-energy': C.dim,
-  resource: C.dim,
-  a2a: C.blue,
-  discord: C.magenta,
-  imessage: C.green,
-  'native-imessage': C.green,
-  'auto-start': C.yellow,
-  startup: C.cyan,
-}
-// Wrap console.log to colorize [tag] prefixes
-const _origLog = console.log.bind(console)
-const _origError = console.error.bind(console)
-console.log = (...args) => {
-  if (typeof args[0] === 'string') {
-    const m = args[0].match(/^\[([^\]]+)\](.*)/)
-    if (m) {
-      const color = TAG_COLORS[m[1]] || C.white
-      // Color errors/warnings in the message body
-      let body = m[2]
-      if (/error|fail|crash/i.test(body)) body = `${C.red}${body}${C.reset}`
-      else if (/warn|skip|reject|dedup/i.test(body)) body = `${C.yellow}${body}${C.reset}`
-      else if (/✓|success|completed|ready|connected|online/i.test(body)) body = `${C.green}${body}${C.reset}`
-      args[0] = `${color}[${m[1]}]${C.reset}${body}`
-    }
-  }
-  _origLog(...args)
-}
-console.error = (...args) => {
-  if (typeof args[0] === 'string') {
-    args[0] = `${C.red}${args[0]}${C.reset}`
-  }
-  _origError(...args)
-}
-
 class Daemon {
   constructor (config) {
     this.config = config
@@ -140,27 +85,11 @@ class Daemon {
     this.hardwareProfile = await detectProfile()
     console.log(`[daemon] Hardware: ${this.hardwareProfile.cpu.model} | ${this.hardwareProfile.memory.total_gb}GB RAM | GPU: ${this.hardwareProfile.gpu.available ? this.hardwareProfile.gpu.name : 'none'}`)
 
-    // Step 1: Authenticate with cloud and register as online (with retry for transient failures)
+    // Step 1: Authenticate with cloud and register as online
     console.log('[daemon] Authenticating with cloud...')
-    let heartbeatResult = null
-    const maxRetries = 5
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        heartbeatResult = await this.cloud.sendHeartbeat({
-          hardware_profile: this.hardwareProfile
-        })
-        break
-      } catch (err) {
-        const isRetryable = /530|502|503|504|timeout|ECONNRESET|ENOTFOUND/i.test(err.message)
-        if (isRetryable && attempt < maxRetries) {
-          const delay = Math.min(attempt * 5, 30) // 5s, 10s, 15s, 20s, 25s
-          console.log(`[daemon] Auth attempt ${attempt}/${maxRetries} failed (${err.message}) — retrying in ${delay}s...`)
-          await new Promise(r => setTimeout(r, delay * 1000))
-        } else {
-          throw err
-        }
-      }
-    }
+    const heartbeatResult = await this.cloud.sendHeartbeat({
+      hardware_profile: this.hardwareProfile
+    })
     this.nodeId = heartbeatResult.node_id
 
     console.log(`[daemon] Node registered: ${this.nodeId}`)
@@ -440,6 +369,20 @@ class Daemon {
     // Capacity — resource monitor snapshot (CPU, RAM, battery, level)
     app.get(`${prefix}/capacity`, (req, res) => {
       res.json(this.resourceMonitor ? this.resourceMonitor.getCapacity() : { level: 'unknown' })
+    })
+
+    // SOM status — read ~/.iris/som-status.json
+    app.get(`${prefix}/som-status`, (req, res) => {
+      const statusPath = path.join(os.homedir(), '.iris', 'som-status.json')
+      try {
+        if (fs.existsSync(statusPath)) {
+          res.json(JSON.parse(fs.readFileSync(statusPath, 'utf-8')))
+        } else {
+          res.json({ error: 'No SOM status yet — run a batch first', campaigns: {} })
+        }
+      } catch (e) {
+        res.status(500).json({ error: e.message })
+      }
     })
 
     // Hardware profile
@@ -1314,7 +1257,8 @@ end tell`
         return res.status(400).json({ error: 'handle query param is required (email or phone)' })
       }
 
-      const digits = handle.replace(/\D/g, '')
+      const isEmail = handle.includes('@')
+      const digits = isEmail ? '' : handle.replace(/\D/g, '')
       const lower = handle.toLowerCase().replace(/'/g, "''")
       const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
 
@@ -1366,79 +1310,6 @@ LIMIT ${limit}
         res.json({ messages: result, count: result.length, handle, days })
       } catch (err) {
         console.error(`[imessage/search] Failed: ${err.message}`)
-        res.status(500).json({ error: err.message })
-      }
-    })
-
-    /**
-     * GET /api/imessage/group-chats?handle=<email_or_phone>&days=30&limit=10
-     * Discover group chats that include a participant matching the handle.
-     * Returns chat IDs + display names + recent message count.
-     */
-    app.get(`${prefix}/api/imessage/group-chats`, async (req, res) => {
-      if (process.platform !== 'darwin') {
-        return res.status(503).json({ error: 'iMessage group chat discovery is only available on macOS' })
-      }
-
-      const handle = (req.query.handle || '').toString().trim()
-      const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
-      const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)))
-
-      if (!handle) {
-        return res.status(400).json({ error: 'handle query param is required (email or phone)' })
-      }
-
-      const digits = handle.replace(/\D/g, '')
-      const lower = handle.toLowerCase().replace(/'/g, "''")
-      const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
-
-      // Find group chats where this handle is a participant
-      const sql = `
-SELECT DISTINCT
-  c.chat_identifier,
-  c.display_name,
-  c.style AS chat_style,
-  (SELECT COUNT(*) FROM message m2
-   JOIN chat_message_join cmj2 ON cmj2.message_id = m2.ROWID
-   WHERE cmj2.chat_id = c.ROWID
-     AND m2.date > (strftime('%s','now','-${days} days') - strftime('%s','2001-01-01')) * 1000000000
-  ) AS recent_count
-FROM chat c
-JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
-JOIN handle h ON h.ROWID = chj.handle_id
-WHERE c.style = 43
-  AND (
-    ${digits ? `REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', '') LIKE '%${digits}%' OR ` : ''}
-    LOWER(h.id) LIKE '%${lower}%'
-  )
-ORDER BY recent_count DESC
-LIMIT ${limit}
-`.trim()
-
-      try {
-        const result = await new Promise((resolve, reject) => {
-          const { execFile } = require('child_process')
-          execFile(
-            '/usr/bin/sqlite3',
-            ['-readonly', '-json', '-bail', chatDbPath, sql],
-            { timeout: 15000, maxBuffer: 2 * 1024 * 1024 },
-            (err, stdout, stderr) => {
-              if (err) {
-                const msg = (stderr || err.message || '').trim()
-                return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
-              }
-              try {
-                resolve(stdout.trim() ? JSON.parse(stdout) : [])
-              } catch (parseErr) {
-                reject(new Error(`sqlite3 JSON parse: ${parseErr.message}`))
-              }
-            }
-          )
-        })
-
-        res.json({ group_chats: result, count: result.length, handle, days })
-      } catch (err) {
-        console.error(`[imessage/group-chats] Failed: ${err.message}`)
         res.status(500).json({ error: err.message })
       }
     })
@@ -1583,17 +1454,17 @@ LIMIT ${limit}
     const ts = new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
     console.log(`[daemon] [${ts}] Task dispatched: ${event.task_id} — "${event.title}"`)
 
-    // ── Dedup: skip duplicate Pusher events for the same task_id within 10s window
-    const DEDUP_COOLDOWN_MS = 10 * 1000 // 10 seconds
+    // ── Dedup: skip duplicate Pusher events for the same task_id within 60s window
+    const DEDUP_COOLDOWN_MS = 60 * 1000 // 60 seconds
     const lastSeen = this.recentlySeenTasks.get(event.task_id)
     if (lastSeen && (Date.now() - lastSeen) < DEDUP_COOLDOWN_MS) {
       console.log(`[daemon] DEDUP: Task ${event.task_id.substring(0, 8)} already received ${Math.round((Date.now() - lastSeen) / 1000)}s ago — ignoring duplicate Pusher event`)
       return
     }
     this.recentlySeenTasks.set(event.task_id, Date.now())
-    // Clean up old dedup entries (> 60s)
+    // Clean up old dedup entries (> 5 min)
     for (const [id, time] of this.recentlySeenTasks) {
-      if (Date.now() - time > 60 * 1000) this.recentlySeenTasks.delete(id)
+      if (Date.now() - time > 300 * 1000) this.recentlySeenTasks.delete(id)
     }
 
     // Also skip if this task is already running in the executor
@@ -1669,7 +1540,7 @@ LIMIT ${limit}
       }
 
       // ── Pre-flight: singleton type check (AFTER fetch, we now have task.type) ──
-      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'clip_cutter']
+      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter']
       if (task && singletonTypesPost.includes(task.type)) {
         const executorRunning = (this.executor?._runningTasks || []).map(t => t.type)
         if (executorRunning.includes(task.type)) {
@@ -1686,33 +1557,31 @@ LIMIT ${limit}
       }
 
       // ── Pre-flight: Chrome process count (AFTER fetch, we know if it's a browser task) ──
-      // If too many Playwright processes, WAIT (up to 5 min) instead of hard-failing.
-      const browserTaskTypes = ['som_batch', 'discover', 'enrich_batch', 'leadgen', 'som']
+      const browserTaskTypes = ['som_batch', 'discover', 'enrich_batch', 'leadgen', 'som', 'custom_playwright', 'inbox_scan']
       if (task && browserTaskTypes.includes(task.type)) {
-        const MAX_PREFLIGHT_WAIT = 300 // 5 minutes
-        const POLL_INTERVAL = 10 // check every 10s
-        let waited = 0
-        let playwrightCount = 0
         try {
           const { execSync } = require('child_process')
-          for (; waited < MAX_PREFLIGHT_WAIT; waited += POLL_INTERVAL) {
+          // Count Playwright processes only — NEVER count Chrome Helper (that's the user's real browser)
+          let playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
+          if (playwrightCount > 6) {
+            // Before rejecting, try cleaning stale processes (>10 min old)
+            try {
+              execSync("ps -eo pid,etime,args | grep '[p]laywright.*test' | awk '{split($2,a,\":\"); if(length(a)==3 || (length(a)==2 && a[1]>10)) print $1}' | xargs kill -9 2>/dev/null || true", { timeout: 5000 })
+            } catch {}
+            // Re-check after cleanup
             playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
-            if (playwrightCount <= 6) break
-            if (waited === 0) console.log(`[daemon] ⏳ PRE-FLIGHT: ${playwrightCount} Playwright processes — waiting for capacity (${task.type})`)
-            await new Promise(r => setTimeout(r, POLL_INTERVAL * 1000))
           }
           if (playwrightCount > 6) {
-            console.log(`[daemon] ⚠️ PRE-FLIGHT: Still ${playwrightCount} Playwright processes after ${MAX_PREFLIGHT_WAIT}s — rejecting ${task.type}`)
+            console.log(`[daemon] ⚠️ PRE-FLIGHT: ${playwrightCount} Playwright processes — rejecting ${task.type}`)
             this.pendingTaskIds.delete(event.task_id)
             try {
               await this.cloud.submitResult(event.task_id, {
                 status: 'failed',
-                error: `Too many Playwright processes (${playwrightCount}) after ${MAX_PREFLIGHT_WAIT}s wait`
+                error: `Too many Playwright processes (${playwrightCount})`
               })
             } catch {}
             return
           }
-          if (waited > 0) console.log(`[daemon] ✓ PRE-FLIGHT: Playwright cleared (${playwrightCount} processes) after ${waited}s — proceeding with ${task.type}`)
         } catch {}
       }
 
