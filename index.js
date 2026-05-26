@@ -184,6 +184,9 @@ async function startTelegram (token, apiBaseUrl) {
   console.log(`[telegram] Connected as @${me.username}`)
 
   bot.on('message', async (message) => {
+    // Cache every text message for CLI retrieval
+    if (message.text) cacheTelegramMessage(message)
+
     if (!message.text) return
     if (message.text.startsWith('/start') || message.text.startsWith('/help')) {
       await bot.sendMessage(message.chat.id, 'IRIS AI assistant is ready. Send me a message!', { parse_mode: 'Markdown' })
@@ -1167,6 +1170,179 @@ app.delete('/api/providers/discord', (req, res) => {
   }
 
   res.json({ status: 'stopped' })
+})
+
+// ─── Telegram Data Endpoints ─────────────────────────────────────
+
+// In-memory message cache (Telegram Bot API has no history retrieval)
+const telegramMessageCache = new Map() // chatId → [{ message_id, from, chat, date, text }]
+const TELEGRAM_CACHE_LIMIT = 200
+
+function cacheTelegramMessage (msg) {
+  const chatId = String(msg.chat.id)
+  if (!telegramMessageCache.has(chatId)) telegramMessageCache.set(chatId, [])
+  const arr = telegramMessageCache.get(chatId)
+  arr.push({
+    message_id: msg.message_id,
+    from: { id: msg.from?.id, username: msg.from?.username, first_name: msg.from?.first_name, is_bot: msg.from?.is_bot },
+    chat: { id: msg.chat.id, type: msg.chat.type, title: msg.chat.title, username: msg.chat.username },
+    date: msg.date,
+    text: msg.text || ''
+  })
+  if (arr.length > TELEGRAM_CACHE_LIMIT) arr.splice(0, arr.length - TELEGRAM_CACHE_LIMIT)
+}
+
+app.get('/api/telegram/chats', (req, res) => {
+  if (!telegramBot) return res.status(503).json({ error: 'No Telegram bot connected. Start one via: iris channels connect telegram' })
+
+  const chats = []
+  for (const [chatId, msgs] of telegramMessageCache) {
+    if (msgs.length === 0) continue
+    const last = msgs[msgs.length - 1]
+    chats.push({
+      id: chatId,
+      type: last.chat.type,
+      title: last.chat.title || last.chat.username || `${last.from.first_name || ''}`.trim() || chatId,
+      message_count: msgs.length,
+      last_message: last.text.slice(0, 120),
+      last_date: new Date(last.date * 1000).toISOString()
+    })
+  }
+  chats.sort((a, b) => new Date(b.last_date) - new Date(a.last_date))
+  res.json({ chats, count: chats.length, bot_username: telegramBotUsername })
+})
+
+app.get('/api/telegram/messages', (req, res) => {
+  const chatId = (req.query.chat_id || '').toString().trim()
+  if (!chatId) return res.status(400).json({ error: 'chat_id query param is required' })
+  if (!telegramBot) return res.status(503).json({ error: 'No Telegram bot connected' })
+
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '50', 10)))
+  const msgs = (telegramMessageCache.get(chatId) || []).slice(-limit)
+
+  const messages = msgs.map(m => ({
+    message_id: m.message_id,
+    text: m.text,
+    from: m.from,
+    chat: m.chat,
+    timestamp: new Date(m.date * 1000).toISOString()
+  }))
+
+  res.json({ messages, chat_id: chatId, count: messages.length })
+})
+
+app.post('/api/telegram/send', async (req, res) => {
+  const { chat_id, text } = req.body || {}
+  if (!chat_id || !text) return res.status(400).json({ error: 'chat_id and text are required' })
+  if (!telegramBot) return res.status(503).json({ error: 'No Telegram bot connected' })
+
+  try {
+    const sent = await telegramBot.sendMessage(chat_id, text, { parse_mode: 'Markdown' })
+    res.json({ ok: true, message_id: sent.message_id })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/telegram/info', (req, res) => {
+  res.json({
+    connected: !!telegramBot,
+    username: telegramBotUsername || null,
+    cached_chats: telegramMessageCache.size,
+    cached_messages: [...telegramMessageCache.values()].reduce((sum, arr) => sum + arr.length, 0)
+  })
+})
+
+// ─── Instagram Data Endpoints ────────────────────────────────────
+
+app.get('/api/instagram/inbox', async (req, res) => {
+  const account = (req.query.account || '').toString().trim()
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '20', 10)))
+
+  // Find session file
+  const somDir = path.join(__dirname, 'som')
+  const testsDir = path.join(__dirname, '..', 'tests', 'e2e')
+  const candidates = account
+    ? [`instagram-auth-${account}.json`]
+    : ['instagram-auth-thediscoverpage_.json', 'instagram-auth-freelabelnet.json', 'instagram-auth-hourdemayo.json', 'instagram-auth.json']
+
+  let sessionFile = null
+  for (const f of candidates) {
+    const p1 = path.join(somDir, f)
+    const p2 = path.join(testsDir, f)
+    if (fs.existsSync(p1)) { sessionFile = p1; break }
+    if (fs.existsSync(p2)) { sessionFile = p2; break }
+  }
+
+  if (!sessionFile) {
+    return res.status(404).json({
+      error: 'No Instagram session found. Save one: iris hive credentials save-session --platform instagram',
+      candidates
+    })
+  }
+
+  let browser = null
+  try {
+    const { chromium } = require('playwright')
+    const storageState = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
+
+    browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] })
+    const ctx = await browser.newContext({
+      storageState,
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    const page = await ctx.newPage()
+
+    await page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'domcontentloaded', timeout: 20000 })
+    await page.waitForTimeout(4000)
+
+    // Dismiss popups
+    try {
+      const notNow = page.locator('button:has-text("Not Now"), button:has-text("Not now")')
+      if (await notNow.first().isVisible({ timeout: 2000 })) await notNow.first().click()
+    } catch {}
+
+    // Extract conversations from sidebar
+    const conversations = await page.evaluate((lim) => {
+      const results = []
+      const rows = document.querySelectorAll('div[role="listitem"], div[role="row"], a[href*="/direct/t/"]')
+      const seen = new Set()
+      for (const row of Array.from(rows)) {
+        if (results.length >= lim) break
+        const nameEl = row.querySelector('span[dir="auto"]') || row.querySelector('span')
+        const name = nameEl?.textContent?.trim() || ''
+        if (!name || name.length < 2 || seen.has(name.toLowerCase())) continue
+        seen.add(name.toLowerCase())
+
+        let preview = ''
+        const spans = row.querySelectorAll('span[dir="auto"]')
+        for (const s of Array.from(spans)) {
+          const t = (s.textContent || '').trim()
+          if (t !== name && t.length > 3 && t.length < 200) { preview = t; break }
+        }
+
+        let timestamp = ''
+        const timeEl = row.querySelector('time')
+        timestamp = timeEl?.getAttribute('datetime') || timeEl?.textContent?.trim() || ''
+
+        results.push({ username: name, preview, timestamp })
+      }
+      return results
+    }, limit)
+
+    await browser.close()
+    browser = null
+
+    res.json({
+      conversations,
+      count: conversations.length,
+      account: sessionFile.includes('-') ? path.basename(sessionFile).replace('instagram-auth-', '').replace('.json', '') : 'default'
+    })
+  } catch (err) {
+    if (browser) try { await browser.close() } catch {}
+    console.error(`[ig-inbox] Error: ${err.message}`)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 // ─── Discord Data Endpoints ──────────────────────────────────────
