@@ -1169,6 +1169,169 @@ app.delete('/api/providers/discord', (req, res) => {
   res.json({ status: 'stopped' })
 })
 
+// ─── Discord Data Endpoints ──────────────────────────────────────
+
+function getDiscordClient () {
+  for (const [, entry] of discordBots) {
+    if (entry.client && entry.client.isReady()) return entry
+  }
+  return null
+}
+
+app.get('/api/discord/guilds', async (req, res) => {
+  const entry = getDiscordClient()
+  if (!entry) return res.status(503).json({ error: 'No Discord bot connected. Start one via: iris channels connect discord' })
+
+  try {
+    const guilds = []
+    for (const [, e] of discordBots) {
+      if (!e.client || !e.client.isReady()) continue
+      for (const [, guild] of e.client.guilds.cache) {
+        guilds.push({
+          id: guild.id,
+          name: guild.name,
+          icon: guild.iconURL({ size: 64 }),
+          member_count: guild.memberCount,
+          bot_username: e.botUsername
+        })
+      }
+    }
+    res.json({ guilds, count: guilds.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/discord/channels', async (req, res) => {
+  const guildId = (req.query.guild_id || '').toString().trim()
+  if (!guildId) return res.status(400).json({ error: 'guild_id query param is required' })
+
+  const entry = getDiscordClient()
+  if (!entry) return res.status(503).json({ error: 'No Discord bot connected' })
+
+  try {
+    const guild = entry.client.guilds.cache.get(guildId) || await entry.client.guilds.fetch(guildId).catch(() => null)
+    if (!guild) return res.status(404).json({ error: `Guild ${guildId} not found or bot has no access` })
+
+    await guild.channels.fetch()
+    const channels = []
+    for (const [, ch] of guild.channels.cache) {
+      if (!ch.isTextBased() || ch.isThread()) continue
+      channels.push({
+        id: ch.id,
+        name: ch.name,
+        type: ch.type,
+        parent_name: ch.parent ? ch.parent.name : null,
+        position: ch.position
+      })
+    }
+    channels.sort((a, b) => (a.parent_name || '').localeCompare(b.parent_name || '') || a.position - b.position)
+    res.json({ channels, guild: { id: guild.id, name: guild.name }, count: channels.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/discord/messages', async (req, res) => {
+  const channelId = (req.query.channel_id || '').toString().trim()
+  if (!channelId) return res.status(400).json({ error: 'channel_id query param is required' })
+
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '50', 10)))
+  const before = (req.query.before || '').toString().trim() || undefined
+
+  const entry = getDiscordClient()
+  if (!entry) return res.status(503).json({ error: 'No Discord bot connected' })
+
+  try {
+    const channel = await entry.client.channels.fetch(channelId).catch(() => null)
+    if (!channel || !channel.isTextBased()) return res.status(404).json({ error: `Channel ${channelId} not found or not text-based` })
+
+    const fetchOpts = { limit }
+    if (before) fetchOpts.before = before
+    const msgs = await channel.messages.fetch(fetchOpts)
+
+    const messages = msgs.map(m => ({
+      id: m.id,
+      content: m.content,
+      author: { id: m.author.id, username: m.author.username, bot: m.author.bot },
+      timestamp: m.createdAt.toISOString(),
+      attachments: m.attachments.map(a => ({ url: a.url, name: a.name, size: a.size })),
+      channel_name: channel.name || null,
+      guild_name: channel.guild ? channel.guild.name : null
+    }))
+
+    res.json({
+      messages,
+      channel: { id: channel.id, name: channel.name || 'DM', guild_id: channel.guildId || null },
+      count: messages.length
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/discord/search', async (req, res) => {
+  const query = (req.query.q || '').toString().trim().toLowerCase()
+  if (!query) return res.status(400).json({ error: 'q query param is required' })
+
+  const channelId = (req.query.channel_id || '').toString().trim()
+  const guildId = (req.query.guild_id || '').toString().trim()
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '20', 10)))
+  const scanLimit = Math.min(500, parseInt(req.query.scan_limit || '200', 10))
+
+  const entry = getDiscordClient()
+  if (!entry) return res.status(503).json({ error: 'No Discord bot connected' })
+
+  try {
+    const channelsToSearch = []
+
+    if (channelId) {
+      const ch = await entry.client.channels.fetch(channelId).catch(() => null)
+      if (ch && ch.isTextBased()) channelsToSearch.push(ch)
+    } else if (guildId) {
+      const guild = entry.client.guilds.cache.get(guildId) || await entry.client.guilds.fetch(guildId).catch(() => null)
+      if (guild) {
+        await guild.channels.fetch()
+        for (const [, ch] of guild.channels.cache) {
+          if (ch.isTextBased() && !ch.isThread()) channelsToSearch.push(ch)
+        }
+      }
+    }
+
+    if (channelsToSearch.length === 0) {
+      return res.status(400).json({ error: 'No searchable channels found. Provide channel_id or guild_id.' })
+    }
+
+    const matches = []
+    let totalScanned = 0
+
+    for (const ch of channelsToSearch) {
+      if (matches.length >= limit) break
+      try {
+        const msgs = await ch.messages.fetch({ limit: Math.min(scanLimit, 100) })
+        totalScanned += msgs.size
+        for (const [, m] of msgs) {
+          if (matches.length >= limit) break
+          if (m.content.toLowerCase().includes(query)) {
+            matches.push({
+              id: m.id,
+              content: m.content,
+              author: { id: m.author.id, username: m.author.username, bot: m.author.bot },
+              timestamp: m.createdAt.toISOString(),
+              channel_name: ch.name || 'DM',
+              guild_name: ch.guild ? ch.guild.name : null
+            })
+          }
+        }
+      } catch { /* skip channels bot can't read */ }
+    }
+
+    res.json({ messages: matches, query, total_scanned: totalScanned, count: matches.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ─── iMessage Provider (BlueBubbles) ─────────────────────────────
 
 app.post('/api/providers/imessage', async (req, res) => {
