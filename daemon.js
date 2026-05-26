@@ -471,7 +471,11 @@ function startDaemon () {
 
     const daemon = new Daemon(config)
 
-    // Inject daemon into bridge's health endpoint so /health reports daemon status
+    // Inject daemon into bridge's health endpoint so /health reports daemon status.
+    // CRITICAL: Set flag BEFORE require('./index') to prevent the bridge from
+    // starting its own embedded daemon (autoStartDaemon). Without this, two daemons
+    // subscribe to Pusher and every task executes twice.
+    process.env._DAEMON_STARTED = '1'
     try {
       const bridge = require('./index')
       if (bridge && typeof bridge.setEmbeddedDaemon === 'function') {
@@ -510,10 +514,46 @@ function startDaemon () {
     process.on('SIGTERM', () => cleanup('SIGTERM'))
 
     daemon.start().catch((err) => {
-      console.error('Daemon cloud auth failed:', err.message)
+      const errMsg = err.message || String(err)
+      console.error('Daemon cloud auth failed:', errMsg)
       console.error('[daemon] Running in OFFLINE mode — local schedules and HTTP server still active')
       console.error('[daemon] Cloud tasks will not be dispatched until auth is fixed')
       console.error('[daemon] Retry: iris bridge restart')
+
+      // Persist failure to status.json so iris bridge status can show it
+      try {
+        const statusPath = path.join(os.homedir(), '.iris', 'status.json')
+        const statusDir = path.dirname(statusPath)
+        if (!fs.existsSync(statusDir)) fs.mkdirSync(statusDir, { recursive: true })
+        fs.writeFileSync(statusPath, JSON.stringify({
+          status: 'offline',
+          error: errMsg,
+          node_id: null,
+          node_name: os.hostname(),
+          heartbeat: { state: 'failed', fail_count: 1 },
+          running_tasks: 0,
+          uptime_s: Math.floor(process.uptime()),
+          last_updated: new Date().toISOString()
+        }, null, 2))
+      } catch { /* non-critical */ }
+
+      // Log to disk (LaunchAgent stderr may not be visible)
+      try {
+        const logDir = path.join(os.homedir(), '.iris', 'logs')
+        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true })
+        fs.appendFileSync(path.join(logDir, 'daemon-error.log'),
+          `[${new Date().toISOString()}] Cloud auth failed: ${errMsg}\n`)
+      } catch { /* non-critical */ }
+
+      // macOS notification so user sees it even without terminal
+      if (process.platform === 'darwin') {
+        try {
+          require('child_process').execSync(
+            `osascript -e 'display notification "Cloud auth failed: ${errMsg.replace(/'/g, "'\\''").substring(0, 100)}" with title "IRIS Daemon" subtitle "Running in offline mode"'`,
+            { stdio: 'ignore', timeout: 5000 }
+          )
+        } catch { /* non-critical */ }
+      }
     })
   })
 
