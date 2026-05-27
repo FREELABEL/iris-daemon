@@ -27,6 +27,7 @@ const { Heartbeat } = require('./heartbeat')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
+const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
 const { execSync, spawn } = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -80,7 +81,31 @@ class Daemon {
   async start () {
     console.log('[daemon] Starting...')
 
-    // Step 0: Detect hardware profile (cached after first run)
+    // Step 0a: Verify tmux (required for session persistence)
+    try {
+      this.executor.tmux.verify()
+      // Clean up stale sessions from previous daemon runs
+      this.executor.tmux.cleanupAll()
+    } catch (tmuxErr) {
+      if (process.env.IRIS_NO_TMUX === '1') {
+        console.log('[daemon] tmux disabled (IRIS_NO_TMUX=1)')
+      } else {
+        console.error(`[daemon] tmux verification failed: ${tmuxErr.message}`)
+        console.error('[daemon] Install tmux: brew install tmux (macOS) or sudo apt install tmux (Linux)')
+        console.error('[daemon] Or set IRIS_NO_TMUX=1 to disable (CI only)')
+        process.exit(1)
+      }
+    }
+
+    // Step 0b: Start tmux zombie cleanup sweep (every 10 min)
+    if (this.executor.tmux.available) {
+      this._tmuxCleanupInterval = setInterval(() => {
+        this.executor.tmux.cleanupZombies()
+        this.executor.tmux.rotateLogs()
+      }, 10 * 60 * 1000)
+    }
+
+    // Step 0c: Detect hardware profile (cached after first run)
     console.log('[daemon] Detecting hardware...')
     this.hardwareProfile = await detectProfile()
     console.log(`[daemon] Hardware: ${this.hardwareProfile.cpu.model} | ${this.hardwareProfile.memory.total_gb}GB RAM | GPU: ${this.hardwareProfile.gpu.available ? this.hardwareProfile.gpu.name : 'none'}`)
@@ -102,6 +127,9 @@ class Daemon {
     // Step 1b: Auto-bootstrap IRIS CLI if not installed
     this._userId = heartbeatResult.user_id || null
     await this._bootstrapCLI()
+
+    // Step 1c: Check for bridge daemon updates (non-blocking)
+    this._checkBridgeUpdate().catch(() => {})
 
     // Step 2: Connect to Pusher
     const pusherKey = heartbeatResult.pusher_key || this.config.pusherKey
@@ -345,14 +373,15 @@ class Daemon {
     app.get(`${prefix}/queue`, (req, res) => {
       const tasks = []
       if (this.executor && this.executor.runningTasks) {
-        for (const [taskId, child] of this.executor.runningTasks) {
+        for (const [taskId, entry] of this.executor.runningTasks) {
           tasks.push({
             id: taskId,
-            title: child._taskTitle || null,
-            type: child._taskType || null,
-            pid: child.pid,
-            started: child._startedAt ? new Date(child._startedAt).toISOString() : null,
-            uptime_s: child._startedAt ? Math.round((Date.now() - child._startedAt) / 1000) : null,
+            title: entry._taskTitle || null,
+            type: entry._taskType || null,
+            pid: entry.pid || null,
+            tmux_session: entry.tmux ? entry.sessionName : null,
+            started: entry._startedAt ? new Date(entry._startedAt).toISOString() : null,
+            uptime_s: entry._startedAt ? Math.round((Date.now() - entry._startedAt) / 1000) : null,
           })
         }
       }
@@ -364,6 +393,61 @@ class Daemon {
         tasks,
         pending_local: this.pendingTaskIds || [],
       })
+    })
+
+    // ─── tmux session endpoints ─────────────────────────────────────────
+    // These power the MCP tools (hive_swarm, hive_panes, hive_sessions)
+    // and the TUI sidebar. External agents never touch tmux directly.
+
+    app.get(`${prefix}/tmux/sessions`, (req, res) => {
+      if (!this.executor.tmux.available) {
+        return res.json({ sessions: [], tmux_available: false })
+      }
+      res.json({ sessions: this.executor.tmux.listActive(), tmux_available: true })
+    })
+
+    app.get(`${prefix}/tmux/sessions/:name/panes`, (req, res) => {
+      if (!this.executor.tmux.available) {
+        return res.status(503).json({ error: 'tmux not available' })
+      }
+      const session = this.executor.tmux.getSession(req.params.name)
+      if (!session) {
+        return res.status(404).json({ error: `Session ${req.params.name} not found` })
+      }
+      const lines = parseInt(req.query.lines || '20', 10)
+      const panesWithOutput = session.panes.map(p => ({
+        ...p,
+        output: this.executor.tmux.captureOutput(req.params.name, p.index, lines) || ''
+      }))
+      res.json({ session: req.params.name, panes: panesWithOutput })
+    })
+
+    app.post(`${prefix}/tmux/sessions/:name/input`, (req, res) => {
+      if (!this.executor.tmux.available) {
+        return res.status(503).json({ error: 'tmux not available' })
+      }
+      const { pane, text } = req.body || {}
+      if (text === undefined || text === null) {
+        return res.status(400).json({ error: 'text is required' })
+      }
+      try {
+        this.executor.tmux.sendInput(req.params.name, pane || 0, String(text))
+        res.json({ ok: true })
+      } catch (err) {
+        res.status(500).json({ error: err.message })
+      }
+    })
+
+    app.delete(`${prefix}/tmux/sessions/:name`, (req, res) => {
+      if (!this.executor.tmux.available) {
+        return res.status(503).json({ error: 'tmux not available' })
+      }
+      try {
+        this.executor.tmux.cleanup(req.params.name)
+        res.json({ ok: true, killed: req.params.name })
+      } catch (err) {
+        res.status(500).json({ error: err.message })
+      }
     })
 
     // Capacity — resource monitor snapshot (CPU, RAM, battery, level)
@@ -1421,6 +1505,28 @@ LIMIT ${limit}
     // Mesh networking routes (offline/LAN peer-to-peer)
     this._registerMeshRoutes(app, prefix)
 
+    // ─── A2A Protocol (Agent-to-Agent) ──────────────────────────────
+    // Standard protocol for agent interoperability (a2a-protocol.org).
+    // Mounts on the PARENT app (not prefixed) so /.well-known/agent.json
+    // is at the root, and /a2a handles JSON-RPC + REST task operations.
+    const parentApp = useEmbedded ? this.externalApp : app
+    try {
+      const { DefaultRequestHandler, InMemoryTaskStore } = require('@a2a-js/sdk/server')
+      const { A2AExpressApp } = require('@a2a-js/sdk/server/express')
+
+      const a2aExecutor = new IrisA2AExecutor(this.executor, this.cloud)
+      const a2aTaskStore = new InMemoryTaskStore()
+      const agentCard = buildAgentCard(this.nodeName, this.nodeId)
+      const a2aHandler = new DefaultRequestHandler(agentCard, a2aTaskStore, a2aExecutor)
+      const a2aApp = new A2AExpressApp(a2aHandler)
+
+      a2aApp.setupRoutes(parentApp, '/a2a')
+
+      console.log(`[a2a] A2A protocol mounted: /a2a/.well-known/agent.json + /a2a (JSON-RPC)`)
+    } catch (err) {
+      console.warn(`[a2a] A2A protocol not available: ${err.message} (install @a2a-js/sdk to enable)`)
+    }
+
     // In embedded mode, routes are already mounted on the bridge — no new server needed
     if (useEmbedded) {
       console.log(`[daemon] Daemon endpoints mounted at /daemon/* on bridge server`)
@@ -1432,7 +1538,7 @@ LIMIT ${limit}
       const bindHost = process.env.BRIDGE_BIND_HOST || '127.0.0.1'
       this.a2aServer = app.listen(a2aPort, bindHost, () => {
         console.log(`[a2a] HTTP server listening on :${a2aPort}`)
-        console.log(`[a2a] Endpoints: /health /capacity /profile /pause /resume /ingest /files /processes`)
+        console.log(`[a2a] Endpoints: /health /capacity /profile /pause /resume /ingest /files /processes /a2a`)
         resolve()
       })
 
@@ -1556,34 +1662,8 @@ LIMIT ${limit}
         }
       }
 
-      // ── Pre-flight: Chrome process count (AFTER fetch, we know if it's a browser task) ──
-      const browserTaskTypes = ['som_batch', 'discover', 'enrich_batch', 'leadgen', 'som', 'custom_playwright', 'inbox_scan']
-      if (task && browserTaskTypes.includes(task.type)) {
-        try {
-          const { execSync } = require('child_process')
-          // Count Playwright processes only — NEVER count Chrome Helper (that's the user's real browser)
-          let playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
-          if (playwrightCount > 6) {
-            // Before rejecting, try cleaning stale processes (>10 min old)
-            try {
-              execSync("ps -eo pid,etime,args | grep '[p]laywright.*test' | awk '{split($2,a,\":\"); if(length(a)==3 || (length(a)==2 && a[1]>10)) print $1}' | xargs kill -9 2>/dev/null || true", { timeout: 5000 })
-            } catch {}
-            // Re-check after cleanup
-            playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
-          }
-          if (playwrightCount > 6) {
-            console.log(`[daemon] ⚠️ PRE-FLIGHT: ${playwrightCount} Playwright processes — rejecting ${task.type}`)
-            this.pendingTaskIds.delete(event.task_id)
-            try {
-              await this.cloud.submitResult(event.task_id, {
-                status: 'failed',
-                error: `Too many Playwright processes (${playwrightCount})`
-              })
-            } catch {}
-            return
-          }
-        } catch {}
-      }
+      // Browser concurrency is enforced by TaskExecutor.BROWSER_TYPES gate (max 1, queue 3).
+      // No process count pre-flight needed — the gate is the single source of truth.
 
       // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
       try {
@@ -1746,6 +1826,33 @@ LIMIT ${limit}
       console.warn(`[daemon] CLI bootstrap failed (non-blocking): ${err.message}`)
       console.warn('[daemon] Scripts using `iris` CLI will fail. Install manually: curl -fsSL https://heyiris.io/install-iris.sh | bash')
     }
+  }
+
+  /**
+   * Check if the bridge daemon is outdated and notify the user.
+   */
+  async _checkBridgeUpdate () {
+    try {
+      const localVersion = require(path.join(__dirname, '..', 'package.json')).version
+      const res = await fetch('https://api.github.com/repos/FREELABEL/iris-daemon/releases/latest', {
+        headers: { Accept: 'application/json', 'User-Agent': 'iris-daemon' },
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      const remoteTag = (data.tag_name || '').replace(/^v/, '')
+      if (!remoteTag || remoteTag === localVersion) {
+        console.log(`[daemon] Bridge up to date: v${localVersion}`)
+        return
+      }
+      const toNum = v => v.split('.').reduce((a, n, i) => a + Number(n) * Math.pow(1000, 2 - i), 0)
+      if (toNum(remoteTag) > toNum(localVersion)) {
+        console.warn(`[daemon] Bridge update available: v${localVersion} -> v${remoteTag}. Run: iris update`)
+        try {
+          execSync(`osascript -e 'display notification "Bridge v${remoteTag} available (current: v${localVersion}). Run: iris update" with title "IRIS Bridge Update"'`, { timeout: 5000, stdio: 'ignore' })
+        } catch { /* non-macOS */ }
+      }
+    } catch { /* non-critical */ }
   }
 
   // ─── Local Schedule Registry ─────────────────────────────────────
@@ -2083,8 +2190,11 @@ LIMIT ${limit}
       console.log('[a2a] HTTP server stopped')
     }
 
-    // Kill running tasks
+    // Kill running tasks (also cleans up tmux sessions)
     this.executor.killAll()
+
+    // Stop tmux zombie cleanup interval
+    if (this._tmuxCleanupInterval) clearInterval(this._tmuxCleanupInterval)
 
     // Write final status
     this._writeStatusFile()

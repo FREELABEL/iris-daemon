@@ -322,6 +322,31 @@ function isDockerMode () {
   }
 }
 
+/**
+ * Detect if a GUI desktop session is available (macOS).
+ * If lid is closed or no active user session, Playwright --headed will hang.
+ * Returns true if headed mode is safe.
+ */
+function hasDesktopSession () {
+  if (process.env.IRIS_FORCE_HEADED === '1') return true
+  if (process.env.HEADLESS === '1' || process.env.IRIS_NO_GUI === '1') return false
+  try {
+    // Check if macOS has an active GUI session
+    const who = execSync('who 2>/dev/null | grep console', { encoding: 'utf-8', timeout: 3000 })
+    return who.trim().length > 0
+  } catch {
+    return false // Non-macOS or no console session — default to headless
+  }
+}
+
+/**
+ * Get Playwright headed/headless flag based on environment.
+ * Headed mode only if a desktop session is active.
+ */
+function playwrightHeadedFlag () {
+  return hasDesktopSession() ? '--headed' : ''
+}
+
 class TaskExecutor {
   // Task types that spawn Playwright/Chromium — only 1 browser at a time.
   // This prevents 5 Chromium windows opening simultaneously when schedules cluster.
@@ -348,6 +373,49 @@ class TaskExecutor {
       if (verbose) console.log(`[executor] freelabel path: ${this.freelabelPath}`)
     } else if (verbose) {
       console.warn('[executor] freelabel root not found — som tasks will fail. Set FREELABEL_PATH env var.')
+    }
+
+    // Check session health on startup
+    this.checkSessionHealth()
+    // Re-check every 6 hours
+    setInterval(() => this.checkSessionHealth(), 6 * 60 * 60 * 1000)
+  }
+
+  /**
+   * Check session file health — warn if IG/YouTube sessions are stale (>7 days old).
+   * Called on startup and every 6 hours.
+   */
+  checkSessionHealth () {
+    const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
+    const sessionDirs = [
+      path.join(os.homedir(), '.iris', 'sessions'),
+      path.join(os.homedir(), '.iris', 'bridge', 'som'),
+    ]
+    const stale = []
+    for (const dir of sessionDirs) {
+      try {
+        if (!fs.existsSync(dir)) continue
+        for (const file of fs.readdirSync(dir)) {
+          if (!file.endsWith('.json') || !file.includes('auth')) continue
+          const filePath = path.join(dir, file)
+          const stat = fs.statSync(filePath)
+          const ageMs = Date.now() - stat.mtimeMs
+          if (ageMs > MAX_AGE_MS) {
+            stale.push({ file, age: Math.round(ageMs / 86400000), path: filePath })
+          }
+        }
+      } catch { /* skip */ }
+    }
+    if (stale.length > 0) {
+      console.warn(`[session-health] ${stale.length} stale session(s) detected:`)
+      for (const s of stale) {
+        console.warn(`  ${s.file} — ${s.age} days old`)
+      }
+      // macOS notification
+      try {
+        const names = stale.map(s => s.file.replace('instagram-auth-', '').replace('.json', '')).join(', ')
+        execSync(`osascript -e 'display notification "${stale.length} session(s) may be expired: ${names}" with title "IRIS Session Alert" sound name "Ping"'`, { timeout: 5000, stdio: 'ignore' })
+      } catch { /* non-macOS */ }
     }
   }
 
@@ -1297,7 +1365,7 @@ class TaskExecutor {
             // --workers=2 runs 2 tests in parallel within a single spec (speeds up multi-check requirement runs)
             const workers = process.env.PLAYWRIGHT_WORKERS || '2'
             cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`, `--workers=${workers}`]
+            args = ['playwright', 'test', scriptPath, playwrightHeadedFlag(), `--timeout=${timeoutMs}`, `--workers=${workers}`].filter(Boolean)
             workspace.projectDir = workspace.dir
             // Belt-and-suspenders: also set NODE_PATH so module resolution can find it
             workspace.env = { ...(workspace.env || {}), NODE_PATH: path.join(hostDir, 'node_modules') }
@@ -1309,7 +1377,7 @@ class TaskExecutor {
               p.on('close', code => code === 0 ? resolve() : reject(new Error(`npm install playwright failed (exit ${code})`)))
             })
             cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
+            args = ['playwright', 'test', scriptPath, playwrightHeadedFlag(), `--timeout=${timeoutMs}`].filter(Boolean)
             workspace.projectDir = workspace.dir
           }
           break
@@ -1426,7 +1494,7 @@ class TaskExecutor {
 
           if (somSpec) {
             // Direct playwright invocation for outreach mode (most common)
-            args = ['playwright', 'test', somSpec, '--headed', '--timeout=600000']
+            args = ['playwright', 'test', somSpec, playwrightHeadedFlag(), '--timeout=600000'].filter(Boolean)
             // Campaign registry takes priority over task.config to prevent mismatches
             const somEnv = {
               BOARD_ID: campaignConfig?.boardId || task.config?.boardId || '38',
@@ -1928,7 +1996,7 @@ async function call(method, p, body) {
           }
 
           cmd = 'npx'
-          args = ['playwright', 'test', 'tests/e2e/enrich-venues.spec.ts', '--headed', '--timeout=1800000']
+          args = ['playwright', 'test', 'tests/e2e/enrich-venues.spec.ts', playwrightHeadedFlag(), '--timeout=1800000'].filter(Boolean)
           task.config = task.config || {}
           task.config.env_vars = {
             ...(task.config.env_vars || {}),
@@ -2990,6 +3058,14 @@ exit 1
       child._taskTitle = task.title || task.type
       child._taskType = task.type
       this.runningTasks.set(task.id, child)
+
+      // Prevent macOS auto-sleep during browser tasks (caffeinate -w PID exits when child dies)
+      if (TaskExecutor.BROWSER_TYPES.includes(task.type) && child.pid && process.platform === 'darwin') {
+        try {
+          const caffeinateProc = spawn('caffeinate', ['-w', String(child.pid)], { stdio: 'ignore', detached: true })
+          caffeinateProc.unref()
+        } catch { /* caffeinate not available — non-critical */ }
+      }
 
       child.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
