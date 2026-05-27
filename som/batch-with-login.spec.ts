@@ -2,23 +2,27 @@ import { test, Page, Locator } from '@playwright/test';
 import { AuthHelper } from './helpers/auth-helper';
 import { LeadgenApiClient } from './helpers/leadgen-api-client';
 import { scrapeProfileStats } from './helpers/providers/base-provider';
+import { getDmProvider } from './helpers/providers/dm-provider-factory';
+import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
+import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from '../../fl-docker-dev/coding-agent-bridge/som/helpers/inbox-scanner';
+import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
+import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
 
-// Token is injected by daemon via HEYIRIS_TOKEN env var (from SDK ~/.iris/sdk/.env)
-// Fallback is Freelabel's internal token — clients must have HEYIRIS_TOKEN set
-const TOKEN = process.env.HEYIRIS_TOKEN || (() => {
-  try {
-    const envPath = require('path').join(require('os').homedir(), '.iris', 'sdk', '.env');
-    const content = require('fs').readFileSync(envPath, 'utf-8');
-    const match = content.match(/IRIS_API_KEY=(.+)/);
-    return match?.[1]?.trim() || '';
-  } catch { return ''; }
-})();
+const TOKEN = process.env.HEYIRIS_TOKEN;
+if (!TOKEN) throw new Error('HEYIRIS_TOKEN env var required. Set in ~/.iris/bridge/.env or export it.');
 // Frontend auth needs a JWT (Passport OAuth token), not the simple API key.
-// Use IRIS_FRONTEND_TOKEN env var (full repo .env won't exist on daemon machines).
-const FRONTEND_TOKEN = process.env.IRIS_FRONTEND_TOKEN || TOKEN;
+// Read from elon frontend .env, or use IRIS_FRONTEND_TOKEN env var.
+const FRONTEND_TOKEN = process.env.IRIS_FRONTEND_TOKEN || (() => {
+  try {
+    const envPath = path.join(__dirname, '../../fl-docker-dev/fl-elon-web-ui/.env');
+    const envContent = require('fs').readFileSync(envPath, 'utf-8');
+    const match = envContent.match(/FL_RAICHU_API_TOKEN=(.+)/);
+    return match?.[1]?.trim() || TOKEN;
+  } catch { return TOKEN; }
+})();
 const BOARD_ID = parseInt(process.env.BOARD_ID || '38', 10);
 const LEADS_TO_PROCESS = parseInt(process.env.LIMIT || '5', 10);
 // Strategy alias map — shell-safe aliases resolve to full names with spaces/pipes
@@ -43,18 +47,30 @@ const STEP_MODE = (process.env.STEP || 'auto').toLowerCase();
 const FIXED_STEP = /^\d+$/.test(STEP_MODE) ? parseInt(STEP_MODE, 10) : null; // null = auto
 const IS_AUTO_STEP = !FIXED_STEP; // auto/next mode
 const IG_ACCOUNT = process.env.IG_ACCOUNT || 'heyiris.io';
+const PLATFORM = (process.env.PLATFORM || '').toLowerCase();
+const IS_LINKEDIN = PLATFORM === 'linkedin' || !IG_ACCOUNT || IG_ACCOUNT === 'null' || IG_ACCOUNT === 'none';
 const OUTREACH_FILTER = (process.env.FILTER || 'new').toLowerCase() as 'all' | 'new' | 'followup';
 const WAIT_DAYS = parseInt(process.env.WAIT_DAYS || '2', 10);
+// MODE=ui (default, V1): full UI flow — Apply Strategy → Generate → Send → Mark step done
+// MODE=api (V2): fast API-direct — skip UI, navigate straight to IG. Requires outreach steps to exist.
+const SOM_MODE = (process.env.MODE || 'ui').toLowerCase() as 'ui' | 'api';
+// SCAN_INBOX: run inbox scan before outreach to catch replies (default: on)
+const SCAN_INBOX = process.env.SCAN_INBOX !== '0';
+const INBOX_LIMIT = parseInt(process.env.INBOX_LIMIT || '20', 10);
 
+const LINKEDIN_AUTH_FILE = path.join(__dirname, 'linkedin-auth.json');
 const DAILY_DM_CAP = parseInt(process.env.DAILY_DM_CAP || '40', 10);
-const DM_SENT_FILE = path.join(__dirname, `.dm-sent-${IG_ACCOUNT}-${new Date().toISOString().slice(0, 10)}.json`);
+const DM_SENT_FILE = path.join(__dirname, `../../test-results/.dm-sent-${IG_ACCOUNT}-${new Date().toISOString().slice(0, 10)}.json`);
+
+// LinkedIn daily cap — separate from IG, defaults to 25 (safe limit for free accounts)
+const LINKEDIN_DAILY_CAP = parseInt(process.env.LINKEDIN_DAILY_CAP || '25', 10);
+const LI_DM_SENT_FILE = path.join(__dirname, `../../test-results/.dm-sent-linkedin-${new Date().toISOString().slice(0, 10)}.json`);
 
 const IG_AUTH_FILE = process.env.BROWSER_SESSION_FILE
   || path.join(__dirname, `instagram-auth-${IG_ACCOUNT}.json`);
 const IG_AUTH_LEGACY = path.join(__dirname, 'instagram-auth.json');
 
-const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
-  'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
+const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL || '';
 
 /**
  * Read per-lead state directly from the workspace UI's `<tr>` data attributes.
@@ -65,6 +81,7 @@ const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL
 type RowAttrs = {
   id: number | null;
   igHandle: string | null;
+  linkedinUrl: string | null;
   hasEmail: boolean;
   hasPhone: boolean;
   hasDmNote: boolean;
@@ -72,9 +89,10 @@ type RowAttrs = {
   outreachCount: number;
 };
 async function readRowAttrs(row: Locator): Promise<RowAttrs> {
-  const [id, ig, hasEmail, hasPhone, hasDm, hasReply, outreach] = await Promise.all([
+  const [id, ig, linkedin, hasEmail, hasPhone, hasDm, hasReply, outreach] = await Promise.all([
     row.getAttribute('data-lead-id'),
     row.getAttribute('data-ig-handle'),
+    row.getAttribute('data-linkedin-url'),
     row.getAttribute('data-has-email'),
     row.getAttribute('data-has-phone'),
     row.getAttribute('data-has-dm-note'),
@@ -85,6 +103,7 @@ async function readRowAttrs(row: Locator): Promise<RowAttrs> {
   return {
     id: Number.isFinite(parsedId) && parsedId > 0 ? parsedId : null,
     igHandle: ig ? ig.replace(/^@/, '').toLowerCase() || null : null,
+    linkedinUrl: linkedin || null,
     hasEmail: hasEmail === 'true',
     hasPhone: hasPhone === 'true',
     hasDmNote: hasDm === 'true',
@@ -109,42 +128,183 @@ function sendDiscordAlert(message: string): Promise<void> {
   });
 }
 
-/** Track DMs sent today per IG account — file-based counter (resets daily via filename) */
-function getDmsSentToday(): number {
+/** Send a rich Discord embed (colors, fields, links) */
+function sendDiscordBatchSummary(opts: {
+  sent: number; skipped: number; failed: number;
+  duration: string; boardId: number; strategy: string; igAccount: string;
+  replies: { name: string; leadId: number; contact: string; lastMsg: string }[];
+  leadTimings?: { name: string; duration: number; status: string }[];
+}): Promise<void> {
+  if (DRY_RUN) return Promise.resolve();
+  const { sent, skipped, failed, duration, boardId, strategy, igAccount, replies, leadTimings } = opts;
+  const total = sent + skipped + failed;
+  const color = sent > 0 ? 0x44FF44 : failed > 0 ? 0xFF4444 : 0xFFAA00; // green / red / orange
+  const boardUrl = `https://web.freelabel.net/iris?boardId=${boardId}&tab=leads`;
+
+  const fields: { name: string; value: string; inline: boolean }[] = [
+    { name: 'DMs Sent', value: `**${sent}**`, inline: true },
+    { name: 'Skipped', value: `${skipped}`, inline: true },
+    { name: 'Failed', value: `${failed}`, inline: true },
+    { name: 'Account', value: `@${igAccount}`, inline: true },
+    { name: 'Strategy', value: strategy, inline: true },
+    { name: 'Duration', value: `${duration}s`, inline: true },
+  ];
+
+  // Replied leads — the main thing the user wants to see
+  let replySection = '';
+  if (replies.length > 0) {
+    const lines = replies.slice(0, 15).map(r => {
+      const leadUrl = `${boardUrl}&lead=${r.leadId}`;
+      const igUrl = `https://www.instagram.com/${r.contact.replace(/^@/, '')}/`;
+      const msgPreview = r.lastMsg.length > 80 ? r.lastMsg.substring(0, 80) + '...' : r.lastMsg;
+      return `**${r.name}** ([profile](${igUrl}) | [lead](${leadUrl}))\n> ${msgPreview}`;
+    });
+    replySection = lines.join('\n\n');
+    if (replies.length > 15) replySection += `\n\n_...and ${replies.length - 15} more_`;
+  }
+
+  // Top sent leads
+  let sentList = '';
+  if (leadTimings && leadTimings.length > 0) {
+    const sentLeads = leadTimings.filter(t => t.status === 'sent').slice(0, 10);
+    if (sentLeads.length > 0) {
+      sentList = sentLeads.map(t => `\`${t.name}\` (${t.duration}s)`).join(', ');
+    }
+  }
+
+  const embeds: any[] = [{
+    title: `${sent > 0 ? '✅' : '⚠️'} SOM Batch Complete — ${sent}/${total} sent`,
+    color,
+    fields,
+    footer: { text: `Board ${boardId}` },
+    timestamp: new Date().toISOString(),
+    url: boardUrl,
+  }];
+
+  // Add reply embed if there are replies
+  if (replies.length > 0) {
+    embeds.push({
+      title: `🔥 ${replies.length} Lead${replies.length > 1 ? 's' : ''} Ready to Talk`,
+      description: replySection,
+      color: 0xFF6600,
+      footer: { text: 'Open inbox to continue the conversation' },
+    });
+  }
+
+  // Add sent leads field if available
+  if (sentList) {
+    embeds[0].fields.push({ name: 'Sent To', value: sentList, inline: false });
+  }
+
+  const payload = { embeds };
+  const body = JSON.stringify(payload);
+
+  return new Promise((resolve) => {
+    const url = new URL(DISCORD_WEBHOOK);
+    const req = https.request({
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, () => resolve());
+    req.on('error', () => resolve());
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * DM tracking — stores both count AND lead IDs sent today.
+ * Lead IDs survive crashes: if we sent the DM but crashed before the API note,
+ * the next run sees the ID in this file and skips the lead (idempotency).
+ */
+interface DmSentData {
+  count: number;
+  leadIds: number[];
+  updated: string;
+}
+
+function readDmSentData(filePath: string): DmSentData {
   try {
-    if (fs.existsSync(DM_SENT_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DM_SENT_FILE, 'utf-8'));
-      return data.count || 0;
+    if (fs.existsSync(filePath)) {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      return {
+        count: raw.count || (raw.leadIds?.length || 0),
+        leadIds: Array.isArray(raw.leadIds) ? raw.leadIds : [],
+        updated: raw.updated || '',
+      };
     }
   } catch {}
-  return 0;
+  return { count: 0, leadIds: [], updated: '' };
 }
-function recordDmSent(): void {
-  const current = getDmsSentToday();
+
+function getDmsSentToday(): number {
+  return readDmSentData(DM_SENT_FILE).count;
+}
+function recordDmSent(leadId?: number | null): void {
+  const data = readDmSentData(DM_SENT_FILE);
+  if (leadId && !data.leadIds.includes(leadId)) {
+    data.leadIds.push(leadId);
+  }
+  data.count = data.leadIds.length || (data.count + 1);
+  data.updated = new Date().toISOString();
   fs.mkdirSync(path.dirname(DM_SENT_FILE), { recursive: true });
-  fs.writeFileSync(DM_SENT_FILE, JSON.stringify({ count: current + 1, updated: new Date().toISOString() }));
+  fs.writeFileSync(DM_SENT_FILE, JSON.stringify(data));
+}
+function wasLeadDmSentToday(leadId: number, filePath?: string): boolean {
+  const data = readDmSentData(filePath || DM_SENT_FILE);
+  return data.leadIds.includes(leadId);
+}
+
+/** LinkedIn-specific DM tracker */
+function getLinkedInDmsSentToday(): number {
+  return readDmSentData(LI_DM_SENT_FILE).count;
+}
+function recordLinkedInDmSent(leadId?: number | null): void {
+  const data = readDmSentData(LI_DM_SENT_FILE);
+  if (leadId && !data.leadIds.includes(leadId)) {
+    data.leadIds.push(leadId);
+  }
+  data.count = data.leadIds.length || (data.count + 1);
+  data.updated = new Date().toISOString();
+  fs.mkdirSync(path.dirname(LI_DM_SENT_FILE), { recursive: true });
+  fs.writeFileSync(LI_DM_SENT_FILE, JSON.stringify(data));
 }
 
 test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, context }) => {
   // ── AUTH (HeyIRIS) ──
   await AuthHelper.loginWithToken(page, FRONTEND_TOKEN);
 
-  // ── AUTH (Instagram) ── load saved session cookies into this context
-  const igFile = fs.existsSync(IG_AUTH_FILE) ? IG_AUTH_FILE
-    : fs.existsSync(IG_AUTH_LEGACY) ? IG_AUTH_LEGACY : null;
-  if (igFile) {
-    const state = JSON.parse(fs.readFileSync(igFile, 'utf-8'));
-    if (state.cookies && state.cookies.length > 0) {
-      await context.addCookies(state.cookies);
-      console.log(`✓ Instagram session loaded for @${IG_ACCOUNT} (${state.cookies.length} cookies)`);
+  // ── AUTH (Instagram / LinkedIn) ── load saved session cookies into this context
+  let igFile: string | null = null;
+  if (IS_LINKEDIN) {
+    // LinkedIn campaign — load LinkedIn cookies instead of Instagram
+    if (fs.existsSync(LINKEDIN_AUTH_FILE)) {
+      const state = JSON.parse(fs.readFileSync(LINKEDIN_AUTH_FILE, 'utf-8'));
+      if (state.cookies && state.cookies.length > 0) {
+        await context.addCookies(state.cookies);
+        console.log(`✓ LinkedIn session loaded (${state.cookies.length} cookies)`);
+      }
+    } else {
+      console.log(`⚠️  No linkedin-auth.json found — save LinkedIn session first\n`);
     }
   } else {
-    console.log(`⚠️  No instagram-auth-${IG_ACCOUNT}.json found — run save-instagram-session first`);
-    console.log(`   IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID\n`);
+    igFile = fs.existsSync(IG_AUTH_FILE) ? IG_AUTH_FILE
+      : fs.existsSync(IG_AUTH_LEGACY) ? IG_AUTH_LEGACY : null;
+    if (igFile) {
+      const state = JSON.parse(fs.readFileSync(igFile, 'utf-8'));
+      if (state.cookies && state.cookies.length > 0) {
+        await context.addCookies(state.cookies);
+        console.log(`✓ Instagram session loaded for @${IG_ACCOUNT} (${state.cookies.length} cookies)`);
+      }
+    } else {
+      console.log(`⚠️  No instagram-auth-${IG_ACCOUNT}.json found — run save-instagram-session first`);
+      console.log(`   IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\n`);
+    }
   }
 
   // ── PREFLIGHT: validate IG session before wasting time loading workspace ──
-  if (igFile) {
+  if (!IS_LINKEDIN && igFile) {
     console.log('Validating Instagram session...');
     const checkPage = await context.newPage();
     try {
@@ -159,11 +319,10 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (onLogin || hasForm || hasLoggedOutSplash) {
         console.log(`\n${'='.repeat(70)}`);
         console.log(`  SESSION EXPIRED: @${IG_ACCOUNT}`);
-        console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID`);
+        console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`);
         console.log(`${'='.repeat(70)}\n`);
-        const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-        fs.mkdirSync(screenshotDir, { recursive: true });
-        await checkPage.screenshot({ path: path.join(screenshotDir, `session-expired-preflight-${IG_ACCOUNT}.png`) }).catch(() => {});
+        fs.mkdirSync('test-results/screenshots', { recursive: true });
+        await checkPage.screenshot({ path: `test-results/screenshots/session-expired-preflight-${IG_ACCOUNT}.png` }).catch(() => {});
         await sendDiscordAlert(
           `**SOM — Instagram Session Expired (preflight)**\n` +
           `Account: \`@${IG_ACCOUNT}\` | Board: \`${BOARD_ID}\`\n` +
@@ -179,31 +338,155 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     await checkPage.close().catch(() => {});
   }
 
+  // ── PREFLIGHT: validate LinkedIn session before wasting time loading workspace ──
+  if (IS_LINKEDIN && fs.existsSync(LINKEDIN_AUTH_FILE)) {
+    console.log('Validating LinkedIn session...');
+    const checkPage = await context.newPage();
+    try {
+      await checkPage.goto('https://www.linkedin.com/feed/', { timeout: 15000, waitUntil: 'domcontentloaded' });
+      await checkPage.waitForTimeout(2000);
+      const liUrl = checkPage.url();
+      const isExpired = liUrl.includes('/login') || liUrl.includes('/authwall') || liUrl.includes('/checkpoint');
+      if (isExpired) {
+        console.log(`\n${'='.repeat(70)}`);
+        console.log(`  SESSION EXPIRED: LinkedIn`);
+        console.log(`  Fix: npx playwright test tests/e2e/save-linkedin-session.spec.ts --headed`);
+        console.log(`${'='.repeat(70)}\n`);
+        fs.mkdirSync('test-results/screenshots', { recursive: true });
+        await checkPage.screenshot({ path: `test-results/screenshots/session-expired-preflight-linkedin.png` }).catch(() => {});
+        await sendDiscordAlert(
+          `**SOM LinkedIn — Session Expired (preflight)**\n` +
+          `Board: \`${BOARD_ID}\`\n` +
+          `LinkedIn redirected to login. Re-save session to fix.`
+        );
+        await checkPage.close();
+        return; // Abort entire test
+      }
+      console.log('LinkedIn session valid');
+    } catch (err: any) {
+      console.log(`LinkedIn preflight check failed: ${err.message?.substring(0, 60)} — continuing anyway`);
+    }
+    await checkPage.close().catch(() => {});
+  }
+
   console.log(`\n📋 Campaign: Board ${BOARD_ID} / Strategy: ${STRATEGY_NAME}`);
   console.log(`   Instagram: @${IG_ACCOUNT}`);
   console.log(`   Limit: ${LEADS_TO_PROCESS} leads`);
   console.log(`   Step: ${FIXED_STEP ? `Fixed step ${FIXED_STEP}` : 'AUTO (next uncompleted)'}`);
   console.log(`   Filter: ${OUTREACH_FILTER === 'new' ? 'NEW ONLY (first contact)' : OUTREACH_FILTER === 'followup' ? 'FOLLOW-UP ONLY (continue sequences)' : 'ALL (new + follow-ups)'}`);
+  console.log(`   Engine: ${SOM_MODE === 'api' ? 'API-DIRECT (v2 — fast, skip UI)' : 'UI (v1 — Apply Strategy flow)'}`);
   if (DRY_RUN) console.log('   Mode: DRY RUN (will NOT send DMs)');
   if (PERSONALIZE) console.log('   Mode: PERSONALIZE (fetch bio)');
   if (!VARY) console.log('   Mode: VARY DISABLED (skip variation)');
   if (WARMUP) console.log(`   Mode: WARMUP (like ${WARMUP_LIKES} posts${WARMUP_FOLLOW ? ' + follow' : ''} before DM)`);
 
   // ── DAILY DM CAP CHECK ──
-  const dmsSentToday = getDmsSentToday();
-  const dmsRemaining = Math.max(0, DAILY_DM_CAP - dmsSentToday);
-  console.log(`   Daily DM cap: ${dmsSentToday}/${DAILY_DM_CAP} sent today (${dmsRemaining} remaining)`);
+  const dmsSentToday = IS_LINKEDIN ? getLinkedInDmsSentToday() : getDmsSentToday();
+  const activeDailyCap = IS_LINKEDIN ? LINKEDIN_DAILY_CAP : DAILY_DM_CAP;
+  const dmsRemaining = Math.max(0, activeDailyCap - dmsSentToday);
+  const capLabel = IS_LINKEDIN ? 'LinkedIn' : `@${IG_ACCOUNT}`;
+  console.log(`   Daily DM cap (${capLabel}): ${dmsSentToday}/${activeDailyCap} sent today (${dmsRemaining} remaining)`);
+
+  // ── QUOTA DASHBOARD ──
+  try {
+    const quotaRes = await fetch(`${process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'}/api/v1/outreach/quota?bloq_id=${BOARD_ID}`, {
+      headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/json' },
+    });
+    if (quotaRes.ok) {
+      const qd = await quotaRes.json() as any;
+      const q = qd.quotas || {};
+      const p = qd.progress || {};
+      const pct = qd.percent || {};
+      if (Object.keys(q).length > 0) {
+        const bar = (pct: number) => { const f = Math.round((pct / 100) * 10); return '█'.repeat(f) + '░'.repeat(10 - f); };
+        console.log('   ┌─ Quota Progress ─────────────────────────────┐');
+        if (q.dms_per_week) console.log(`   │ DMs/wk:  ${bar(pct.dms ?? 0)} ${p.dms_this_week ?? 0}/${q.dms_per_week} (${pct.dms ?? 0}%)${(pct.dms ?? 0) >= 100 ? ' ✓' : ''} │`);
+        if (q.replies_per_week) console.log(`   │ Replies: ${bar(pct.replies ?? 0)} ${p.replies_this_week ?? 0}/${q.replies_per_week} (${pct.replies ?? 0}%)${(pct.replies ?? 0) >= 100 ? ' ✓' : ''} │`);
+        if (q.revenue_per_month) console.log(`   │ Rev/mo:  ${bar(pct.revenue ?? 0)} $${p.revenue_this_month ?? 0}/$${q.revenue_per_month} (${pct.revenue ?? 0}%) │`);
+        if (q.deals_per_month) console.log(`   │ Deals:   ${bar(pct.deals ?? 0)} ${p.deals_this_month ?? 0}/${q.deals_per_month} (${pct.deals ?? 0}%)${(pct.deals ?? 0) >= 100 ? ' ✓' : ''} │`);
+        console.log('   └───────────────────────────────────────────────┘');
+      }
+    }
+  } catch {}
 
   if (!DRY_RUN && dmsRemaining <= 0) {
-    console.log('\n🚫 Daily DM limit reached — aborting batch');
+    console.log(`\n🚫 Daily ${IS_LINKEDIN ? 'LinkedIn' : 'IG'} DM limit reached (${dmsSentToday}/${activeDailyCap}) — aborting batch`);
     await sendDiscordAlert(
       `🚫 **SOM DM — Daily Limit Reached**\n` +
-      `📋 Board: \`${BOARD_ID}\` | Account: \`@${IG_ACCOUNT}\`\n` +
-      `Sent ${dmsSentToday}/${DAILY_DM_CAP} DMs today. Try again tomorrow.`
+      `📋 Board: \`${BOARD_ID}\` | Account: \`${capLabel}\`\n` +
+      `Sent ${dmsSentToday}/${activeDailyCap} DMs today. Try again tomorrow.`
     );
     return;
   }
   console.log('');
+
+  // ── PRE-FLIGHT INBOX SCAN ──
+  // Hoisted so batch completion can include reply summary in Discord notification
+  let inboxReplies: { name: string; leadId: number; contact: string; lastMsg: string }[] = [];
+  if (SCAN_INBOX) {
+    console.log('📬 Pre-flight inbox scan...\n');
+    try {
+      const inboxApiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
+
+      // Navigate to messaging
+      const messagingUrl = IS_LINKEDIN
+        ? 'https://www.linkedin.com/messaging/'
+        : 'https://www.instagram.com/direct/inbox/';
+      await page.goto(messagingUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.waitForTimeout(3000);
+
+      // Dismiss popups
+      for (const text of ['Not Now', 'Not now', 'Cancel', 'Dismiss', 'No thanks', 'Got it']) {
+        const btn = page.locator(`button:has-text("${text}")`).first();
+        if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await btn.click().catch(() => {});
+          await page.waitForTimeout(500);
+        }
+      }
+
+      // Scan inbox using the appropriate provider
+      const provider = IS_LINKEDIN ? new LinkedInInboxProvider() : new InstagramInboxProvider();
+      const inboxResult = await provider.discover(page, context, {
+        targetUrl: messagingUrl,
+        limit: INBOX_LIMIT,
+        scrollAttempts: 5,
+      });
+      console.log(`   Scanned ${inboxResult.profiles.length} conversations`);
+
+      // Fetch board leads for matching
+      const inboxLeads = await fetchBoardLeads(inboxApiBase, TOKEN, BOARD_ID, (raw: any) => ({
+        id: raw.id,
+        name: raw.name || raw.nickname || '',
+        igHandle: raw.contact_info?.instagram || raw.nickname?.replace(/^@/, '') || '',
+        phone: raw.contact_info?.phone || raw.phone || '',
+      }));
+
+      // Run the scanner — matches, tags, reports
+      const scanConfig: ScanConfig = {
+        platform: IS_LINKEDIN ? 'linkedin' : 'instagram',
+        account: IS_LINKEDIN ? 'linkedin' : IG_ACCOUNT,
+        boardId: BOARD_ID,
+        apiBase: inboxApiBase,
+        token: TOKEN,
+        dryRun: DRY_RUN,
+        ourName: '',
+        discordWebhook: DISCORD_WEBHOOK,
+      };
+
+      const scanResult = await runInboxScan(scanConfig, inboxResult.profiles, inboxLeads, { autoDetectOurName: true });
+      printSummary(scanConfig, scanResult);
+      await sendResultAlert(scanConfig, scanResult);
+      inboxReplies = scanResult.tagged;
+
+      if (scanResult.tagged.length > 0) {
+        console.log(`\n   ${scanResult.tagged.length} leads replied — they will be skipped in outreach\n`);
+      }
+    } catch (inboxErr: any) {
+      console.log(`   Inbox scan failed: ${inboxErr.message} — continuing to outreach\n`);
+    }
+  } else {
+    console.log('📬 Inbox scan: OFF (set SCAN_INBOX=1 to enable)\n');
+  }
 
   // ── ENRICHMENT SETUP (always-on) ──
   // apiClient is still used for state-mutating calls (addNote, quickEnrichInstagram).
@@ -240,7 +523,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     await page.waitForTimeout(2000);
   }
   console.log(`✓ Found ${rowCount} leads\n`);
-  if (rowCount === 0) { console.log('⚠️  No leads.'); return; }
+  if (rowCount === 0 && SOM_MODE !== 'api') { console.log('⚠️  No leads.'); return; }
+  if (rowCount === 0 && SOM_MODE === 'api') { console.log('⚠️  No leads in UI — continuing to API-direct mode (UI rows not needed)'); }
 
   await page.waitForTimeout(1000);
 
@@ -270,8 +554,11 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   } else if (OUTREACH_FILTER === 'new' || FIXED_STEP === 1) {
     // NEW OUTREACH: fetch only leads that have NO outreach steps yet
     try {
+      // has_social=1 filters to leads with IG/social handles (skips non-DM-able leads like law firms)
+      const socialFilter = IS_LINKEDIN ? '' : '&has_social=1';
+      const perPage = Math.min(LEADS_TO_PROCESS * 3, 500);
       const freshRes = await fetch(
-        `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=no_outreach&per_page=500`,
+        `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=no_outreach${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`,
         { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
       );
       if (freshRes.ok) {
@@ -286,7 +573,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           console.log('⚠️  No fresh leads. Checking for leads with incomplete outreach steps...');
           try {
             const pendingRes = await fetch(
-              `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=not_contacted&per_page=500`,
+              `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=not_contacted${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`,
               { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
             );
             if (pendingRes.ok) {
@@ -310,12 +597,23 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     }
   }
 
+  // ── API-DIRECT MODE: only when MODE=api AND we have API-filtered IDs ──
+  // MODE=ui (default): full UI flow with Apply Strategy + step tracking
+  // MODE=api: fast direct navigation, skips UI table scan
+  const useApiDirect = SOM_MODE === 'api' && !!(apiFilteredIds && apiFilteredIds.size > 0);
+  if (useApiDirect) {
+    console.log(`⚡ API-DIRECT MODE: ${apiFilteredIds!.size} leads from API — skipping UI table scan\n`);
+  }
+
   // ── FILTER leads based on step mode — auto-paginate if needed ──
   // step=1 or unset: only leads WITHOUT outreach badge (need first contact)
   // step=N (N>1):    only leads WITH outreach badge (already started, need step N)
   // step=auto:       ALL leads — eligibility determined after opening panel
   const eligibleRows: number[] = [];
   let scannedUpTo = 0;
+
+  // API-DIRECT skips the entire UI scanning/pagination loop
+  if (!useApiDirect) {
   // Scale pagination with board size — small boards need 2-3 pages, large boards need more
   // Follow-up mode with API shortcut needs fewer pages (we have the ID allow-list)
   const MAX_LOAD_MORE = apiFilteredIds ? 5 : Math.min(Math.ceil(rowCount / 50) + 3, 40);
@@ -385,6 +683,697 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       break;
     }
   }
+  } // end if (!useApiDirect) — UI scanning block
+
+  // ── API-DIRECT: skip row scanning, process leads directly from API IDs ──
+  if (useApiDirect && apiFilteredIds && apiFilteredIds.size > 0) {
+    const dmsRemaining = IS_LINKEDIN ? Math.max(0, LINKEDIN_DAILY_CAP - getLinkedInDmsSentToday()) : Math.max(0, DAILY_DM_CAP - getDmsSentToday());
+    const directLimit = DRY_RUN ? LEADS_TO_PROCESS : Math.min(LEADS_TO_PROCESS, dmsRemaining);
+    const apiLeadIds = [...apiFilteredIds].slice(0, directLimit);
+    console.log(`⚡ API-DIRECT: Processing ${apiLeadIds.length} leads by direct navigation\n`);
+
+    const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0 };
+    const leadTimings: { name: string; duration: number; status: string }[] = [];
+    const batchStart = Date.now();
+
+    for (let idx = 0; idx < apiLeadIds.length; idx++) {
+      const leadId = apiLeadIds[idx];
+      const leadStart = Date.now();
+      console.log(`\n━━━ Lead ${idx + 1}/${apiLeadIds.length} (ID: ${leadId}) ━━━\n`);
+
+      try {
+        // Fetch lead details from API to get IG handle
+        const leadRes = await fetch(
+          `${apiBase}/api/v1/leads/${leadId}`,
+          { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
+        );
+        if (!leadRes.ok) {
+          console.log(`API error: ${leadRes.status}`);
+          results.skipped++;
+          leadTimings.push({ name: `#${leadId}`, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
+        const leadData = (await leadRes.json()).data || {};
+        const contactInfo = leadData.contact_info || {};
+        const rawHandle = IS_LINKEDIN
+          ? (contactInfo.linkedin || contactInfo.linkedin_url || leadData.linkedin_url || '')
+          : (contactInfo.instagram || contactInfo.social_handle || leadData.nickname || '');
+        // For LinkedIn, extract the slug from the full URL for display/messages
+        const igHandle = IS_LINKEDIN && rawHandle.includes('linkedin.com/')
+          ? rawHandle.replace(/.*linkedin\.com\/in\//, '').replace(/\/$/, '')
+          : rawHandle;
+        // Keep the full URL for navigation
+        const linkedInFullUrl = IS_LINKEDIN ? rawHandle : '';
+        // Prefer enriched display name (real name) over raw handle
+        const customFields = leadData.custom_fields || {};
+        const displayName = customFields.ig_display_name || customFields.ig_enrichment?.full_name || '';
+        const name = displayName || leadData.name || igHandle || `Lead #${leadId}`;
+        console.log(`-> ${name} (${IS_LINKEDIN ? 'LinkedIn: ' + igHandle : '@' + igHandle})`);
+
+        if (!igHandle) {
+          console.log(`  No ${IS_LINKEDIN ? 'LinkedIn URL' : 'IG handle'} — skipping`);
+          results.skipped++;
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
+
+        // Crash-proof dedup check (local file)
+        const sentFile = IS_LINKEDIN ? LI_DM_SENT_FILE : DM_SENT_FILE;
+        if (wasLeadDmSentToday(leadId, sentFile)) {
+          console.log('  Already sent today — skipping');
+          results.skipped++;
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
+
+        // ── OUTREACH MESSAGE DEDUP: skip if DM'd in last 3 days ──
+        try {
+          const omRes = await fetch(
+            `${apiBase}/api/v1/leads/${leadId}/outreach/messages?direction=outbound`,
+            { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
+          );
+          if (omRes.ok) {
+            const omData = await omRes.json();
+            const msgs = (omData.messages || []).filter((m: any) => m.type === 'instagram_dm');
+            const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
+            const recent = msgs.find((m: any) => new Date(m.sent_at || m.created_at).getTime() > threeDaysAgo);
+            if (recent) {
+              const age = Math.round((Date.now() - new Date(recent.sent_at || recent.created_at).getTime()) / (24*60*60*1000) * 10) / 10;
+              console.log(`  ⏭️  Already DM'd ${age}d ago — skipping (anti-spam)`);
+              results.skipped++;
+              leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+              continue;
+            }
+          }
+        } catch (omErr: any) {
+          console.log(`  ⛔ DEDUP CHECK FAILED (outreach messages): ${omErr.message} — skipping to be safe`);
+          results.skipped++;
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
+
+        // ── NOTE-BASED DEDUP FALLBACK: check [SOM DM] or [SOM FAIL] notes ──
+        // [SOM DM]: skip entirely (already contacted from this account — no time limit)
+        // [SOM FAIL]: skip for 3 days (auto-retry after cooldown)
+        try {
+          const notes = leadData.notes || [];
+          const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
+          const recentNote = notes.find((n: any) => {
+            const content = n.content || n.message || '';
+            if (content.includes('[SOM DM]')) return true; // always skip — already DM'd
+            if (content.includes('[SOM FAIL]')) return new Date(n.created_at).getTime() > threeDaysAgo; // 3-day cooldown
+            return false;
+          });
+          if (recentNote) {
+            const noteContent = recentNote.content || recentNote.message || '';
+            const age = Math.round((Date.now() - new Date(recentNote.created_at).getTime()) / (24*60*60*1000) * 10) / 10;
+            const reason = noteContent.includes('[SOM FAIL]') ? `failed ${age}d ago (cooldown)` : `DM'd ${age}d ago`;
+            console.log(`  ⏭️  ${reason} — skipping`);
+            results.skipped++;
+            leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+            continue;
+          }
+        } catch (noteErr: any) {
+          console.log(`  ⛔ DEDUP CHECK FAILED (note scan): ${noteErr.message} — skipping to be safe`);
+          results.skipped++;
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
+
+        // ── INITIALIZE OUTREACH STEPS (mirrors "Apply Strategy" in V1 UI) ──
+        // Creates the 5-step strategy so the lead exits the "fresh" pool.
+        // DRY RUN: skip — don't mutate the database, just check existing state.
+        let stepId: number | null = null;
+        if (!DRY_RUN) {
+          try {
+            const initRes = await fetch(
+              `${apiBase}/api/v1/leads/${leadId}/outreach-steps/initialize-strategy`,
+              { method: 'POST', headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ strategy_key: IS_LINKEDIN ? 'linkedin-first' : 'instagram-first' }) }
+            );
+            const initData: any = await initRes.json();
+            if (initRes.ok) {
+              const steps = initData.data?.steps || [];
+              stepId = steps[0]?.id || null;
+              console.log(`  ✓ Outreach steps initialized (${steps.length} steps, step1 id=${stepId})`);
+            } else if (initRes.status === 400 && initData.message?.includes('already has')) {
+              // Steps exist — fetch step 1 ID for completion later
+              const stepsRes = await fetch(
+                `${apiBase}/api/v1/leads/${leadId}/outreach-steps`,
+                { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
+              );
+              const stepsData: any = await stepsRes.json();
+              const steps = stepsData.data?.steps || [];
+              stepId = steps[0]?.id || null;
+              const completed = steps[0]?.is_completed;
+              if (completed) {
+                console.log(`  ⏭️  Step 1 already completed — skipping`);
+                results.skipped++;
+                leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+                continue;
+              }
+              console.log(`  Steps already exist (step1 id=${stepId})`);
+            } else {
+              console.log(`  ⚠ Failed to initialize outreach: ${initData.message} — skipping`);
+              results.skipped++;
+              leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+              continue;
+            }
+          } catch (initErr: any) {
+            console.log(`  ⛔ Initialize outreach failed: ${initErr.message} — skipping`);
+            results.skipped++;
+            leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+            continue;
+          }
+        } else {
+          console.log(`  [DRY RUN] Would initialize outreach steps`);
+        }
+
+        // Generate message — same flow as V1 "Vary It" button:
+        // 1. Get strategy script from outreach-strategy-templates (the REAL SOM scripts)
+        // 2. Call generate-personalized-message with script + lead handle + name
+        let msg = '';
+        try {
+          // Fetch strategy templates for this board
+          const stratRes = await fetch(
+            `${apiBase}/api/v1/bloqs/${BOARD_ID}/outreach-strategy-templates`,
+            { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
+          );
+          let scriptText = '';
+          if (stratRes.ok) {
+            const stratData = (await stratRes.json()) as any;
+            const templates = stratData.data?.templates || [];
+            // Find matching strategy by name
+            const strat = templates.find((t: any) => t.name === STRATEGY_NAME);
+            if (strat?.steps?.[0]) {
+              scriptText = strat.steps[0].instructions || '';
+              console.log(`  Strategy script: "${scriptText.substring(0, 60)}..."`);
+            }
+          }
+
+          if (scriptText) {
+            // Use the same endpoint as V1's "Vary It" button
+            const msgRes = await fetch(
+              `${apiBase}/api/v1/ai/generate-personalized-message`,
+              {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({
+                  script_message: scriptText,
+                  instagram_handle: igHandle,
+                  lead_name: name,
+                }),
+              }
+            );
+            if (msgRes.ok) {
+              const msgData = (await msgRes.json()) as any;
+              msg = msgData.data?.message || msgData.message || '';
+            }
+          }
+
+          if (!msg && scriptText) {
+            // AI variation failed — use the raw script as-is (better than generic fallback)
+            msg = scriptText;
+            console.log(`  ⚠ AI variation failed — using raw script`);
+          }
+
+          if (!msg) {
+            console.log(`  ⚠ Strategy script not found — using fallback`);
+          }
+        } catch (msgErr: any) {
+          console.log(`  ⚠ Message generation failed: ${msgErr.message} — using fallback`);
+        }
+        if (!msg) {
+          msg = `Hey ${name}! Noticed you're doing some interesting work. Would love to connect.`;
+        }
+        console.log(`-> Msg: "${msg.substring(0, 60)}..."`);
+
+        // Navigate directly to profile
+        const igPage = await context.newPage();
+        const profileUrl = IS_LINKEDIN
+          ? (linkedInFullUrl.startsWith('http') ? linkedInFullUrl : `https://www.linkedin.com/in/${igHandle}/`)
+          : `https://www.instagram.com/${igHandle}/`;
+        await igPage.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await igPage.waitForTimeout(3000);
+
+        // Session check
+        const igUrl = igPage.url();
+        if (igUrl.includes('/accounts/login') || igUrl.includes('/challenge/')) {
+          console.log('SESSION EXPIRED — aborting batch');
+          await igPage.close().catch(() => {});
+          results.failed++;
+          break;
+        }
+
+        // Dismiss popups
+        for (const text of ['Not Now', 'Not now', 'Cancel', 'Dismiss']) {
+          const btn = igPage.locator(`button:has-text("${text}")`).first();
+          if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await btn.click().catch(() => {});
+            await igPage.waitForTimeout(500);
+          }
+        }
+
+        // ── Full IG DM interaction (Paths A/B/C — same logic as main flow) ──
+        const dismissIgPopup = async () => {
+          for (const text of ['Not Now', 'Not now', 'Cancel', 'Dismiss']) {
+            const btn = igPage.locator(`button:has-text("${text}")`).first();
+            if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+              await btn.click().catch(() => {});
+              await igPage.waitForTimeout(500);
+            }
+          }
+        };
+
+        // Check if account exists
+        const notFound = await igPage.locator('text=Sorry, this page').isVisible().catch(() => false);
+        if (notFound) {
+          console.log('  Account not found — skipping');
+          results.failed++;
+          await igPage.close().catch(() => {});
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+          continue;
+        }
+
+        // ── SCRAPE PROFILE (bio, followers, name) — save to notes + custom_fields ──
+        if (!IS_LINKEDIN) {
+          try {
+            const profileStats = await scrapeProfileStats(igPage);
+            if (profileStats && (profileStats.followers > 0 || profileStats.bio)) {
+              console.log(`  Profile: ${profileStats.displayName || igHandle} | ${profileStats.followers.toLocaleString()} followers | ${profileStats.bio?.substring(0, 50) || 'no bio'}...`);
+              if (!DRY_RUN && leadId) {
+                // Save to notes
+                const statsNote = [
+                  `[SOM Inline Enrich]`,
+                  profileStats.displayName ? `Name: ${profileStats.displayName}` : '',
+                  `Followers: ${profileStats.followers.toLocaleString()}`,
+                  `Posts: ${profileStats.posts.toLocaleString()}`,
+                  profileStats.bio ? `Bio: ${profileStats.bio.substring(0, 200)}` : '',
+                  profileStats.externalUrl ? `URL: ${profileStats.externalUrl}` : '',
+                  profileStats.category ? `Category: ${profileStats.category}` : '',
+                ].filter(Boolean).join(' | ');
+                apiClient.addNote(leadId, statsNote, 'enrichment').catch(() => {});
+                // Save to custom_fields
+                apiClient.updateLead(leadId, {
+                  custom_fields: {
+                    ig_followers: profileStats.followers,
+                    ig_following: profileStats.following,
+                    ig_posts: profileStats.posts,
+                    ig_bio: profileStats.bio?.substring(0, 500),
+                    ig_display_name: profileStats.displayName,
+                    ig_external_url: profileStats.externalUrl,
+                    ig_category: profileStats.category,
+                    ig_verified: profileStats.isVerified,
+                    ig_scraped_at: new Date().toISOString(),
+                  },
+                }).catch(() => {});
+              }
+            }
+          } catch (scrapeErr: any) {
+            console.log(`  ⚠ Profile scrape failed: ${scrapeErr.message}`);
+          }
+        }
+
+        // ── WARMUP: like posts + follow before DM (mirrors V1) ──
+        if (WARMUP) {
+          try {
+            if (IS_LINKEDIN) {
+              // LinkedIn warmup: dwell on profile (no likes/follow — LinkedIn detects automation)
+              console.log('  Warmup: viewing LinkedIn profile...');
+              await igPage.waitForTimeout(3000 + Math.random() * 3000);
+              console.log(`    ${DRY_RUN ? '[DRY] Would view' : 'Viewed'} profile for dwell time`);
+            } else {
+          console.log(`  Warmup: liking ${WARMUP_LIKES} posts${WARMUP_FOLLOW ? ' + follow' : ''}...`);
+            // Like posts
+            for (let likeIdx = 0; likeIdx < WARMUP_LIKES; likeIdx++) {
+              const postLinks = igPage.locator('a[href*="/p/"], a[href*="/reel/"]');
+              const postCount = await postLinks.count().catch(() => 0);
+              if (likeIdx >= postCount) break;
+              await postLinks.nth(likeIdx).click();
+              await igPage.waitForTimeout(1500);
+              const alreadyLiked = igPage.locator('svg[aria-label="Unlike"]').first();
+              const likeBtn = igPage.locator('svg[aria-label="Like"]').first();
+              if (await alreadyLiked.isVisible({ timeout: 2000 }).catch(() => false)) {
+                console.log(`    Post ${likeIdx + 1} already liked`);
+              } else if (await likeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                if (!DRY_RUN) await likeBtn.click();
+                console.log(`    ${DRY_RUN ? '[DRY] Would like' : 'Liked'} post ${likeIdx + 1}`);
+              }
+              await igPage.goBack();
+              await igPage.waitForTimeout(1000);
+            }
+            // Follow
+            if (WARMUP_FOLLOW) {
+              const followBtn = igPage.locator('button:text-is("Follow")').first();
+              if (await followBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                if (!DRY_RUN) await followBtn.click();
+                console.log(`    ${DRY_RUN ? '[DRY] Would follow' : 'Followed'} @${igHandle}`);
+              } else {
+                console.log('    Already following or follow button not found');
+              }
+            }
+            // Cooldown
+            const cooldown = 3000 + Math.random() * 4000;
+            await igPage.waitForTimeout(cooldown);
+            } // end else (IG warmup)
+          } catch (warmupErr: any) {
+            console.log(`    Warmup error: ${warmupErr.message} — continuing to DM`);
+          }
+        }
+
+        let inDMView = false;
+
+        // ── LINKEDIN DM PATH ──
+        if (IS_LINKEDIN) {
+          // LinkedIn profile page: click "Message" button → opens messaging overlay
+          const liMsgBtn = igPage.locator('button:has-text("Message"), a:has-text("Message")').first();
+          if (await liMsgBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+            console.log('  Clicking LinkedIn Message button...');
+            await liMsgBtn.click();
+            await igPage.waitForTimeout(3000);
+            // Dismiss any LinkedIn popups
+            for (const text of ['Dismiss', 'Not now', 'No thanks', 'Got it']) {
+              const btn = igPage.locator(`button:has-text("${text}")`).first();
+              if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+                await btn.click().catch(() => {});
+                await igPage.waitForTimeout(500);
+              }
+            }
+            inDMView = true;
+          } else {
+            // Try "Connect" first, then message
+            const connectBtn = igPage.locator('button:has-text("Connect")').first();
+            if (await connectBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+              console.log('  No Message button — trying Connect first...');
+              if (!DRY_RUN) {
+                await connectBtn.click();
+                await igPage.waitForTimeout(1500);
+                // Look for "Add a note" option in the connect dialog
+                const addNote = igPage.locator('button:has-text("Add a note")').first();
+                if (await addNote.isVisible({ timeout: 2000 }).catch(() => false)) {
+                  await addNote.click();
+                  await igPage.waitForTimeout(1000);
+                  inDMView = true;
+                  console.log('  Connect → Add a note (will send as connection request)');
+                } else {
+                  // Just send connection request without note
+                  const sendBtn = igPage.locator('button:has-text("Send"), button[aria-label="Send now"]').first();
+                  if (await sendBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+                    await sendBtn.click();
+                    console.log('  Sent connection request (no message)');
+                  }
+                  console.log('  Cannot DM — not connected. Connection request sent.');
+                  results.failed++;
+                  await igPage.close().catch(() => {});
+                  leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+                  continue;
+                }
+              } else {
+                console.log('  [DRY RUN] Would click Connect → Add a note');
+                results.failed++;
+                await igPage.close().catch(() => {});
+                leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+                continue;
+              }
+            } else {
+              console.log('  No Message or Connect button found — skipping');
+              results.failed++;
+              await igPage.close().catch(() => {});
+              leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+              continue;
+            }
+          }
+        }
+
+        // ── INSTAGRAM DM PATHS (skip if LinkedIn already handled above) ──
+        if (!IS_LINKEDIN) {
+
+        // PATH A: Already in DM view
+        const earlyDmInput = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text], p[placeholder*="Message"]').first();
+        if (igPage.url().includes('/direct/') || await earlyDmInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+          console.log('  Direct DM view detected');
+          inDMView = true;
+        }
+
+        // PATH B: Profile has "Message" button (public account or already following)
+        if (!inDMView) {
+          // Broader selector — IG renders Message button as button, div[role=button], or header link
+          const messageBtn = igPage.locator('button:text-is("Message"), div[role="button"]:text-is("Message"), a:text-is("Message"), header button:has-text("Message")').first();
+          if (await messageBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+            console.log('  Clicking Message button...');
+            await messageBtn.click();
+            await igPage.waitForTimeout(3000);
+            await dismissIgPopup();
+            // Verify we're now in DM view (URL changed or input appeared)
+            const dmInputCheck = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text]').first();
+            if (igPage.url().includes('/direct/') || await dmInputCheck.isVisible({ timeout: 3000 }).catch(() => false)) {
+              inDMView = true;
+            } else {
+              console.log('  Message button clicked but DM view not opened — trying PATH C');
+            }
+          }
+        }
+
+        // PATH C: Options menu → "Send message" (for accounts we don't follow)
+        if (!inDMView) {
+          const dotsClicked = await (async () => {
+            for (const label of ['Options', 'More options']) {
+              const svg = igPage.locator(`svg[aria-label="${label}"]`).first();
+              if (await svg.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await svg.click();
+                return true;
+              }
+            }
+            const dotsBtn = igPage.locator('div[role="button"]:has(svg circle)').first();
+            if (await dotsBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await dotsBtn.click();
+              return true;
+            }
+            return false;
+          })();
+
+          if (dotsClicked) {
+            await igPage.waitForTimeout(1000);
+            const sendMsg = igPage.locator('text=Send message').first();
+            if (await sendMsg.isVisible({ timeout: 3000 }).catch(() => false)) {
+              console.log('  Options -> Send message...');
+              await sendMsg.click();
+              await igPage.waitForTimeout(2000);
+              inDMView = true;
+            } else {
+              // Try following first, then retry
+              console.log('  No "Send message" — trying Follow first...');
+              await igPage.locator('text=Cancel').first().click().catch(() => {});
+              await igPage.waitForTimeout(500);
+              const followBtn = igPage.locator('button:text-is("Follow")').first();
+              if (await followBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await followBtn.click();
+                await igPage.waitForTimeout(2000);
+                console.log('  Followed! Retrying Send message...');
+                // Re-open options
+                for (const label of ['Options', 'More options']) {
+                  const svg = igPage.locator(`svg[aria-label="${label}"]`).first();
+                  if (await svg.isVisible({ timeout: 2000 }).catch(() => false)) {
+                    await svg.click();
+                    await igPage.waitForTimeout(1000);
+                    const retrySend = igPage.locator('text=Send message').first();
+                    if (await retrySend.isVisible({ timeout: 3000 }).catch(() => false)) {
+                      await retrySend.click();
+                      await igPage.waitForTimeout(2000);
+                      inDMView = true;
+                    }
+                    break;
+                  }
+                }
+              }
+              if (!inDMView) {
+                // Last-resort: check if DM input is visible anywhere on the page
+                const lastResortInput = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text]').first();
+                if (await lastResortInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+                  console.log('  DM input found (last-resort check)');
+                  inDMView = true;
+                } else {
+                  console.log('  Cannot DM this account — skipping');
+                  results.failed++;
+                  if (leadId) {
+                    apiClient.addNote(leadId, `[SOM FAIL] Cannot open DM for @${igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
+                  }
+                  await igPage.close().catch(() => {});
+                  leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+                  continue;
+                }
+              }
+            }
+          } else {
+            console.log('  No options button found — skipping');
+            results.failed++;
+            if (leadId) {
+              apiClient.addNote(leadId, `[SOM FAIL] No options button for @${igHandle} via @${IG_ACCOUNT}`).catch(() => {});
+            }
+            await igPage.close().catch(() => {});
+            leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+            continue;
+          }
+        }
+        } // end if (!IS_LINKEDIN) — IG paths
+
+        // ── TYPE & SEND DM ──
+        if (inDMView) {
+          await igPage.waitForTimeout(800);
+
+          // Dismiss "Turn on Notifications" overlay that blocks DM input on ALL accounts
+          // Instagram shows this as a dialog/modal with "Turn On" and "Not Now" buttons
+          for (let popupAttempt = 0; popupAttempt < 3; popupAttempt++) {
+            const notNow = igPage.locator('button:has-text("Not Now"), button:has-text("Not now"), button:has-text("Cancel")').first();
+            if (await notNow.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await notNow.click();
+              console.log('  → Dismissed notifications popup');
+              await igPage.waitForTimeout(1000);
+            } else {
+              // Also try clicking outside the dialog or pressing Escape to close any overlay
+              const dialog = igPage.locator('[role="dialog"]').first();
+              if (await dialog.isVisible({ timeout: 500 }).catch(() => false)) {
+                await igPage.keyboard.press('Escape');
+                console.log('  → Closed dialog via Escape');
+                await igPage.waitForTimeout(500);
+              } else {
+                break;
+              }
+            }
+          }
+
+          if (!IS_LINKEDIN) await dismissIgPopup();
+          // DM input selectors: IG uses aria-label="Message", LinkedIn uses role="textbox" in messaging overlay
+          const dmInput = igPage.locator(IS_LINKEDIN
+            ? 'div[role="textbox"][contenteditable="true"], div[aria-label*="Write a message"][contenteditable="true"], div.msg-form__contenteditable[contenteditable="true"]'
+            : 'div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text], p[placeholder*="Message"]'
+          ).first();
+
+          if (await dmInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await dmInput.click();
+            await dmInput.fill(msg).catch(async () => {
+              await igPage.keyboard.type(msg, { delay: 15 });
+            });
+            await igPage.waitForTimeout(1000);
+
+            if (DRY_RUN) {
+              await igPage.screenshot({ path: `test-results/screenshots/api-direct-dry-${idx + 1}.png` }).catch(() => {});
+              console.log(`  [DRY RUN] Message typed to @${igHandle}: "${msg.substring(0, 50)}..."`);
+              results.sent++;
+            } else {
+              const sendBtn = igPage.locator('button:has-text("Send"):not([disabled])').first();
+              if (await sendBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                await sendBtn.click();
+              } else {
+                await igPage.keyboard.press('Enter');
+              }
+
+              // ── DELIVERY CONFIRMATION: verify message appeared in chat ──
+              await igPage.waitForTimeout(2000);
+              const msgSnippet = msg.substring(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const delivered = await igPage.locator(`div[dir="auto"]:text-matches("${msgSnippet}", "i")`).first()
+                .isVisible({ timeout: 3000 }).catch(() => false);
+
+              if (delivered) {
+                console.log('  DM sent!');
+                results.sent++;
+                recordDmSent(leadId);
+                if (leadId) {
+                  let recOk = false;
+                  for (let att = 0; att < 3; att++) {
+                    try {
+                      const rr = await apiClient.recordDmSent(leadId, {
+                        message: msg,
+                        channel_account: IG_ACCOUNT,
+                        campaign_name: STRATEGY_NAME,
+                        bloq_id: BOARD_ID,
+                        ig_handle: igHandle,
+                        step_index: 0,
+                      });
+                      if (rr.success) { recOk = true; break; }
+                      console.log(`  ⚠ recordDmSent attempt ${att + 1} failed: ${rr.message}`);
+                    } catch (e: any) {
+                      console.log(`  ⚠ recordDmSent attempt ${att + 1} error: ${e.message}`);
+                    }
+                    if (att < 2) await igPage.waitForTimeout(1000);
+                  }
+                  if (!recOk) console.log(`  ⛔ CRITICAL: Failed to record DM after 3 attempts!`);
+
+                  if (stepId) {
+                    try {
+                      const cr = await apiClient.completeStep(leadId, stepId, process.env.STRATEGY);
+                      if (cr.success) console.log(`  ✓ Step 1 completed via API`);
+                      else console.log(`  ⚠ Step complete failed: ${cr.message}`);
+                    } catch (stepErr: any) {
+                      console.log(`  ⚠ Step complete error: ${stepErr.message}`);
+                    }
+                  }
+
+                  try {
+                    const enrichResp = await apiClient.quickEnrichInstagram(leadId);
+                    if (enrichResp.success && enrichResp.contacts) {
+                      const emails = enrichResp.contacts.emails || [];
+                      const phones = enrichResp.contacts.phones || [];
+                      if (emails.length > 0 || phones.length > 0) {
+                        console.log(`  ✓ Enriched: ${emails.length} emails, ${phones.length} phones`);
+                      }
+                    }
+                  } catch (enrichErr: any) {
+                    console.log(`  ⚠ Enrich failed: ${enrichErr.message}`);
+                  }
+                }
+              } else {
+                console.log('  ⛔ DM not confirmed in chat — skipping note + step');
+                results.failed++;
+                // Record [SOM FAIL] so dedup skips this lead for 3 days (auto-retry after)
+                if (leadId) {
+                  apiClient.addNote(leadId, `[SOM FAIL] DM to @${igHandle} via @${IG_ACCOUNT} — message typed but not confirmed in chat`).catch(() => {});
+                }
+              }
+            }
+          } else {
+            console.log('  No DM input found in view');
+            results.failed++;
+            // Record [SOM FAIL] for leads where DM view couldn't be opened
+            if (leadId) {
+              apiClient.addNote(leadId, `[SOM FAIL] Could not open DM view for @${igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
+            }
+          }
+        }
+        await igPage.close().catch(() => {});
+
+        // leadTimings status is set by the catch block for errors; for normal flow, derive from results
+        leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'sent' });
+      } catch (err: any) {
+        console.log(`Error: ${err.message?.substring(0, 100)}`);
+        results.failed++;
+        leadTimings.push({ name: `#${leadId}`, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+      }
+
+      // Human-like delay between leads
+      if (idx < apiLeadIds.length - 1) {
+        const delay = 4000 + Math.random() * 6000;
+        await page.waitForTimeout(delay);
+      }
+    }
+
+    // Summary
+    const totalDuration = ((Date.now() - batchStart) / 1000).toFixed(1);
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(DRY_RUN ? '  DRY RUN COMPLETE (API-DIRECT)' : '  BATCH COMPLETE (API-DIRECT)');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`  Board: ${BOARD_ID}  |  Strategy: ${STRATEGY_NAME}`);
+    console.log(`  ${DRY_RUN ? 'Would send' : 'Sent'}: ${results.sent}  |  Skip: ${results.skipped}  |  Fail: ${results.failed}`);
+    console.log(`  Total: ${totalDuration}s`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+
+    // Discord batch summary with inbox replies
+    await sendDiscordBatchSummary({
+      sent: results.sent, skipped: results.skipped, failed: results.failed,
+      duration: totalDuration, boardId: BOARD_ID, strategy: STRATEGY_NAME,
+      igAccount: IG_ACCOUNT, replies: inboxReplies, leadTimings,
+    });
+    return; // Done — skip the UI-based processing below
+  }
 
   const skippedCount = scannedUpTo - eligibleRows.length;
   const filterLabel = OUTREACH_FILTER === 'new' ? ' [new only]' : OUTREACH_FILTER === 'followup' ? ' [follow-up only]' : '';
@@ -410,10 +1399,9 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   if (effectiveLimit < LEADS_TO_PROCESS && !DRY_RUN) {
     console.log(`⚠️  Capping batch from ${LEADS_TO_PROCESS} to ${effectiveLimit} (daily DM quota)\n`);
   }
-  // Pre-filter: remove rows where the lead has no usable IG handle.
-  // Reads each row's data-ig-handle directly from the rendered DOM (no API call,
-  // no 200-cap). Falls back to the displayed name if the attribute is empty but
-  // the name itself looks like a username.
+  // Pre-filter: remove rows where the lead has no usable contact channel.
+  // For LinkedIn campaigns: filter by data-linkedin-url instead of data-ig-handle.
+  // Reads each row's data attributes directly from the rendered DOM (no API call, no 200-cap).
   const dmableRows: number[] = [];
   for (const rowIdx of eligibleRows) {
     if (dmableRows.length >= effectiveLimit) break;
@@ -422,15 +1410,24 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     const rowName = (await btn.textContent().catch(() => ''))?.trim() || '';
     if (!rowName) { dmableRows.push(rowIdx); continue; } // can't determine — let it through
     const rowAttrs = await readRowAttrs(row);
-    const rowNameIsHandle = !rowName.includes(' ') && /^[a-z0-9._]+$/i.test(rowName);
-    if (rowNameIsHandle || rowAttrs.igHandle) {
-      dmableRows.push(rowIdx);
+    if (IS_LINKEDIN) {
+      if (rowAttrs.linkedinUrl) {
+        dmableRows.push(rowIdx);
+      } else {
+        console.log(`⏭️  Pre-filter: "${rowName}" — no LinkedIn URL, skipping`);
+      }
     } else {
-      console.log(`⏭️  Pre-filter: "${rowName}" — no IG handle, skipping`);
+      const rowNameIsHandle = !rowName.includes(' ') && /^[a-z0-9._]+$/i.test(rowName);
+      if (rowNameIsHandle || rowAttrs.igHandle) {
+        dmableRows.push(rowIdx);
+      } else {
+        console.log(`⏭️  Pre-filter: "${rowName}" — no IG handle, skipping`);
+      }
     }
   }
   if (dmableRows.length < effectiveLimit && eligibleRows.length > dmableRows.length) {
-    console.log(`⚠️  Only ${dmableRows.length}/${effectiveLimit} leads have IG handles on this page`);
+    const channelLabel = IS_LINKEDIN ? 'LinkedIn URLs' : 'IG handles';
+    console.log(`⚠️  Only ${dmableRows.length}/${effectiveLimit} leads have ${channelLabel} on this page`);
   }
   const toProcess = dmableRows;
 
@@ -450,11 +1447,30 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       // Read eligibility from the rendered row (no API). Source of truth: BloqLeadsTab.vue.
       const rowAttrs = await readRowAttrs(rowLocator);
 
-      // ── PRE-CHECK: Skip if already DM'd (UI-rendered [SOM DM] note flag) ──
-      if (rowAttrs.hasDmNote) {
-        console.log(`⏭️  Already DM'd (UI badge) — skipping`);
+      // ── PRE-CHECK: Skip if outreach already assigned (orange badge = outreach steps exist) ──
+      // NOTE: hasDmNote alone is NOT sufficient — a lead can have a [SOM DM] note from
+      // a previous API-direct run but no outreach steps (so no orange badge, still shows "Fresh").
+      // The authoritative check is outreachCount > 0 (steps assigned via Apply Strategy).
+      if (rowAttrs.outreachCount > 0) {
+        console.log(`⏭️  Outreach already assigned (${rowAttrs.outreachCount} steps) — skipping`);
         leadTimings.push({ name, duration: 0, status: 'skip' });
         results.skipped++; continue;
+      }
+      if (rowAttrs.hasDmNote && OUTREACH_FILTER === 'new') {
+        console.log(`⏭️  Has DM note but no outreach steps — previously DM'd without strategy, skipping`);
+        leadTimings.push({ name, duration: 0, status: 'skip' });
+        results.skipped++; continue;
+      }
+
+      // ── CRASH-PROOF IDEMPOTENCY: Skip if we sent to this lead today (local file) ──
+      // This catches the case where DM was sent but crash happened before API note was recorded.
+      if (rowAttrs.id) {
+        const sentFile = IS_LINKEDIN ? LI_DM_SENT_FILE : DM_SENT_FILE;
+        if (wasLeadDmSentToday(rowAttrs.id, sentFile)) {
+          console.log(`⏭️  Already sent today (crash-proof check) — skipping lead #${rowAttrs.id}`);
+          leadTimings.push({ name, duration: 0, status: 'skip' });
+          results.skipped++; continue;
+        }
       }
 
       // Reply detection (#67772): skip leads who already replied — they need manual follow-up
@@ -538,9 +1554,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
       if (outreachState === 'unknown') {
         console.log('⚠️  Outreach panel timed out');
-        const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-        fs.mkdirSync(screenshotDir, { recursive: true });
-        await page.screenshot({ path: path.join(screenshotDir, `outreach-timeout-${idx + 1}.png`) });
+        await page.screenshot({ path: `test-results/screenshots/outreach-timeout-${idx + 1}.png` });
         await page.keyboard.press('Escape'); results.skipped++; continue;
       }
 
@@ -597,9 +1611,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           }
         } else {
           console.log('⚠️  No Apply Strategy button found');
-          const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-          fs.mkdirSync(screenshotDir, { recursive: true });
-          await page.screenshot({ path: path.join(screenshotDir, `no-apply-btn-${idx + 1}.png`) });
+          await page.screenshot({ path: `test-results/screenshots/no-apply-btn-${idx + 1}.png` });
         }
       }
 
@@ -683,19 +1695,37 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       }
 
       // ── RECENT DM DEDUP: skip if we've DM'd this lead in the last 3 days ──
-      // Prevents spamming leads who have multiple incomplete steps across strategies
+      // Primary: OutreachMessage records (reliable, queryable)
+      // Fallback: legacy [SOM DM] notes (for pre-existing data)
       if (rowAttrs.id) {
         try {
-          const leadData = await apiClient.getLead(rowAttrs.id);
-          const notes = leadData?.data?.notes || leadData?.notes || [];
           const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
-          const recentDm = notes.find((n: any) => {
-            if (!n.content || !n.content.includes('[SOM DM]')) return false;
-            const noteDate = new Date(n.created_at).getTime();
-            return noteDate > threeDaysAgo;
+          let recentDmDate: string | null = null;
+
+          // Primary: check OutreachMessage records
+          const omResult = await apiClient.getOutreachMessages(rowAttrs.id, 'outbound');
+          const messages = omResult?.data?.messages || [];
+          const recentMsg = messages.find((m: any) => {
+            if (m.type !== 'instagram_dm') return false;
+            return new Date(m.sent_at || m.created_at).getTime() > threeDaysAgo;
           });
-          if (recentDm) {
-            const daysAgo = Math.round((Date.now() - new Date(recentDm.created_at).getTime()) / (24 * 60 * 60 * 1000) * 10) / 10;
+          if (recentMsg) {
+            recentDmDate = recentMsg.sent_at || recentMsg.created_at;
+          }
+
+          // Fallback: legacy note scan (catches DMs sent before OutreachMessage tracking)
+          if (!recentDmDate) {
+            const leadData = await apiClient.getLead(rowAttrs.id);
+            const notes = leadData?.data?.notes || leadData?.notes || [];
+            const recentNote = notes.find((n: any) => {
+              if (!n.content || !n.content.includes('[SOM DM]')) return false;
+              return new Date(n.created_at).getTime() > threeDaysAgo;
+            });
+            if (recentNote) recentDmDate = recentNote.created_at;
+          }
+
+          if (recentDmDate) {
+            const daysAgo = Math.round((Date.now() - new Date(recentDmDate).getTime()) / (24 * 60 * 60 * 1000) * 10) / 10;
             console.log(`⏭️  Already DM'd ${daysAgo}d ago — skipping (anti-spam)`);
             await page.keyboard.press('Escape'); results.skipped++; continue;
           }
@@ -705,9 +1735,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       console.log(`→ Executing step ${targetStepIndex + 1}`);
       if (totalPlayButtons === 0) {
         console.log('⏭️  No play buttons found after 90s');
-        const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-        fs.mkdirSync(screenshotDir, { recursive: true });
-        await page.screenshot({ path: path.join(screenshotDir, `no-play-${idx + 1}.png`) });
+        await page.screenshot({ path: `test-results/screenshots/no-play-${idx + 1}.png` });
         await page.keyboard.press('Escape'); results.skipped++; continue;
       }
       if (targetStepIndex >= totalPlayButtons) {
@@ -778,7 +1806,93 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         console.log(`→ Msg: "${msg.substring(0, 60)}..."`);
       }
 
-      // ── 9. OPEN INSTAGRAM ──
+      // ── 9. OPEN LINKEDIN or OPEN INSTAGRAM ──
+      if (IS_LINKEDIN) {
+        // ── LINKEDIN SEND PATH (via DM Provider Factory) ──
+        const liBtn = page.locator('button:has-text("Open LinkedIn")').first();
+        if (!(await liBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+          console.log('No Open LinkedIn btn');
+          results.skipped++;
+        } else {
+          console.log('-> Open LinkedIn & Copy...');
+          const [liPage] = await Promise.all([
+            context.waitForEvent('page', { timeout: 15000 }).catch(() => null as any),
+            liBtn.click()
+          ]);
+
+          if (liPage) {
+            await liPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+            await liPage.waitForTimeout(2000);
+
+            // Check if session is valid
+            const liUrl = liPage.url();
+            if (liUrl.includes('/login') || liUrl.includes('/authwall')) {
+              console.log(`\x1b[31m  SESSION EXPIRED: LinkedIn -- re-save session\x1b[0m`);
+              await sendDiscordAlert(
+                `**SOM LinkedIn -- Session Expired**\nBoard: \`${BOARD_ID}\`\nLinkedIn redirected to login.`
+              );
+              await liPage.close().catch(() => {});
+              results.failed++;
+              break; // Abort batch -- all leads will fail
+            }
+
+            // Use the provider factory for DM sending
+            const liProvider = getDmProvider('linkedin', { dryRun: DRY_RUN });
+            const target: DmTarget = {
+              name,
+              profileUrl: liPage.url(),
+              message: msg,
+              leadId: rowAttrs.id ?? undefined,
+            };
+
+            const batchResult = await liProvider.sendBatch(liPage, context, [target]);
+            const dmResult = batchResult.results[0];
+            if (dmResult?.status === 'sent' || dmResult?.status === 'dry_run') {
+              results.sent++;
+              if (dmResult.status === 'sent') recordLinkedInDmSent(rowAttrs.id);
+            } else {
+              results.failed++;
+            }
+
+            // Record note via API
+            if (msg && rowAttrs?.id) {
+              try {
+                await apiClient.addNote(rowAttrs.id, `[SOM LinkedIn] ${msg}`);
+                console.log('  -> Note recorded');
+              } catch (err: any) {
+                console.log(`  Note failed: ${err.message?.substring(0, 40)}`);
+              }
+            }
+
+            await liPage.close().catch(() => {});
+          }
+
+          // Click "I've sent the message" checkbox + Complete
+          const sentCheckbox = page.locator('input[type="checkbox"]').first();
+          if (await sentCheckbox.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await sentCheckbox.check();
+            await page.waitForTimeout(300);
+          }
+          const completeBtn = page.locator('button:has-text("Complete")').first();
+          if (await completeBtn.isEnabled({ timeout: 2000 }).catch(() => false)) {
+            await completeBtn.click();
+            await page.waitForTimeout(1500);
+            console.log('  Step completed');
+          }
+        }
+
+        // Human-like delay between LinkedIn leads
+        if (idx < toProcess.length - 1) {
+          const delay = 5000 + Math.random() * 10000;
+          console.log(`  Waiting ${(delay / 1000).toFixed(1)}s before next lead...\n`);
+          await page.waitForTimeout(delay);
+        }
+        const leadEnd = Date.now();
+        leadTimings.push({ name, duration: leadEnd - leadStart, status: results.sent > 0 ? 'sent' : 'skip' });
+        continue; // Skip the Instagram path below
+      }
+
+      // ── INSTAGRAM SEND PATH ──
       let inlineProfileStats: any = null; // Hoisted — populated when on IG profile page
       const igBtn = page.locator('button:has-text("Open Instagram")').first();
       if (!(await igBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
@@ -802,15 +1916,13 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           const igSplashLogout = await igPage.locator('a:has-text("Log in"), button:has-text("Log in")').first().isVisible({ timeout: 1000 }).catch(() => false)
             && !(await igPage.locator('svg[aria-label="Home"]').isVisible({ timeout: 500 }).catch(() => false));
           if (isLoginPage || hasLoginForm || igSplashLogout) {
-            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID`;
+            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`;
             console.log(`\n\x1b[31m${'='.repeat(70)}\x1b[0m`);
             console.log(`\x1b[31m  SESSION EXPIRED: @${IG_ACCOUNT}\x1b[0m`);
             console.log(`\x1b[31m  Instagram redirected to login page: ${igUrl.substring(0, 80)}\x1b[0m`);
-            console.log(`\x1b[31m  Fix: IG_ACCOUNT=${IG_ACCOUNT} iris hive credentials save-session --platform instagram --bloq YOUR_BLOQ_ID\x1b[0m`);
+            console.log(`\x1b[31m  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\x1b[0m`);
             console.log(`\x1b[31m${'='.repeat(70)}\x1b[0m\n`);
-            const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-            fs.mkdirSync(screenshotDir, { recursive: true });
-            await igPage.screenshot({ path: path.join(screenshotDir, `session-expired-${IG_ACCOUNT}.png`) }).catch(() => {});
+            await igPage.screenshot({ path: `test-results/screenshots/session-expired-${IG_ACCOUNT}.png` }).catch(() => {});
             await sendDiscordAlert(
               `\u{1F6A8} **SOM — Instagram Session Expired**\n` +
               `Account: \`@${IG_ACCOUNT}\` | Board: \`${BOARD_ID}\`\n` +
@@ -863,7 +1975,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             try {
               const currentUrl = igPage.url();
               if (!currentUrl.includes('/direct/')) {
-                const screenshotDir = path.join(__dirname, 'test-results/screenshots/profiles');
+                const screenshotDir = path.join(__dirname, '../../test-results/screenshots/profiles');
                 fs.mkdirSync(screenshotDir, { recursive: true });
                 const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
                 await igPage.screenshot({
@@ -988,7 +2100,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
             // ── PATH A: Already in DM view (URL has /direct/ or message input visible) ──
             const url = igPage.url();
-            const dmInputEarly = igPage.locator('textarea[placeholder*="Message"], div[contenteditable="true"][role="textbox"], p[placeholder*="Message"]').first();
+            const dmInputEarly = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text], p[placeholder*="Message"]').first();
             if (url.includes('/direct/') || await dmInputEarly.isVisible({ timeout: 2000 }).catch(() => false)) {
               console.log('  → Direct DM view detected');
               inDMView = true;
@@ -1001,9 +2113,25 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
               if (await messageBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
                 console.log('  → Public account — clicking Message...');
                 await messageBtn.click();
+                // Wait for navigation to DM view
+                const reachedDM = await igPage.waitForURL(/\/direct\//, { timeout: 8000 }).then(() => true).catch(() => false);
                 await igPage.waitForTimeout(1500);
-                await dismissIgPopup(); // notifications popup may appear here
-                inDMView = true;
+                // Aggressively dismiss notifications popup that blocks DM input
+                for (let pa = 0; pa < 3; pa++) {
+                  const nn = igPage.locator('button:has-text("Not Now"), button:has-text("Not now"), button:has-text("Cancel")').first();
+                  if (await nn.isVisible({ timeout: 1500 }).catch(() => false)) {
+                    await nn.click();
+                    console.log('  → Dismissed popup after Message click');
+                    await igPage.waitForTimeout(800);
+                  } else { break; }
+                }
+                await dismissIgPopup();
+                if (reachedDM || igPage.url().includes('/direct/')) {
+                  inDMView = true;
+                } else {
+                  const hasError = await igPage.locator('text=Something went wrong').isVisible().catch(() => false);
+                  console.log(`  ✗ Message button didn't open DM view${hasError ? ' (IG error)' : ''}`);
+                }
               }
             }
 
@@ -1038,11 +2166,19 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                 if (await sendMsg.isVisible({ timeout: 5000 }).catch(() => false)) {
                   console.log('  → Send message...');
                   await sendMsg.click();
+                  // Wait for DM view to load (navigation to /direct/)
+                  const reachedDM = await igPage.waitForURL(/\/direct\//, { timeout: 8000 }).then(() => true).catch(() => false);
                   await igPage.waitForTimeout(1500);
-                  inDMView = true;
-                } else {
-                  // No "Send message" — try following first (IG restricts DMs for non-followers)
-                  console.log('  ✗ No "Send message" in menu — trying follow first...');
+                  await dismissIgPopup();
+                  if (reachedDM || igPage.url().includes('/direct/')) {
+                    inDMView = true;
+                  } else {
+                    console.log('  ✗ Send message didn\'t open DM view — trying Follow first...');
+                  }
+                }
+                // If Send message failed or wasn't available, try following then retry
+                if (!inDMView) {
+                  console.log('  → Trying follow first (private account or DM restricted)...');
                   await igPage.locator('text=Cancel').first().click().catch(() => {});
                   await igPage.waitForTimeout(1000);
 
@@ -1061,8 +2197,14 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                       if (await retrySendMsg.isVisible({ timeout: 5000 }).catch(() => false)) {
                         console.log('  → Send message (after follow)...');
                         await retrySendMsg.click();
+                        const retryReachedDM = await igPage.waitForURL(/\/direct\//, { timeout: 8000 }).then(() => true).catch(() => false);
                         await igPage.waitForTimeout(1500);
-                        inDMView = true;
+                        await dismissIgPopup();
+                        if (retryReachedDM || igPage.url().includes('/direct/')) {
+                          inDMView = true;
+                        } else {
+                          console.log('  ✗ Still can\'t open DM after follow');
+                        }
                       } else {
                         console.log('  ✗ Still no "Send message" after follow');
                         await igPage.locator('text=Cancel').first().click().catch(() => {});
@@ -1073,17 +2215,13 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                     }
                   } else {
                     console.log('  ✗ No Follow button either — cannot DM');
-                    const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-                    fs.mkdirSync(screenshotDir, { recursive: true });
-                    await igPage.screenshot({ path: path.join(screenshotDir, `no-send-msg-${idx + 1}.png`) });
+                    await igPage.screenshot({ path: `test-results/screenshots/no-send-msg-${idx + 1}.png` });
                     results.failed++;
                   }
                 }
               } else {
                 console.log('  ✗ No ... button found');
-                const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-                fs.mkdirSync(screenshotDir, { recursive: true });
-                await igPage.screenshot({ path: path.join(screenshotDir, `no-dots-${idx + 1}.png`) });
+                await igPage.screenshot({ path: `test-results/screenshots/no-dots-${idx + 1}.png` });
                 results.failed++;
               }
             }
@@ -1091,9 +2229,26 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             // ── TYPE & SEND DM ──
             if (inDMView) {
               await igPage.waitForTimeout(800);
-              // Dismiss any popup that appeared after navigating to DM view
+              // Aggressively dismiss "Turn on Notifications" and any other overlay blocking DM input
+              for (let popupAttempt = 0; popupAttempt < 3; popupAttempt++) {
+                const notNow = igPage.locator('button:has-text("Not Now"), button:has-text("Not now"), button:has-text("Cancel")').first();
+                if (await notNow.isVisible({ timeout: 2000 }).catch(() => false)) {
+                  await notNow.click();
+                  console.log('  → Dismissed notifications popup');
+                  await igPage.waitForTimeout(1000);
+                } else {
+                  const dialog = igPage.locator('[role="dialog"]').first();
+                  if (await dialog.isVisible({ timeout: 500 }).catch(() => false)) {
+                    await igPage.keyboard.press('Escape');
+                    console.log('  → Closed dialog via Escape');
+                    await igPage.waitForTimeout(500);
+                  } else {
+                    break;
+                  }
+                }
+              }
               await dismissIgPopup();
-              const dmInput = igPage.locator('textarea[placeholder*="Message"], div[contenteditable="true"][role="textbox"], div[contenteditable="true"], p[placeholder*="Message"]').first();
+              const dmInput = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text], p[placeholder*="Message"]').first();
 
               if (await dmInput.isVisible({ timeout: 8000 }).catch(() => false)) {
                 const dmText = msg || 'Hey! I saw you\'re into some cool stuff. Would love to connect!';
@@ -1106,9 +2261,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
                 if (DRY_RUN) {
                   // Screenshot the typed message but DON'T send
-                  const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-                  fs.mkdirSync(screenshotDir, { recursive: true });
-                  await igPage.screenshot({ path: path.join(screenshotDir, `dry-run-dm-${idx + 1}.png`) });
+                  await igPage.screenshot({ path: `test-results/screenshots/dry-run-dm-${idx + 1}.png` });
                   console.log(`  [DRY RUN] Message typed but NOT sent: "${dmText.substring(0, 50)}..."`);
                   results.sent++; // count as "would have sent"
                 } else {
@@ -1119,47 +2272,71 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                   } else {
                     await igPage.keyboard.press('Enter');
                   }
-                  await igPage.waitForTimeout(800);
-                  console.log('  ✓ DM sent!');
-                  results.sent++;
-                  dmSentThisLead = true;
-                  recordDmSent();
 
-                  // Record DM note (fire-and-forget). Lead ID comes from the row's
-                  // data-lead-id, which we already read into rowAttrs at the top of this iteration.
-                  if (rowAttrs.id) {
-                    apiClient.addNote(
-                      rowAttrs.id,
-                      `[SOM DM] Sent via @${IG_ACCOUNT}: "${dmText.substring(0, 100)}..."`,
-                      'outreach'
-                    ).catch(() => {});
+                  // ── DELIVERY CONFIRMATION: verify message appeared in chat ──
+                  await igPage.waitForTimeout(2000);
+                  const uiMsgSnippet = dmText.substring(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                  const uiDelivered = await igPage.locator(`div[dir="auto"]:text-matches("${uiMsgSnippet}", "i")`).first()
+                    .isVisible({ timeout: 3000 }).catch(() => false);
 
-                    // ── STEP COMPLETION (immediately after DM send) ──
-                    // Must happen HERE, not later — if the browser crashes after this point,
-                    // the step is already marked done and the lead won't get re-messaged.
-                    try {
-                      const steps = await apiClient.getSteps(rowAttrs.id);
-                      const stepIdx = typeof targetStepIndex === 'number' ? targetStepIndex : 0;
-                      const currentStep = steps[stepIdx];
-                      if (currentStep?.id) {
-                        const result = await apiClient.completeStep(rowAttrs.id, currentStep.id, process.env.STRATEGY);
-                        if (result.success) {
-                          console.log(`  ✓ Step ${stepIdx + 1} completed via API`);
-                        } else {
-                          console.log(`  ⚠ Step complete failed: ${result.message}`);
+                  if (uiDelivered) {
+                    console.log('  ✓ DM sent!');
+                    results.sent++;
+                    dmSentThisLead = true;
+                    recordDmSent(rowAttrs.id);
+
+                    if (rowAttrs.id) {
+                      // Record with retry (not fire-and-forget)
+                      let uiRecOk = false;
+                      for (let att = 0; att < 3; att++) {
+                        try {
+                          const rr = await apiClient.recordDmSent(rowAttrs.id, {
+                            message: dmText,
+                            channel_account: IG_ACCOUNT,
+                            campaign_name: STRATEGY_NAME,
+                            bloq_id: BOARD_ID,
+                            ig_handle: rowAttrs.igHandle,
+                            step_index: typeof targetStepIndex === 'number' ? targetStepIndex : 0,
+                          });
+                          if (rr.success) { uiRecOk = true; break; }
+                        } catch {}
+                        if (att < 2) await igPage.waitForTimeout(1000);
+                      }
+
+                      // Step completion only if note recorded
+                      if (uiRecOk) {
+                        try {
+                          const steps = await apiClient.getSteps(rowAttrs.id);
+                          const stepIdx = typeof targetStepIndex === 'number' ? targetStepIndex : 0;
+                          const currentStep = steps[stepIdx];
+                          if (currentStep?.id) {
+                            const result = await apiClient.completeStep(rowAttrs.id, currentStep.id, process.env.STRATEGY);
+                            if (result.success) {
+                              console.log(`  ✓ Step ${stepIdx + 1} completed via API`);
+                            } else {
+                              console.log(`  ⚠ Step complete failed: ${result.message}`);
+                            }
+                          }
+                        } catch (stepErr: any) {
+                          console.log(`  ⚠ Step complete error: ${stepErr.message}`);
                         }
                       }
-                    } catch (stepErr: any) {
-                      console.log(`  ⚠ Step complete error: ${stepErr.message}`);
+                    }
+                  } else {
+                    console.log('  ⛔ DM not confirmed in chat — skipping note + step');
+                    results.failed++;
+                    if (rowAttrs.id) {
+                      apiClient.addNote(rowAttrs.id, `[SOM FAIL] DM to @${rowAttrs.igHandle} via @${IG_ACCOUNT} — message typed but not confirmed in chat`).catch(() => {});
                     }
                   }
                 }
               } else {
                 console.log('  ✗ No message input found');
-                const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-                fs.mkdirSync(screenshotDir, { recursive: true });
-                await igPage.screenshot({ path: path.join(screenshotDir, `no-dm-input-${idx + 1}.png`) });
+                await igPage.screenshot({ path: `test-results/screenshots/no-dm-input-${idx + 1}.png` });
                 results.failed++;
+                if (rowAttrs.id) {
+                  apiClient.addNote(rowAttrs.id, `[SOM FAIL] No DM input found for @${rowAttrs.igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
+                }
               }
             }
           }
@@ -1297,9 +2474,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     } catch (err: any) {
       const leadDuration = ((Date.now() - leadStart) / 1000).toFixed(1);
       console.error(`❌ Error (${leadDuration}s): ${err.message?.substring(0, 150)}`);
-      const screenshotDir = path.join(__dirname, 'test-results/screenshots');
-      fs.mkdirSync(screenshotDir, { recursive: true });
-      await page.screenshot({ path: path.join(screenshotDir, `error-${idx + 1}.png`) }).catch(() => {});
+      leadTimings.push({ name: `lead ${rowIndex + 1}`, duration: parseFloat(leadDuration), status: 'fail' });
+      await page.screenshot({ path: `test-results/screenshots/error-${idx + 1}.png` }).catch(() => {});
       results.failed++;
       try {
         for (const p of context.pages()) {
@@ -1343,19 +2519,21 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   if (DRY_RUN) console.log('  Mode: DRY RUN');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-  // Discord alert for replied leads (#67772) — so you can follow up manually
-  if (repliedLeads.length > 0) {
-    const leadLines = repliedLeads.map(l => {
-      const ig = l.igHandle ? `@${l.igHandle}` : '';
-      const link = l.id ? `https://web.freelabel.net/iris?boardId=${BOARD_ID}&tab=leads&lead=${l.id}` : '';
-      return `  • **${l.name}** ${ig}${link ? ` — [View](${link})` : ''}`;
-    }).join('\n');
-    await sendDiscordAlert(
-      `🔥 **SOM — ${repliedLeads.length} Lead${repliedLeads.length > 1 ? 's' : ''} Replied!**\n` +
-      `📋 Board: \`${BOARD_ID}\` | Account: \`@${IG_ACCOUNT}\`\n` +
-      `These leads responded — follow up manually:\n${leadLines}`
-    );
+  // Merge inbox replies + in-batch replied leads for the Discord summary
+  const allReplies = [...inboxReplies];
+  for (const r of repliedLeads) {
+    if (r.id && !allReplies.some(ir => ir.leadId === r.id)) {
+      allReplies.push({ name: r.name, leadId: r.id!, contact: r.igHandle || '', lastMsg: '(replied during batch)' });
+    }
   }
+
+  // Discord batch summary with inbox replies
+  await sendDiscordBatchSummary({
+    sent: results.sent, skipped: results.skipped, failed: results.failed,
+    duration: totalDuration, boardId: BOARD_ID, strategy: STRATEGY_NAME,
+    igAccount: IG_ACCOUNT, replies: allReplies, leadTimings,
+  });
+
   if (leadTimings.length > 0) {
     console.log('');
     console.log('  LEAD TIMINGS:');

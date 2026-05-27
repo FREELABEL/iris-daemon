@@ -14,7 +14,14 @@ try {
 const app = express()
 app.use(express.json({ limit: '10mb' }))
 
-// CORS — allowlist of known origins (security: never use wildcard *)
+// CORS — dynamic allowlist. Localhost always allowed; remote origins from env or config.
+// Clients: set BRIDGE_CORS_ORIGINS env var (comma-separated) or add cors_origins to ~/.iris/config.json
+const _configCors = (() => {
+  try {
+    const cfg = JSON.parse(require('fs').readFileSync(require('path').join(require('os').homedir(), '.iris', 'config.json'), 'utf-8'))
+    return (cfg.cors_origins || [])
+  } catch { return [] }
+})()
 const CORS_ALLOWLIST = new Set([
   'http://localhost:3200',
   'http://localhost:9300',
@@ -23,8 +30,8 @@ const CORS_ALLOWLIST = new Set([
   'https://freelabel.net',
   'https://web.freelabel.net',
   'https://heyiris.io',
-  'https://freelabel.net',
   'https://app.heyiris.io',
+  ..._configCors,
   ...(process.env.BRIDGE_CORS_ORIGINS || '').split(',').filter(Boolean)
 ])
 app.use((req, res, next) => {

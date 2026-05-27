@@ -1,73 +1,86 @@
 import { Page } from '@playwright/test';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 /**
  * Authentication helper for HeyIRIS
- * Injects auth token into localStorage to skip the login form
+ * Injects auth token into localStorage to skip the login form.
+ *
+ * User identity is read from ~/.iris/config.json (written by installer).
+ * NO hardcoded credentials — works on any client machine.
  */
+
+interface IrisConfig {
+  user_id: number;
+  api_url?: string;
+  node_api_key?: string;
+  frontend_url?: string;
+}
+
+function loadIrisConfig(): IrisConfig {
+  const configPath = path.join(os.homedir(), '.iris', 'config.json');
+  if (!fs.existsSync(configPath)) {
+    throw new Error('~/.iris/config.json not found. Run the IRIS installer first.');
+  }
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  if (!config.user_id) {
+    throw new Error('user_id missing from ~/.iris/config.json. Run: iris auth login');
+  }
+  return config;
+}
+
+function getFrontendUrl(config: IrisConfig): string {
+  return config.frontend_url
+    || process.env.IRIS_FRONTEND_URL
+    || 'https://web.freelabel.net';
+}
+
 export class AuthHelper {
 
   /**
-   * Login by injecting full user session into localStorage
+   * Login by injecting auth token into localStorage.
+   * User identity is loaded from ~/.iris/config.json — no hardcoded admin data.
    */
   static async loginWithToken(page: Page, token: string): Promise<void> {
     console.log('🔐 Injecting auth session...');
 
+    const config = loadIrisConfig();
+    const frontendUrl = getFrontendUrl(config);
+    const userId = config.user_id;
+
     // Navigate to the domain first (localStorage is domain-scoped)
-    await page.goto('https://web.freelabel.net/login');
+    await page.goto(`${frontendUrl}/login`);
     await page.waitForTimeout(2000);
 
-    // Inject full auth data into localStorage (matches real session)
-    await page.evaluate((tkn) => {
-      const userData = {
-        id: 193,
-        email: 'admin@freelabel.net',
-        name: null,
-        user_name: 'admin',
-        phone: '(817) 703-7623',
-        account_type: '2',
-        is_admin: 1,
-        is_paid: 0,
-        user_token: tkn,
-        xp_points: 1007660,
-        dashboard_type: 'artist',
-        default_profile: null,
-        platform_fee_percentage: 20
-      };
-
-      localStorage.setItem('user', JSON.stringify(userData));
+    // Inject auth data into localStorage — only token and user_id needed
+    // The frontend fetches the full profile from the API on load
+    await page.evaluate(({ tkn, uid }) => {
       localStorage.setItem('user_token', tkn);
-      localStorage.setItem('user_id', '193');
-      localStorage.setItem('email', 'admin@freelabel.net');
-      localStorage.setItem('user_name', 'admin');
-      localStorage.setItem('user_account_type', '2');
-      localStorage.setItem('user_account_package', '2');
-      localStorage.setItem('user_is_paid', '1');
-      localStorage.setItem('user_session_key', 'e7ea9e64-ea8b-4c14-a6e3-687bf1888c40');
-      localStorage.setItem('user_xp_points', '1007660');
-    }, token);
+      localStorage.setItem('user_id', String(uid));
+      localStorage.setItem('user', JSON.stringify({
+        id: uid,
+        user_token: tkn,
+      }));
+    }, { tkn: token, uid: userId });
 
-    console.log('✓ Full session injected into localStorage');
+    console.log(`✓ Session injected for user ${userId}`);
 
-    // Navigate to the app - should be authenticated now
-    // Retry once if the browser crashes (common under memory pressure with 4 parallel campaigns)
+    // Navigate to the app — retry once on browser crash
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await page.goto('https://web.freelabel.net/iris', { timeout: 30000 });
+        await page.goto(`${frontendUrl}/iris`, { timeout: 30000 });
         await page.waitForTimeout(5000);
         break;
       } catch (err: any) {
         if (attempt === 2 || !err.message?.includes('closed')) throw err;
         console.log(`⚠️  Browser hiccup on auth (attempt ${attempt}/2) — retrying...`);
-        await page.goto('https://web.freelabel.net/login', { timeout: 15000 }).catch(() => {});
+        await page.goto(`${frontendUrl}/login`, { timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(2000);
-        // Re-inject token (page may have reloaded)
-        await page.evaluate((tkn) => {
+        await page.evaluate(({ tkn, uid }) => {
           localStorage.setItem('user_token', tkn);
-          localStorage.setItem('user', JSON.stringify({
-            id: 193, email: 'admin@freelabel.net', user_name: 'admin',
-            user_token: tkn, account_type: '2', is_admin: 1
-          }));
-        }, token);
+          localStorage.setItem('user', JSON.stringify({ id: uid, user_token: tkn }));
+        }, { tkn: token, uid: userId });
       }
     }
 

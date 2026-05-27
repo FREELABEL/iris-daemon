@@ -17,19 +17,11 @@ const fs = require('fs')
 const sessionDir = __dirname
 const cacheFile = path.join(__dirname, '.som-campaigns-cache.json')
 
-// ─── INLINE FALLBACK (baked-in defaults — used when cache is missing) ─────────
-const inlineCampaigns = {
-  courses:      { boardId: '38',  strategy: 'AI Course | V3',                   igAccount: 'heyiris.io',         twAccount: 'freelabelnet', active: true,  label: 'AI Course Outreach',    color: '\x1b[36m' },
-  creators:     { boardId: '80',  strategy: 'Creator Outreach | V1',            igAccount: 'thediscoverpage_',   twAccount: 'freelabelnet', active: true,  label: 'Creator Outreach',      color: '\x1b[35m' },
-  beatbox:      { boardId: '224', strategy: 'DJ Outreach | V2',                 igAccount: 'thebeatbox__',       twAccount: 'freelabelnet', active: true,  label: 'DJ Outreach',           color: '\x1b[33m' },
-  mayo:         { boardId: '176', strategy: 'Mayo Outreach | V2',               igAccount: 'hourdemayo',         twAccount: 'freelabelnet', active: true,  label: 'Mayo Outreach',         color: '\x1b[32m' },
-  venues:       { boardId: '292', strategy: 'Venue Partnership | V1',           igAccount: 'freelabelnet',       twAccount: 'freelabelnet', active: true,  label: 'Venue Partnership',     color: '\x1b[31m' },
-  freelabelnet: { boardId: '355', strategy: 'Artist Outreach | FFAT V1',        igAccount: 'freelabelnet',       twAccount: 'freelabelnet', active: true,  label: 'FFAT Artists (Austin)', color: '\x1b[34m' },
-  atxbeauty:    { boardId: '283', strategy: 'Beauty & Wellness Outreach | V1',  igAccount: 'atxbeautylab.lisa',  twAccount: 'freelabelnet', active: false, label: 'ATX Beauty Outreach',   color: '\x1b[95m' },
-  gooddeals:    { boardId: '302', strategy: 'LinkedIn Founder Outreach | V1',   igAccount: null,                 twAccount: null,           active: false, label: 'Good Deals Outreach',   color: '\x1b[32m' },
-}
+// ─── NO INLINE DEFAULTS — campaigns MUST come from API cache ─────────────────
+// Run `iris som sync` or call syncFromApi() to populate the cache.
+// This prevents shipping admin-specific board IDs to client machines.
 
-// ─── RESOLVE: prefer cache, fall back to inline ──────────────────────────────
+// ─── RESOLVE: cache only, no hardcoded fallback ──────────────────────────────
 function loadCampaigns () {
   try {
     if (fs.existsSync(cacheFile)) {
@@ -39,9 +31,10 @@ function loadCampaigns () {
       }
     }
   } catch (e) {
-    // fall through to inline
+    // cache unreadable
   }
-  return inlineCampaigns
+  console.warn('[som-config] No campaigns configured. Run: iris som sync')
+  return {}
 }
 
 const campaigns = loadCampaigns()
@@ -103,10 +96,12 @@ const strategyAliases = {
   'ai-course-v3': 'AI Course | V3',
   'ai-course':    'AI Course | V3',
   'creator-v1':   'Creator Outreach | V1',
-  'creator':      'Creator Outreach | V1',
+  'creator-v3':   'Creator Outreach | V3 — Affiliate',
+  'creator':      'Creator Outreach | V3 — Affiliate',
   'dj-v1':        'DJ Outreach | V1',
   'dj-v2':        'DJ Outreach | V2',
-  'dj':           'DJ Outreach | V2',
+  'dj-v3':        'DJ Outreach | V3',
+  'dj':           'DJ Outreach | V3',
   'mayo-v1':      'Mayo Outreach | V1',
   'mayo-v2':      'Mayo Outreach | V2',
   'mayo':         'Mayo Outreach | V2',
@@ -128,6 +123,8 @@ const strategyAliases = {
   'email-financial-v1':  'Email Financial Advisory | V1',
   'email-financial':     'Email Financial Advisory | V1',
   'gooddeals':           'LinkedIn Founder Outreach | V1',
+  'sandbox':             'Sandbox Test | V1',
+  'sandbox-v1':          'Sandbox Test | V1',
 }
 
 // Derived: unique active IG accounts for inbox scanning (deduped by igAccount)

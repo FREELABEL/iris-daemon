@@ -8,7 +8,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-const TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+const TOKEN = process.env.HEYIRIS_TOKEN;
+if (!TOKEN) throw new Error('HEYIRIS_TOKEN env var required. Set in ~/.iris/bridge/.env or export it.');
 const BOARD_ID = parseInt(process.env.BOARD_ID || '38', 10);
 const LIMIT = parseInt(process.env.LIMIT || '20', 10);
 const WA_ACCOUNT = process.env.WA_ACCOUNT || 'default';
@@ -19,8 +20,7 @@ const SESSION_INPUT = process.env.BROWSER_SESSION_FILE
   || path.join(os.homedir(), '.iris', 'whatsapp-sessions', WA_ACCOUNT);
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
 
-const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
-  'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
+const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL || '';
 
 /** Resolve session input to a usable directory, extracting archives if needed */
 function resolveSessionDir(input: string): { dir: string; cleanup: boolean } {

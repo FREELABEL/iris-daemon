@@ -25,6 +25,8 @@ const path = require('path')
 const os = require('os')
 const https = require('https')
 const http = require('http')
+const crypto = require('crypto')
+const { TmuxManager } = require('./tmux-manager')
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -221,15 +223,17 @@ async function somPreflightCheck (boardId, strategy, opts = {}) {
   return check(boardId, strategy, opts)
 }
 
-// Auto-detect freelabel project root (looks for som:creators npm script)
+// Auto-detect freelabel project root.
+// Priority: env var → config.json → relative paths → null.
+// No hardcoded ~/Sites/freelabel guesses — client machines don't have it.
 
 function findFreelabelPath () {
-  // 1. Explicit env var
+  // 1. Explicit env var (always wins)
   if (process.env.FREELABEL_PATH) {
     const pkg = path.join(process.env.FREELABEL_PATH, 'package.json')
     if (fs.existsSync(pkg)) return process.env.FREELABEL_PATH
   }
-  // 2. Read from ~/.iris/config.json
+  // 2. Read from ~/.iris/config.json (set by installer or user)
   try {
     const configPath = path.join(os.homedir(), '.iris', 'config.json')
     if (fs.existsSync(configPath)) {
@@ -240,27 +244,21 @@ function findFreelabelPath () {
       }
     }
   } catch { /* continue */ }
-  // 3. Relative paths from daemon/ directory
-  const candidates = [
-    path.resolve(__dirname, '../../..'),  // fl-docker-dev/coding-agent-bridge/daemon/ → freelabel root
+  // 3. Relative paths from daemon directory (works when daemon is inside the monorepo)
+  const relativeCandidates = [
+    path.resolve(__dirname, '../../..'),   // fl-docker-dev/coding-agent-bridge/daemon/ → freelabel root
     path.resolve(__dirname, '../../../..'), // one level up
-    // 4. Common developer paths
-    path.join(os.homedir(), 'Sites', 'freelabel'),
-    path.join(os.homedir(), 'projects', 'freelabel'),
-    path.join(os.homedir(), 'code', 'freelabel'),
-    path.join(os.homedir(), 'dev', 'freelabel'),
-    path.join(os.homedir(), 'Developer', 'freelabel'),
-    path.join(os.homedir(), 'workspace', 'freelabel'),
   ]
-  for (const c of candidates) {
-    const pkg = path.join(c, 'package.json')
-    if (fs.existsSync(pkg)) {
-      try {
+  for (const c of relativeCandidates) {
+    try {
+      const pkg = path.join(c, 'package.json')
+      if (fs.existsSync(pkg)) {
         const json = JSON.parse(fs.readFileSync(pkg, 'utf-8'))
         if (json.scripts && (json.scripts['som:creators'] || json.scripts['leadgen:creators'] || json.scripts['linkedin:search'])) return c
-      } catch { /* continue */ }
-    }
+      }
+    } catch { /* continue */ }
   }
+  // No freelabel checkout found — this is normal on client machines
   return null
 }
 
@@ -332,12 +330,13 @@ class TaskExecutor {
   constructor (cloudClient, workspaceManager) {
     this.cloud = cloudClient
     this.workspaces = workspaceManager
-    this.runningTasks = new Map() // taskId → childProcess
+    this.runningTasks = new Map() // taskId → childProcess or { sessionName, tmux: true }
     this.flApiPath = findFlApiPath()
     this.dockerMode = null // lazily detected
     this._browserQueue = []   // queued browser tasks waiting for their turn
     this._browserRunning = false // true when a browser task is executing
     this._executedTaskIds = new Map() // taskId -> timestamp (prevents re-execution from duplicate Pusher events)
+    this.tmux = new TmuxManager()
     const verbose = process.env.DAEMON_VERBOSE || process.env.FL_API_PATH || process.env.FREELABEL_PATH
     if (this.flApiPath) {
       if (verbose) console.log(`[executor] fl-api path: ${this.flApiPath}`)
@@ -454,6 +453,17 @@ class TaskExecutor {
     }
     if (isBrowserTask) this._browserRunning = true
 
+    // Auto-install Playwright browsers on first browser task (idempotent — instant if already installed)
+    if (isBrowserTask && !this._playwrightChecked) {
+      try {
+        const { execSync } = require('child_process')
+        execSync('npx playwright install chromium 2>/dev/null', { timeout: 120000, stdio: 'ignore' })
+        this._playwrightChecked = true
+      } catch {
+        console.log(`[executor] ⚠ Playwright browser install failed — task may fail if browsers missing`)
+      }
+    }
+
     const taskShort = taskId.substring(0, 12)
     const timeoutSec = task.timeout_seconds || task.config?.timeout_seconds || 'default'
     const nodeId = task.node_id ? task.node_id.substring(0, 12) : 'unknown'
@@ -551,9 +561,29 @@ class TaskExecutor {
         const msgText = (task.prompt || '').trim()
         const tsNow = new Date().toLocaleTimeString('en-US', { hour12: false })
         console.log(`\n[${tsNow}] \x1b[36m${senderName}\x1b[0m: ${msgText}\n`)
+
+        // Hive inbox: persist to ~/.iris/hive/inbox/
+        if (msgConfig.hive_inbox) {
+          try {
+            await this._saveToHiveInbox(task)
+          } catch (err) {
+            console.error(`[hive-inbox] Save failed: ${err.message}`)
+          }
+        }
+
+        // Smart notification truncation — long messages get a CLI hint
         try {
-          const notifText = msgText.length > 200 ? msgText.substring(0, 197) + '...' : msgText
-          execSync(`osascript -e 'display notification "${notifText.replace(/["\\]/g, '')}" with title "IRIS Message from ${senderName.replace(/["\\]/g, '')}"'`, { timeout: 5000, stdio: 'ignore' })
+          const MAX_NOTIF = 140
+          let notifText = msgText
+          if (msgConfig.hive_inbox && msgConfig.inbox_type === 'file') {
+            notifText = `File: ${msgConfig.file_name || 'download'}`
+          }
+          if (notifText.length > MAX_NOTIF) {
+            notifText = notifText.substring(0, MAX_NOTIF) + '... Run: iris hive inbox'
+          }
+          const safeNotif = notifText.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
+          const safeTitle = `IRIS ${msgConfig.hive_inbox ? 'Inbox' : 'Message'} from ${senderName}`.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
+          execSync(`osascript -e 'display notification "${safeNotif}" with title "${safeTitle}"'`, { timeout: 5000, stdio: 'ignore' })
         } catch { /* non-macOS or notification failed */ }
         clearInterval(progressInterval)
         await this.cloud.submitResult(taskId, {
@@ -562,6 +592,86 @@ class TaskExecutor {
           duration_ms: Date.now() - startTime,
         })
         this.notifyDiscord(task, 'completed', Date.now() - startTime, [`Message from ${senderName}: ${msgText}`]).catch(() => {})
+        return
+      }
+
+      // ── Short-circuit: hive_search — local search across inbox + iMessage ──
+      if (task.type === 'hive_search') {
+        const searchQuery = (task.prompt || '').trim().toLowerCase()
+        const searchConfig = task.config || {}
+        const searchType = searchConfig.search_type || 'all'
+        const searchLimit = searchConfig.limit || 10
+        const results = []
+
+        console.log(`[hive-search] Searching for "${searchQuery}" (type=${searchType})`)
+
+        // Search Hive inbox
+        if (searchType === 'all' || searchType === 'inbox') {
+          const inboxDir = path.join(os.homedir(), '.iris', 'hive', 'inbox')
+          const manifestPath = path.join(inboxDir, '.manifest.jsonl')
+          try {
+            if (fs.existsSync(manifestPath)) {
+              const raw = fs.readFileSync(manifestPath, 'utf-8').trim()
+              for (const line of raw.split('\n')) {
+                try {
+                  const item = JSON.parse(line)
+                  const haystack = [item.file, item.original_name, item.message, item.from_node, item.url]
+                    .filter(Boolean).join(' ').toLowerCase()
+                  if (haystack.includes(searchQuery)) {
+                    let preview = item.message || ''
+                    if (preview.length < 20) {
+                      try {
+                        const fp = path.join(inboxDir, item.file)
+                        if (fs.existsSync(fp)) preview = fs.readFileSync(fp, 'utf-8').substring(0, 200)
+                      } catch {}
+                    }
+                    results.push({
+                      source: 'inbox',
+                      match: item.original_name || item.file,
+                      preview: preview.substring(0, 120).replace(/\n/g, ' '),
+                      date: item.received_at,
+                    })
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+        }
+
+        // Search iMessage (macOS only)
+        if (searchType === 'all' || searchType === 'imessage') {
+          try {
+            const dbPath = path.join(os.homedir(), 'Library', 'Messages', 'chat.db')
+            if (fs.existsSync(dbPath)) {
+              const q = searchQuery.replace(/'/g, "''").replace(/[%_\\]/g, c => '\\' + c)
+              const safeLimit = Math.max(1, Math.min(parseInt(searchLimit, 10) || 10, 50))
+              const sql = `SELECT m.text, m.date/1000000000 + 978307200 as unix_ts, h.id as handle FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID WHERE m.text LIKE '%${q}%' ESCAPE '\\' ORDER BY m.date DESC LIMIT ${safeLimit}`
+              const output = execSync(`sqlite3 "${dbPath}"`, {
+                input: sql, timeout: 10000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+              })
+              for (const line of output.trim().split('\n')) {
+                if (!line) continue
+                const parts = line.split('|')
+                results.push({
+                  source: 'imessage',
+                  match: parts[2] || 'unknown',
+                  preview: (parts[0] || '').substring(0, 120).replace(/\n/g, ' '),
+                  date: parts[1] ? new Date(Number(parts[1]) * 1000).toISOString() : null,
+                })
+              }
+            }
+          } catch { /* not macOS or no access */ }
+        }
+
+        const limitedResults = results.slice(0, searchLimit)
+        console.log(`[hive-search] Found ${limitedResults.length} result(s) for "${searchQuery}"`)
+
+        clearInterval(progressInterval)
+        await this.cloud.submitResult(taskId, {
+          status: 'completed',
+          output: JSON.stringify(limitedResults),
+          duration_ms: Date.now() - startTime,
+        })
         return
       }
 
@@ -902,6 +1012,11 @@ class TaskExecutor {
         console.log(`[executor] Credential file cleaned up: ${credentialFilePath}`)
       }
       _cleanupRunning() // Remove from dedup tracking
+      // Clean up tmux session if this task used one
+      const runningEntry = this.runningTasks.get(taskId)
+      if (runningEntry?.tmux && runningEntry.sessionName) {
+        try { this.tmux.cleanup(runningEntry.sessionName) } catch {}
+      }
       this.runningTasks.delete(taskId)
 
       // ── Browser queue drain: run next queued browser task ──
@@ -1105,10 +1220,12 @@ class TaskExecutor {
           // Then symlink its node_modules into the workspace so Node's module
           // resolution (which walks up from the spec file's location) can find
           // @playwright/test without needing a per-task npm install.
+          const flPath = findFreelabelPath()
           const candidateHosts = [
             process.env.IRIS_PLAYWRIGHT_HOST,
-            path.resolve(os.homedir(), 'Sites/freelabel'),
-            path.resolve(os.homedir(), 'Sites/freelabel/iris-code'),
+            flPath,
+            flPath ? path.join(flPath, 'iris-code') : null,
+            path.join(os.homedir(), '.iris'),
           ].filter(Boolean)
           let hostDir = null
           for (const cand of candidateHosts) {
@@ -1960,10 +2077,17 @@ async function call(method, p, body) {
           const discoverSubcommand = discoverParts[0] // import-yt-feed
           const discoverExtraArgs = discoverParts.slice(1)
 
-          const discoverRoot = this.freelabelPath || findFreelabelPath()
+          // Try monorepo first, fall back to bridge (portable)
+          let discoverRoot = this.freelabelPath || findFreelabelPath()
           if (!discoverRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
-            return
+            const bridgeDir = path.join(os.homedir(), '.iris', 'bridge')
+            if (fs.existsSync(path.join(bridgeDir, 'som', 'yt-feed.js'))) {
+              discoverRoot = bridgeDir
+              console.log(`[executor] Using bridge discover scripts (no monorepo found)`)
+            } else {
+              reject(new Error('No discover scripts found. Run iris update to sync bridge files.'))
+              return
+            }
           }
 
           // Auto-inject local browser session for YouTube tasks
@@ -2719,19 +2843,98 @@ exit 1
       const basePath = process.env.PATH || '/usr/local/bin:/usr/bin:/bin'
       const spawnPath = [_node18BinDir, irisPath, basePath].filter(Boolean).join(':')
 
+      const spawnEnv = {
+        ...process.env,
+        ...loadProjectEnv(),
+        PATH: spawnPath,
+        TASK_ID: task.id,
+        TASK_TYPE: task.type,
+        WORKSPACE_DIR: workspace.dir,
+        PROJECT_DIR: workspace.projectDir,
+        ...(workspace.env || {}),
+        ...(task.config?.env_vars || {})
+      }
+
+      // Timeout config (shared by both paths)
+      const longRunningTypes = ['som_batch', 'enrich_batch', 'discover', 'som', 'inbox_scan']
+      const isLongRunning = longRunningTypes.includes(task.type)
+      const typeDefault = isLongRunning ? 3600 : 600
+      const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
+      const timeout = (explicit || typeDefault) * 1000
+      const timeoutLabel = timeout / 1000
+      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'comms_sync', 'custom_playwright']
+      const isGraceful = gracefulTypes.includes(task.type)
+
+      // ── tmux path: spawn inside a persistent tmux session ──
+      if (this.tmux.available) {
+        let tmuxSession
+        try {
+          tmuxSession = this.tmux.createForTask(task, cmd, args, spawnEnv, workspace.projectDir)
+        } catch (tmuxErr) {
+          console.error(`[executor] tmux session creation failed, falling back to direct spawn: ${tmuxErr.message}`)
+          // Fall through to direct spawn below
+        }
+
+        if (tmuxSession) {
+          const { sessionName, outputFile, exitFile, channel } = tmuxSession
+          this.runningTasks.set(task.id, { sessionName, tmux: true, _startedAt: Date.now(), _taskTitle: task.title || task.type, _taskType: task.type })
+
+          // Stream output from pipe-pane log file
+          let lastLineCount = 0
+          const outputPoll = setInterval(() => {
+            const { lines: newLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
+            if (newLines.length > 0) {
+              outputLines.push(...newLines)
+              newLines.forEach(line => {
+                if (line.trim()) console.log(`[task:${task.id.substring(0, 8)}] ${line}`)
+              })
+              lastLineCount = total
+            }
+          }, 500)
+
+          // Timeout
+          const timer = setTimeout(() => {
+            clearInterval(outputPoll)
+            this.tmux.cleanup(sessionName)
+            if (isGraceful) {
+              resolve({ exitCode: 124, timedOut: true })
+            } else {
+              reject(new Error(`Task timed out after ${timeoutLabel}s`))
+            }
+          }, timeout)
+
+          // Wait for command to finish via tmux wait-for channel
+          this.tmux.waitForCompletion(channel, exitFile, timeout + 5000)
+            .then(exitCode => {
+              clearTimeout(timer)
+              clearInterval(outputPoll)
+              // Final output read
+              const { lines: finalLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
+              if (finalLines.length > 0) outputLines.push(...finalLines)
+              if (exitCode === 0 || isGraceful) {
+                resolve({ exitCode })
+              } else {
+                reject(new Error(`Process exited with code ${exitCode}`))
+              }
+            })
+            .catch(err => {
+              clearTimeout(timer)
+              clearInterval(outputPoll)
+              if (isGraceful) {
+                resolve({ exitCode: 1 })
+              } else {
+                reject(err)
+              }
+            })
+
+          return // tmux path handled — skip direct spawn
+        }
+      }
+
+      // ── Direct spawn path (fallback when tmux unavailable) ──
       const child = spawn(cmd, args, {
         cwd: workspace.projectDir,
-        env: {
-          ...process.env,
-          ...loadProjectEnv(),
-          PATH: spawnPath,
-          TASK_ID: task.id,
-          TASK_TYPE: task.type,
-          WORKSPACE_DIR: workspace.dir,
-          PROJECT_DIR: workspace.projectDir,
-          ...(workspace.env || {}),
-          ...(task.config?.env_vars || {})
-        },
+        env: spawnEnv,
         stdio: ['pipe', 'pipe', 'pipe']
       })
 
@@ -2740,7 +2943,6 @@ exit 1
       child._taskType = task.type
       this.runningTasks.set(task.id, child)
 
-      // Stream stdout
       child.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
         outputLines.push(...lines)
@@ -2751,7 +2953,6 @@ exit 1
         })
       })
 
-      // Stream stderr
       child.stderr.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
@@ -2762,26 +2963,11 @@ exit 1
         })
       })
 
-      // Timeout — SOM/enrich tasks get 1 hour, others 10 minutes
-      // Note: API defaults timeout_seconds to 600 in DB, so we override for long-running types
-      const longRunningTypes = ['som_batch', 'enrich_batch', 'discover', 'som', 'inbox_scan']
-      const isLongRunning = longRunningTypes.includes(task.type)
-      const typeDefault = isLongRunning ? 3600 : 600
-      // Only honor task.timeout_seconds if it was explicitly set above the DB default (600)
-      const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
-      const timeout = (explicit || typeDefault) * 1000
-      const timeoutLabel = timeout / 1000
-      // custom_playwright: failures = test results, not crashes — preserve output
-      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'comms_sync', 'custom_playwright']
-      const isGraceful = gracefulTypes.includes(task.type)
-
       const timer = setTimeout(() => {
         child.kill('SIGTERM')
         setTimeout(() => {
           if (!child.killed) child.kill('SIGKILL')
         }, 5000)
-        // Browser tasks resolve even on timeout — partial work (scrape, DMs sent)
-        // is still valuable. Report exit code 124 so status shows the timeout.
         if (isGraceful) {
           resolve({ exitCode: 124, timedOut: true })
         } else {
@@ -2791,8 +2977,6 @@ exit 1
 
       child.on('close', (code) => {
         clearTimeout(timer)
-        // Browser tasks resolve even on non-zero exit — Playwright often exits
-        // non-zero for benign reasons (browser closed early, nav timeout, etc.)
         if (code === 0 || isGraceful) {
           resolve({ exitCode: code || 0 })
         } else {
@@ -2943,6 +3127,195 @@ exit 1
         reject(err)
       })
     })
+  }
+
+  /**
+   * Save an incoming hive_inbox message to ~/.iris/hive/inbox/
+   * Handles file downloads (streaming), text, and link types.
+   * Security: path traversal protection, streaming I/O, TTL checks.
+   */
+  async _saveToHiveInbox (task) {
+    const config = task.config || {}
+    const inboxType = config.inbox_type || 'text' // file | text | link
+    const senderName = config.sender_name || 'Unknown'
+    const msgText = (task.prompt || '').trim()
+
+    // TTL check — skip stale deliveries
+    if (config.expires_at) {
+      const expiresAt = new Date(config.expires_at).getTime()
+      if (!isNaN(expiresAt) && Date.now() > expiresAt) {
+        console.log(`[hive-inbox] Skipping expired delivery from ${senderName} (expired ${config.expires_at})`)
+        return
+      }
+    }
+
+    const inboxDir = path.join(os.homedir(), '.iris', 'hive', 'inbox')
+    fs.mkdirSync(inboxDir, { recursive: true })
+    const manifestPath = path.join(inboxDir, '.manifest.jsonl')
+
+    const now = new Date()
+    const timestamp = now.toISOString().replace(/[T:]/g, '-').replace(/\.\d+Z$/, '')
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+
+    let savedFile = ''
+    let sizeBytes = 0
+
+    if (inboxType === 'file' && config.file_url) {
+      // Path traversal protection: sanitize filename
+      const rawName = config.file_name || 'download'
+      const safeName = path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_')
+      const fileName = `${timestamp}_${safeName}`
+      const fullPath = path.join(inboxDir, fileName)
+
+      // Double-check resolved path is inside inbox dir
+      const resolvedPath = path.resolve(fullPath)
+      if (!resolvedPath.startsWith(path.resolve(inboxDir))) {
+        console.error(`[hive-inbox] Path traversal blocked: ${resolvedPath}`)
+        return
+      }
+
+      // Streaming download — no memory buffering
+      try {
+        console.log(`[hive-inbox] Downloading file from ${senderName}: ${safeName}`)
+        await new Promise((resolve, reject) => {
+          const url = new URL(config.file_url)
+          const client = url.protocol === 'https:' ? https : http
+          client.get(config.file_url, (response) => {
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+              // Follow one redirect
+              const redirectClient = response.headers.location.startsWith('https:') ? https : http
+              redirectClient.get(response.headers.location, (rr) => {
+                const writer = fs.createWriteStream(fullPath)
+                rr.pipe(writer)
+                writer.on('finish', () => {
+                  writer.close()
+                  resolve()
+                })
+                writer.on('error', reject)
+              }).on('error', reject)
+              return
+            }
+            if (response.statusCode !== 200) {
+              reject(new Error(`HTTP ${response.statusCode}`))
+              return
+            }
+            const writer = fs.createWriteStream(fullPath)
+            response.pipe(writer)
+            writer.on('finish', () => {
+              writer.close()
+              resolve()
+            })
+            writer.on('error', reject)
+          }).on('error', reject)
+        })
+
+        // Phase 2: Decrypt if encrypted
+        if (config.encrypted && config.encryption_iv) {
+          try {
+            const configPath = path.join(os.homedir(), '.iris', 'config.json')
+            const nodeConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+            const secret = nodeConfig.node_api_key || nodeConfig.api_key || ''
+            const key = crypto.createHash('sha256').update(secret).digest()
+            const iv = Buffer.from(config.encryption_iv, 'hex')
+            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv)
+
+            const encryptedData = fs.readFileSync(fullPath)
+            const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()])
+            fs.writeFileSync(fullPath, decrypted)
+            console.log(`[hive-inbox] Decrypted ${safeName} (${decrypted.length} bytes)`)
+          } catch (decryptErr) {
+            console.error(`[hive-inbox] Decryption failed for ${safeName}: ${decryptErr.message}`)
+            // Keep the encrypted file — better than losing data
+          }
+        }
+
+        const stat = fs.statSync(fullPath)
+        sizeBytes = stat.size
+        savedFile = fileName
+
+        // Phase 3: Strip macOS quarantine + set execute permissions for scripts
+        try { execSync(`xattr -d com.apple.quarantine "${fullPath}"`, { timeout: 3000, stdio: 'ignore' }) } catch { /* not macOS or no quarantine */ }
+        const executableExts = ['.sh', '.py', '.js', '.rb', '.pl', '.bash', '.zsh']
+        if (executableExts.some(ext => safeName.toLowerCase().endsWith(ext))) {
+          try { fs.chmodSync(fullPath, '755') } catch { /* ignore */ }
+        }
+
+        console.log(`[hive-inbox] Downloaded ${safeName} (${sizeBytes} bytes)`)
+      } catch (err) {
+        console.error(`[hive-inbox] Download failed for ${safeName}: ${err.message}`)
+        return
+      }
+    } else if (inboxType === 'link') {
+      const fileName = `${timestamp}_link.txt`
+      const fullPath = path.join(inboxDir, fileName)
+      const content = `${config.url || msgText}\n${msgText !== (config.url || '') ? '\n' + msgText : ''}`
+      fs.writeFileSync(fullPath, content.trim() + '\n')
+      sizeBytes = Buffer.byteLength(content, 'utf-8')
+      savedFile = fileName
+    } else {
+      // Text
+      const fileName = `${timestamp}_message.txt`
+      const fullPath = path.join(inboxDir, fileName)
+      fs.writeFileSync(fullPath, msgText + '\n')
+      sizeBytes = Buffer.byteLength(msgText, 'utf-8')
+      savedFile = fileName
+    }
+
+    // Append to JSONL manifest (atomic append — no read-modify-write)
+    // Phase 3: Store task_id for read receipts (sender can query task status)
+    const entry = {
+      id,
+      task_id: task.id || null,
+      file: savedFile,
+      type: inboxType,
+      from_node: senderName,
+      received_at: now.toISOString(),
+      size_bytes: sizeBytes,
+      read: false,
+      original_name: config.file_name || null,
+      message: msgText.substring(0, 500) || null,
+      url: config.url || null,
+    }
+    fs.appendFileSync(manifestPath, JSON.stringify(entry) + '\n')
+    console.log(`[hive-inbox] Saved ${inboxType} from ${senderName}: ${savedFile}`)
+
+    // Phase 4: Auto-prune old items (>14 days) — runs after every save
+    this._pruneHiveInbox(inboxDir, manifestPath)
+  }
+
+  /**
+   * Remove inbox items older than 14 days. Runs after every inbox save
+   * and on daemon startup (called from constructor or first task).
+   */
+  _pruneHiveInbox (inboxDir, manifestPath) {
+    try {
+      if (!fs.existsSync(manifestPath)) return
+      const raw = fs.readFileSync(manifestPath, 'utf-8').trim()
+      if (!raw) return
+      const lines = raw.split('\n')
+      const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000
+      const keep = []
+      let pruned = 0
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line)
+          if (new Date(item.received_at).getTime() < cutoff) {
+            // Delete file from disk
+            const filePath = path.join(inboxDir, item.file)
+            try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath) } catch {}
+            pruned++
+          } else {
+            keep.push(line)
+          }
+        } catch { keep.push(line) } // keep unparseable lines
+      }
+      if (pruned > 0) {
+        fs.writeFileSync(manifestPath, keep.join('\n') + (keep.length ? '\n' : ''))
+        console.log(`[hive-inbox] Pruned ${pruned} item(s) older than 14 days`)
+      }
+    } catch (err) {
+      console.warn(`[hive-inbox] Prune failed: ${err.message}`)
+    }
   }
 
   /**
@@ -3180,14 +3553,22 @@ exit 1
    * Kill all running tasks (used during shutdown).
    */
   killAll () {
-    for (const [taskId, child] of this.runningTasks) {
+    for (const [taskId, entry] of this.runningTasks) {
       console.log(`[executor] Killing task ${taskId}`)
-      child.kill('SIGTERM')
-      setTimeout(() => {
-        if (!child.killed) child.kill('SIGKILL')
-      }, 3000)
+      if (entry?.tmux && entry.sessionName) {
+        // tmux-managed task — kill the session
+        try { this.tmux.cleanup(entry.sessionName) } catch {}
+      } else if (entry?.kill) {
+        // Direct child process
+        entry.kill('SIGTERM')
+        setTimeout(() => {
+          if (!entry.killed) entry.kill('SIGKILL')
+        }, 3000)
+      }
     }
     this.runningTasks.clear()
+    // Clean up any remaining tmux sessions
+    try { this.tmux.cleanupAll() } catch {}
   }
 }
 

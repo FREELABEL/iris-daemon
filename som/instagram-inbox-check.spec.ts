@@ -8,7 +8,8 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 
-const TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+const TOKEN = process.env.HEYIRIS_TOKEN;
+if (!TOKEN) throw new Error('HEYIRIS_TOKEN env var required. Set in ~/.iris/bridge/.env or export it.');
 const BOARD_ID = parseInt(process.env.BOARD_ID || '38', 10);
 const LIMIT = parseInt(process.env.LIMIT || '30', 10);
 const IG_ACCOUNT = process.env.IG_ACCOUNT || 'heyiris.io';
@@ -19,8 +20,7 @@ const IG_AUTH_FILE = process.env.BROWSER_SESSION_FILE
   || path.join(__dirname, `instagram-auth-${IG_ACCOUNT}.json`);
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
 
-const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
-  'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
+const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL || '';
 
 test(`Instagram Inbox Reply Check — @${IG_ACCOUNT} / Board ${BOARD_ID}`, async ({ page, context }) => {
   // ── Load IG session ──
