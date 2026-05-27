@@ -675,12 +675,60 @@ class TaskExecutor {
         return
       }
 
+      // ── Exchange task: clone repo + create branch before execution ──
+      let exchangeRepoDir = null
+      if (task.type === 'exchange_task' && task.config?.repo_url) {
+        const repoUrl = task.config.repo_url
+        const branch = task.config.branch_name || `exchange/${taskId.substring(0, 8)}`
+        exchangeRepoDir = path.join(workspace.dir, 'repo')
+        console.log(`[exchange] Cloning ${repoUrl} → ${exchangeRepoDir} (branch: ${branch})`)
+        try {
+          execSync(`git clone --depth 50 "${repoUrl.replace(/"/g, '')}" "${exchangeRepoDir}"`, {
+            timeout: 120000, stdio: 'pipe',
+          })
+          execSync(`git checkout -b "${branch.replace(/"/g, '')}"`, {
+            cwd: exchangeRepoDir, timeout: 10000, stdio: 'pipe',
+          })
+          // Override workspace dir so iris-code runs inside the repo
+          workspace.dir = exchangeRepoDir
+          console.log(`[exchange] Repo ready on branch ${branch}`)
+        } catch (err) {
+          console.error(`[exchange] Git clone failed: ${err.message}`)
+          // Continue anyway — iris-code can still work without a repo
+        }
+      }
+
       // Delegate to runtime-specific executor if not iris_agent
       let result
       if (runtime !== 'iris_agent') {
         result = await this.runRuntimeProcess(task, runtime, workspace, outputLines)
       } else {
         result = await this.runProcess(task, workspace, outputLines)
+      }
+
+      // ── Exchange task: commit + push changes after execution ──
+      if (exchangeRepoDir && result.exitCode === 0) {
+        try {
+          const branch = task.config.branch_name || `exchange/${taskId.substring(0, 8)}`
+          const hasChanges = execSync('git status --porcelain', {
+            cwd: exchangeRepoDir, encoding: 'utf-8', timeout: 5000,
+          }).trim()
+          if (hasChanges) {
+            execSync(`git add -A && git commit -m "Exchange task: ${(task.title || '').replace(/"/g, "'").substring(0, 72)}"`, {
+              cwd: exchangeRepoDir, timeout: 30000, stdio: 'pipe',
+            })
+            execSync(`git push origin "${branch.replace(/"/g, '')}"`, {
+              cwd: exchangeRepoDir, timeout: 60000, stdio: 'pipe',
+            })
+            console.log(`[exchange] Changes committed + pushed to ${branch}`)
+            outputLines.push(`[exchange] Branch ${branch} pushed with changes`)
+          } else {
+            console.log('[exchange] No file changes to commit')
+          }
+        } catch (err) {
+          console.warn(`[exchange] Post-execution git failed: ${err.message}`)
+          outputLines.push(`[exchange] Warning: git push failed: ${err.message}`)
+        }
       }
 
       clearInterval(progressInterval)
@@ -1275,7 +1323,7 @@ class TaskExecutor {
           const extraArgs = (task.config && task.config.artisan_args) || []
 
           if (!this.flApiPath) {
-            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
+            reject(new Error('This task requires fl-api (Laravel). Set FL_API_PATH env var or freelabel_path in ~/.iris/config.json.'))
             return
           }
 
@@ -1561,7 +1609,7 @@ async function call(method, p, body) {
 
           const linkedinRoot = this.freelabelPath || findFreelabelPath()
           if (!linkedinRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1581,7 +1629,7 @@ async function call(method, p, body) {
 
           const emailRoot = this.freelabelPath || findFreelabelPath()
           if (!emailRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1635,7 +1683,7 @@ async function call(method, p, body) {
 
           const twitterRoot = this.freelabelPath || findFreelabelPath()
           if (!twitterRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1654,7 +1702,7 @@ async function call(method, p, body) {
 
           const threadsRoot = this.freelabelPath || findFreelabelPath()
           if (!threadsRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1773,7 +1821,7 @@ async function call(method, p, body) {
 
           const instaRoot = this.freelabelPath || findFreelabelPath()
           if (!instaRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1810,7 +1858,7 @@ async function call(method, p, body) {
             // Fallback: run enrichment via npm script that calls the API
             const enrichRoot = this.freelabelPath || findFreelabelPath()
             if (!enrichRoot) {
-              reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+              reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
               return
             }
             cmd = 'npm'
@@ -1831,7 +1879,7 @@ async function call(method, p, body) {
 
           const venueRoot = this.freelabelPath || findFreelabelPath()
           if (!venueRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1875,7 +1923,7 @@ async function call(method, p, body) {
 
           const scrapeRoot = this.freelabelPath || findFreelabelPath()
           if (!scrapeRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1898,7 +1946,7 @@ async function call(method, p, body) {
           const venueEnrichArgs = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
           const venueEnrichRoot = this.freelabelPath || findFreelabelPath()
           if (!venueEnrichRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -1992,7 +2040,7 @@ async function call(method, p, body) {
           const clipUrl = clipParams.find(p => p.startsWith('url='))?.split('=').slice(1).join('=') || ''
 
           if (!this.flApiPath) {
-            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
+            reject(new Error('This task requires fl-api (Laravel). Set FL_API_PATH env var or freelabel_path in ~/.iris/config.json.'))
             return
           }
 
@@ -2029,7 +2077,7 @@ async function call(method, p, body) {
 
           const scanRoot = this.freelabelPath || findFreelabelPath()
           if (!scanRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
@@ -2788,7 +2836,7 @@ exit 1
 
           const clipRoot = this.freelabelPath || findFreelabelPath()
           if (!clipRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
             return
           }
 
