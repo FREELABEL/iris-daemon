@@ -777,8 +777,9 @@ class TaskExecutor {
       }
 
       // Delegate to runtime-specific executor if not iris_agent
+      // hive_script always uses runProcess (it has its own node handler — don't route through bash)
       let result
-      if (runtime !== 'iris_agent') {
+      if (runtime !== 'iris_agent' && task.type !== 'hive_script') {
         result = await this.runRuntimeProcess(task, runtime, workspace, outputLines)
       } else {
         result = await this.runProcess(task, workspace, outputLines)
@@ -1511,9 +1512,9 @@ class TaskExecutor {
             args = ['playwright', 'test', somSpec, playwrightHeadedFlag(), '--timeout=600000'].filter(Boolean)
             // Campaign registry takes priority over task.config to prevent mismatches
             const somEnv = {
-              BOARD_ID: campaignConfig?.boardId || task.config?.boardId || '38',
-              STRATEGY: campaignConfig?.strategy || task.config?.strategy || 'AI Course | V3',
-              IG_ACCOUNT: campaignConfig?.igAccount || task.config?.igAccount || 'heyiris.io',
+              BOARD_ID: campaignConfig?.boardId || task.config?.boardId || '',
+              STRATEGY: campaignConfig?.strategy || task.config?.strategy || '',
+              IG_ACCOUNT: campaignConfig?.igAccount || task.config?.igAccount || '',
               LIMIT: String(somExtraArgs.find(a => a.startsWith('limit='))?.split('=')[1] || '15'),
               SOM_SOURCE: task.config?.chained_from ? 'chain' : (task.config?.scheduled ? 'schedule' : 'dispatch'),
               SOM_TASK_ID: task.id || '',
@@ -1575,19 +1576,29 @@ class TaskExecutor {
             })
           )
 
-          // Resolve token (env first, then ~/.iris/sdk/.env — same pattern as Remotion chain)
-          let lgToken = process.env.FL_API_TOKEN
+          // Resolve token: env → sdk/.env → IRIS_API_KEY → config.json node_api_key
+          let lgToken = process.env.FL_API_TOKEN || process.env.HEYIRIS_TOKEN
           if (!lgToken) {
             try {
               const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
               if (fs.existsSync(sdkEnv)) {
-                const m = fs.readFileSync(sdkEnv, 'utf-8').match(/^FL_API_TOKEN=(.+)$/m)
+                const raw = fs.readFileSync(sdkEnv, 'utf-8')
+                const m = raw.match(/^FL_API_TOKEN=(.+)$/m) || raw.match(/^IRIS_API_KEY=(.+)$/m)
                 if (m) lgToken = m[1].trim()
               }
             } catch { /* ignore */ }
           }
           if (!lgToken) {
-            reject(new Error('leadgen: no FL_API_TOKEN found (set env var or ~/.iris/sdk/.env)'))
+            try {
+              const configPath = path.join(os.homedir(), '.iris', 'config.json')
+              if (fs.existsSync(configPath)) {
+                const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+                lgToken = config.node_api_key || null
+              }
+            } catch { /* ignore */ }
+          }
+          if (!lgToken) {
+            reject(new Error('leadgen: no API token found. Set FL_API_TOKEN env var, IRIS_API_KEY in ~/.iris/sdk/.env, or run iris auth login'))
             return
           }
 
@@ -2960,6 +2971,86 @@ exit 1
           return
         }
 
+        case 'swarm': {
+          // Multi-agent swarm — director in pane 0 orchestrates workers in panes 1+
+          if (!this.tmux.available) {
+            reject(new Error('Swarm tasks require tmux — install with: brew install tmux'))
+            return
+          }
+
+          const roles = task.config?.roles || [
+            { name: 'researcher', prompt: task.prompt },
+            { name: 'writer', prompt: task.prompt },
+          ]
+          const model = task.config?.model || 'iris/gpt-4.1-nano'
+          const irisCmd = this.findIris()
+
+          // Build worker panes — each runs iris chat with a role-specific prompt
+          const workerRoles = roles.map((role, i) => {
+            const rolePrompt = role.prompt_override || `You are the ${role.name}. ${task.prompt}`
+            return {
+              name: role.name,
+              cmd: irisCmd,
+              args: ['chat', '--agent', String(role.agent_id || 11), rolePrompt],
+              env: { SWARM_ROLE: role.name },
+              cwd: workspace.projectDir
+            }
+          })
+
+          // Create swarm: pane 0 = director, panes 1+ = workers
+          const directorScript = path.join(__dirname, 'swarm-director.js')
+          const paneSpec = workerRoles.map((r, i) => `${i + 1}:${r.name}`).join(',')
+
+          // Director role (pane 0) — runs the orchestrator script
+          const directorRole = {
+            name: 'director',
+            cmd: 'node',
+            args: [
+              directorScript,
+              '--session', `iris-swarm-${task.id.substring(0, 8).replace(/[^a-zA-Z0-9]/g, '')}`,
+              '--goal', task.prompt,
+              '--panes', paneSpec,
+              '--model', model,
+              '--timeout', String(task.timeout_seconds || 600)
+            ],
+            env: {},
+            cwd: workspace.projectDir
+          }
+
+          const allRoles = [directorRole, ...workerRoles]
+          const swarm = this.tmux.createSwarm(task.id, allRoles)
+
+          // Track as tmux session
+          this.runningTasks.set(task.id, {
+            sessionName: swarm.sessionName,
+            tmux: true,
+            _startedAt: Date.now(),
+            _taskTitle: task.title || `Swarm: ${roles.map(r => r.name).join(', ')}`,
+            _taskType: task.type
+          })
+
+          // Wait for director (pane 0) to finish — it exits when goal is done or timeout
+          const directorPane = swarm.panes[0]
+          this.tmux.waitForCompletion(directorPane.channel, directorPane.exitFile, (task.timeout_seconds || 600) * 1000 + 10000)
+            .then(exitCode => {
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = exitCode
+              // Read director summary
+              const summaryFile = path.join(os.homedir(), '.iris', 'tmux-logs', `${swarm.sessionName}-summary.txt`)
+              let summary = ''
+              try { summary = fs.readFileSync(summaryFile, 'utf-8') } catch {}
+              outputLines.push(...summary.split('\n'))
+              resolve({ exitCode })
+            })
+            .catch(err => {
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = 1
+              resolve({ exitCode: 1 })
+            })
+
+          return // swarm handled — skip normal spawn path
+        }
+
         default:
           // Default: treat prompt as a shell command
           cmd = '/bin/bash'
@@ -3490,6 +3581,10 @@ exit 1
     if (stats.board) fields.push({ name: 'Board', value: `${stats.board}`, inline: true })
     if (stats.mode) fields.push({ name: 'Mode', value: stats.mode, inline: true })
     if (stats.videos) fields.push({ name: 'Videos', value: `${stats.videos}`, inline: true })
+    if (stats.sent != null) fields.push({ name: 'Sent', value: `${stats.sent}`, inline: true })
+    if (stats.skipped != null) fields.push({ name: 'Skipped', value: `${stats.skipped}`, inline: true })
+    if (stats.failed != null) fields.push({ name: 'Failed', value: `${stats.failed}`, inline: true })
+    if (stats.quota_used != null) fields.push({ name: 'Daily Quota', value: `${stats.quota_used}/${stats.quota_total}`, inline: true })
 
     // Top profiles / content preview
     let description = ''
@@ -3567,6 +3662,20 @@ exit 1
         username: match[1],
         comment: match[2].length > 60 ? match[2].substring(0, 57) + '...' : match[2]
       })
+    }
+
+    // SOM outreach stats: "Sent: 5" / "Skipped: 2" / "Failed: 1" / "DMs today: 12/40"
+    const sentMatch = output.match(/(?:✅|Sent:?)\s*(\d+)/i)
+    if (sentMatch) stats.sent = parseInt(sentMatch[1])
+    const skippedMatch = output.match(/(?:Skipped:?)\s*(\d+)/i)
+    if (skippedMatch) stats.skipped = parseInt(skippedMatch[1])
+    const failedMatch = output.match(/(?:Failed:?|✗)\s*(\d+)/i)
+    if (failedMatch) stats.failed = parseInt(failedMatch[1])
+    // Daily DM quota: "DMs today: 12/40" or "Daily cap: 12/40"
+    const quotaMatch = output.match(/(?:DMs today|Daily cap|Quota):?\s*(\d+)\s*\/\s*(\d+)/i)
+    if (quotaMatch) {
+      stats.quota_used = parseInt(quotaMatch[1])
+      stats.quota_total = parseInt(quotaMatch[2])
     }
 
     // General summary from the BATCH COMPLETE block

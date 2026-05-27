@@ -93,7 +93,7 @@ let embeddedDaemon = null
 function setEmbeddedDaemon (daemon) {
   embeddedDaemon = daemon
 }
-module.exports = { setEmbeddedDaemon }
+module.exports = { setEmbeddedDaemon, app }
 
 // ─── iMessage Channel (OpenClaw pattern) ────────────────────────
 
@@ -4049,7 +4049,7 @@ async function autoStartDaemon () {
 
     // Alias daemon routes at root level so frontend can call /files, /processes, etc.
     // without the /daemon prefix (which is only used in embedded mode)
-    const daemonPaths = ['/files', '/processes', '/capacity', '/profile', '/sessions', '/pause', '/resume', '/ingest']
+    const daemonPaths = ['/files', '/processes', '/capacity', '/profile', '/sessions', '/pause', '/resume', '/ingest', '/queue', '/health']
     app.use((req, res, next) => {
       if (embeddedDaemon && daemonPaths.some(p => req.path === p || req.path.startsWith(p + '/'))) {
         req.url = '/daemon' + req.url
