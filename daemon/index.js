@@ -81,6 +81,22 @@ class Daemon {
   async start () {
     console.log('[daemon] Starting...')
 
+    // Step 0: Clean up stale status from previous run
+    try {
+      if (fs.existsSync(STATUS_FILE)) {
+        const oldStatus = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'))
+        if (oldStatus.status === 'active' && oldStatus.pid) {
+          // Check if the old PID is still alive
+          try {
+            process.kill(oldStatus.pid, 0) // signal 0 = existence check
+            console.warn(`[daemon] Previous daemon (PID ${oldStatus.pid}) still running — will replace`)
+          } catch {
+            console.log(`[daemon] Cleaning up stale status (PID ${oldStatus.pid} is dead)`)
+          }
+        }
+      }
+    } catch { /* status file missing or corrupted — fine */ }
+
     // Step 0a: Verify tmux (required for session persistence)
     try {
       this.executor.tmux.verify()
@@ -102,6 +118,7 @@ class Daemon {
       this._tmuxCleanupInterval = setInterval(() => {
         this.executor.tmux.cleanupZombies()
         this.executor.tmux.rotateLogs()
+        this.executor.tmux._rotateLedger()
       }, 10 * 60 * 1000)
     }
 
@@ -123,9 +140,13 @@ class Daemon {
     console.log(`[daemon] API: ${this.config.apiUrl}`)
     console.log(`[daemon] Status: online | Active tasks: ${heartbeatResult.active_tasks}`)
     console.log(`[daemon] Max concurrent: ${process.env.MAX_CONCURRENT || 4}`)
+    console.log(`[daemon] PID: ${process.pid}`)
+
+    // Write status IMMEDIATELY after first heartbeat — don't wait for callback setup
+    this._userId = heartbeatResult.user_id || null
+    this._writeStatusFile()
 
     // Step 1b: Auto-bootstrap IRIS CLI if not installed
-    this._userId = heartbeatResult.user_id || null
     await this._bootstrapCLI()
 
     // Step 1c: Check for bridge daemon updates (non-blocking)
@@ -315,6 +336,7 @@ class Daemon {
       const status = {
         status: this.paused ? (this.pauseReason === 'battery' ? 'hibernating' : 'paused') : 'active',
         reason: this.pauseReason,
+        pid: process.pid,
         node_id: this.nodeId,
         node_name: this.nodeName,
         capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
@@ -448,6 +470,18 @@ class Daemon {
       } catch (err) {
         res.status(500).json({ error: err.message })
       }
+    })
+
+    app.get(`${prefix}/tmux/ledger`, (req, res) => {
+      if (!this.executor.tmux.available) {
+        return res.status(503).json({ error: 'tmux not available' })
+      }
+      const limit = parseInt(req.query.limit || '50', 10)
+      const filters = {}
+      if (req.query.source) filters.source = req.query.source
+      if (req.query.type) filters.type = req.query.type
+      if (req.query.status) filters.status = req.query.status
+      res.json({ entries: this.executor.tmux.readLedger(limit, filters) })
     })
 
     // Capacity — resource monitor snapshot (CPU, RAM, battery, level)
@@ -1677,6 +1711,9 @@ LIMIT ${limit}
         }
       }
 
+      // Tag source for tmux ledger tracking
+      task._source = 'pusher'
+
       // Execute (executor.runningTasks will track it from here)
       await this.executor.execute(task)
 
@@ -2011,6 +2048,7 @@ LIMIT ${limit}
       res.json({ task_id: taskId, status: 'accepted' })
 
       // Execute asynchronously, then push result back to originator's /ingest
+      task._source = 'mesh'
       try {
         const result = await this.executor.execute(task)
         this.meshDispatch.trackTask(taskId, 'completed', result)
@@ -2196,8 +2234,20 @@ LIMIT ${limit}
     // Stop tmux zombie cleanup interval
     if (this._tmuxCleanupInterval) clearInterval(this._tmuxCleanupInterval)
 
-    // Write final status
-    this._writeStatusFile()
+    // Write stopped status with PID for diagnostics
+    try {
+      const statusPath = STATUS_FILE
+      const dir = path.dirname(statusPath)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(statusPath, JSON.stringify({
+        status: 'stopped',
+        pid: process.pid,
+        node_id: this.nodeId,
+        node_name: this.nodeName,
+        stopped_at: new Date().toISOString(),
+        signal,
+      }, null, 2))
+    } catch { /* non-critical */ }
 
     // Mark node offline
     try {
