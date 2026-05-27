@@ -522,13 +522,23 @@ class TaskExecutor {
     if (isBrowserTask) this._browserRunning = true
 
     // Auto-install Playwright browsers on first browser task (idempotent — instant if already installed)
+    // Pin to exact version from package.json to prevent version drift across nodes
     if (isBrowserTask && !this._playwrightChecked) {
       try {
         const { execSync } = require('child_process')
-        execSync('npx playwright install chromium 2>/dev/null', { timeout: 120000, stdio: 'ignore' })
+        let pwVersion = ''
+        try {
+          const pkg = require(path.join(__dirname, '..', 'package.json'))
+          pwVersion = (pkg.dependencies?.['@playwright/test'] || pkg.devDependencies?.['@playwright/test'] || '').replace(/[\^~>=]/g, '')
+        } catch {}
+        const installCmd = pwVersion
+          ? `npx @playwright/test@${pwVersion} install chromium 2>/dev/null`
+          : 'npx playwright install chromium 2>/dev/null'
+        execSync(installCmd, { timeout: 120000, stdio: 'ignore' })
         this._playwrightChecked = true
+        if (pwVersion) console.log(`[executor] Playwright chromium installed (pinned to ${pwVersion})`)
       } catch {
-        console.log(`[executor] ⚠ Playwright browser install failed — task may fail if browsers missing`)
+        console.log(`[executor] Playwright browser install failed — task may fail if browsers missing`)
       }
     }
 
@@ -782,7 +792,10 @@ class TaskExecutor {
             cwd: exchangeRepoDir, encoding: 'utf-8', timeout: 5000,
           }).trim()
           if (hasChanges) {
-            execSync(`git add -A && git commit -m "Exchange task: ${(task.title || '').replace(/"/g, "'").substring(0, 72)}"`, {
+            const safeTitle = (task.title || 'untitled').replace(/[^\w\s.,!?()-]/g, '').substring(0, 72)
+            const commitMsg = `Exchange task: ${safeTitle}`
+            execSync('git add -A', { cwd: exchangeRepoDir, timeout: 10000, stdio: 'pipe' })
+            execSync(`git commit -m "${commitMsg}"`, {
               cwd: exchangeRepoDir, timeout: 30000, stdio: 'pipe',
             })
             execSync(`git push origin "${branch.replace(/"/g, '')}"`, {
@@ -1128,10 +1141,11 @@ class TaskExecutor {
         console.log(`[executor] Credential file cleaned up: ${credentialFilePath}`)
       }
       _cleanupRunning() // Remove from dedup tracking
-      // Clean up tmux session if this task used one
+      // Clean up tmux session if this task used one (with completion data for ledger)
       const runningEntry = this.runningTasks.get(taskId)
       if (runningEntry?.tmux && runningEntry.sessionName) {
-        try { this.tmux.cleanup(runningEntry.sessionName) } catch {}
+        const durationMs = runningEntry._startedAt ? Date.now() - runningEntry._startedAt : null
+        try { this.tmux.cleanup(runningEntry.sessionName, { exitCode: runningEntry._exitCode ?? null, durationMs }) } catch {}
       }
       this.runningTasks.delete(taskId)
 
@@ -3024,6 +3038,9 @@ exit 1
             .then(exitCode => {
               clearTimeout(timer)
               clearInterval(outputPoll)
+              // Store exit code for ledger (read in finally block)
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = exitCode
               // Final output read
               const { lines: finalLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
               if (finalLines.length > 0) outputLines.push(...finalLines)
@@ -3036,6 +3053,8 @@ exit 1
             .catch(err => {
               clearTimeout(timer)
               clearInterval(outputPoll)
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = 1
               if (isGraceful) {
                 resolve({ exitCode: 1 })
               } else {
