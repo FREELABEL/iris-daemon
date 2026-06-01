@@ -20,6 +20,7 @@ const scripts = pkg.scripts || {}
 // Add an entry here when a task type starts dispatching `npm run <script>`.
 const REQUIRED = [
   'discover:import-yt-feed', // daemon `discover` task — YouTube feed import
+  'som:all',                 // daemon `som_batch`/`som_swarm` task — outreach batch
 ]
 
 const failures = []

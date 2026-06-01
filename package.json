@@ -10,7 +10,9 @@
     "status": "curl -s http://localhost:3200/health",
     "test": "node --test tests/",
     "discover:import-yt-feed": "node som/yt-feed.js",
-    "discover:import-yt-feed:dry": "node som/yt-feed.js dry=1"
+    "discover:import-yt-feed:dry": "node som/yt-feed.js dry=1",
+    "som:all": "node som/som-all.js",
+    "som:run": "node som/som.js"
   },
   "dependencies": {
     "@playwright/test": "^1.60.0",
