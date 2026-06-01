@@ -2135,37 +2135,68 @@ async function call(method, p, body) {
         }
 
         case 'clip_cutter': {
-          // AI-scored clip cutter — runs artisan command on LOCAL Docker (has ffmpeg + assets)
-          // The artisan command queries the production DB for fresh discover content
-          // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1" or "threshold=80"
+          // Class A (portable / API-based) — NO local Laravel or Docker required (#117824).
+          // The prod fl-api worker has ffmpeg + the assets container, so we POST to
+          // /api/v1/clips/cut-scheduled with the user's token and let the server cut the
+          // clip. Same model as leadgen/comms_sync — runs on any client machine.
+          // prompt format: "[key=value ...]" e.g. "brand=discover dry=1 threshold=80 url=..."
           const clipParams = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
-          const clipBrand = clipParams.find(p => p.startsWith('brand='))?.split('=')[1] || 'discover'
-          const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
-          const clipThreshold = clipParams.find(p => p.startsWith('threshold='))?.split('=')[1] || '70'
-          const clipUrl = clipParams.find(p => p.startsWith('url='))?.split('=').slice(1).join('=') || ''
+          const clipGet = (k) => clipParams.find(p => p.startsWith(k + '='))?.split('=').slice(1).join('=')
+          const clipBrand = clipGet('brand') || 'discover'
+          const clipDry = clipGet('dry') === '1'
+          const clipThreshold = clipGet('threshold') || '70'
+          const clipUrl = clipGet('url') || ''
 
-          if (!this.flApiPath) {
-            reject(new Error('This task requires fl-api (Laravel). Set FL_API_PATH env var or freelabel_path in ~/.iris/config.json.'))
+          // Resolve token: env → ~/.iris/sdk/.env (FL_API_TOKEN|IRIS_API_KEY) → config.json node_api_key
+          let clipToken = process.env.FL_API_TOKEN || process.env.HEYIRIS_TOKEN
+          if (!clipToken) {
+            try {
+              const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
+              if (fs.existsSync(sdkEnv)) {
+                const raw = fs.readFileSync(sdkEnv, 'utf-8')
+                const m = raw.match(/^FL_API_TOKEN=(.+)$/m) || raw.match(/^IRIS_API_KEY=(.+)$/m)
+                if (m) clipToken = m[1].trim()
+              }
+            } catch { /* ignore */ }
+          }
+          if (!clipToken) {
+            try {
+              const configPath = path.join(os.homedir(), '.iris', 'config.json')
+              if (fs.existsSync(configPath)) clipToken = JSON.parse(fs.readFileSync(configPath, 'utf-8')).node_api_key || null
+            } catch { /* ignore */ }
+          }
+          if (!clipToken) {
+            reject(new Error('clip_cutter: no API token found. Set FL_API_TOKEN env var, IRIS_API_KEY in ~/.iris/sdk/.env, or run iris auth login'))
             return
           }
 
-          // Re-check Docker on every run (container may have stopped since last check)
-          this.dockerMode = isDockerMode()
+          const clipApiBase = process.env.FL_API_URL || 'https://raichu.heyiris.io'
+          const clipBody = { brand: clipBrand, threshold: Number(clipThreshold), dry_run: clipDry }
+          if (clipUrl) clipBody.url = clipUrl
 
-          if (!this.dockerMode) {
-            // No Docker = no ffmpeg/assets container = clip_cutter can't run
-            reject(new Error('clip_cutter requires Docker (api container with ffmpeg). Docker is not running.'))
-            return
-          }
+          const clipScript = `
+const TOKEN = ${JSON.stringify(clipToken)};
+const API = ${JSON.stringify(clipApiBase)};
+const BODY = ${JSON.stringify(clipBody)};
 
-          const clipArtisanArgs = ['clips:cut-scheduled', `--brand=${clipBrand}`, `--threshold=${clipThreshold}`]
-          if (clipDry) clipArtisanArgs.push('--dry-run')
-          if (clipUrl) clipArtisanArgs.push(`--url=${clipUrl}`)
-
-          const dockerRoot = path.resolve(this.flApiPath, '..')
-          cmd = 'docker'
-          args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
-          workspace.projectDir = dockerRoot
+(async () => {
+  const res = await fetch(API + '/api/v1/clips/cut-scheduled', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(BODY)
+  });
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) { console.error('[clip_cutter] HTTP ' + res.status + ': ' + text.slice(0, 300)); process.exit(1); }
+  if (json.job_id) console.log('[clip_cutter] dispatched clip job #' + json.job_id + (json.video_title ? ' — ' + json.video_title : '') + (json.virality_score ? ' (' + json.virality_score + '%)' : ''));
+  else if (json.message) console.log('[clip_cutter] ' + json.message);
+  console.log(JSON.stringify(json, null, 2));
+})().catch(err => { console.error('[clip_cutter] ERROR: ' + err.message); process.exit(1); });
+`
+          const clipScriptPath = path.join(workspace.dir, 'clip-cutter-task.js')
+          fs.writeFileSync(clipScriptPath, clipScript, 'utf-8')
+          cmd = 'node'
+          args = [clipScriptPath]
           break
         }
 
