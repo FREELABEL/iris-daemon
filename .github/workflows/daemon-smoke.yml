@@ -1,0 +1,29 @@
+name: Daemon Smoke (fresh-install gate)
+
+# Catches the class of bug that only shows up on a real client machine:
+# a missing/renamed file, a broken require, or a syntax error that crashes the
+# daemon on startup. Runs in a clean runner = a fresh client's environment.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install production deps (exactly as a client clone does)
+        run: npm install --production
+
+      - name: Syntax-check every daemon JS file
+        run: find daemon -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Verify every relative require resolves (catches missing-file crashes like #117200)
+        run: node test/check-requires.js
