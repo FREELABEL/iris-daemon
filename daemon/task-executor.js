@@ -26,7 +26,15 @@ const os = require('os')
 const https = require('https')
 const http = require('http')
 const crypto = require('crypto')
-const { TmuxManager } = require('./tmux-manager')
+// Defensive load: tmux is an OPTIONAL accelerator. A missing/broken tmux-manager
+// module must NEVER take down the whole daemon — degrade to direct spawn instead.
+// (This is the hardening for #117200, where the module was absent on clients.)
+let TmuxManager = null
+try {
+  ({ TmuxManager } = require('./tmux-manager'))
+} catch (err) {
+  console.warn(`[daemon] tmux-manager unavailable — Hive tasks will run via direct spawn (no tmux): ${err.message}`)
+}
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -361,7 +369,11 @@ class TaskExecutor {
     this._browserQueue = []   // queued browser tasks waiting for their turn
     this._browserRunning = false // true when a browser task is executing
     this._executedTaskIds = new Map() // taskId -> timestamp (prevents re-execution from duplicate Pusher events)
-    this.tmux = new TmuxManager()
+    // If the tmux module failed to load, use a null-object so every `this.tmux.available`
+    // gate falls through to direct spawn and cleanup calls are safe no-ops.
+    this.tmux = TmuxManager
+      ? new TmuxManager()
+      : { available: false, cleanup () {}, cleanupAll () {} }
     const verbose = process.env.DAEMON_VERBOSE || process.env.FL_API_PATH || process.env.FREELABEL_PATH
     if (this.flApiPath) {
       if (verbose) console.log(`[executor] fl-api path: ${this.flApiPath}`)
