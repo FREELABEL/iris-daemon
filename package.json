@@ -8,7 +8,9 @@
     "dev": "node index.js",
     "daemon": "node daemon.js",
     "status": "curl -s http://localhost:3200/health",
-    "test": "node --test tests/"
+    "test": "node --test tests/",
+    "discover:import-yt-feed": "node som/yt-feed.js",
+    "discover:import-yt-feed:dry": "node som/yt-feed.js dry=1"
   },
   "dependencies": {
     "@playwright/test": "^1.60.0",

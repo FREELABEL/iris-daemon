@@ -27,3 +27,6 @@ jobs:
 
       - name: Verify every relative require resolves (catches missing-file crashes like #117200)
         run: node test/check-requires.js
+
+      - name: Verify npm-script-backed tasks are shippable (catches missing discover/som scripts)
+        run: node test/check-task-scripts.js
