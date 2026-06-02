@@ -3527,6 +3527,37 @@ function resolvePath (p) {
 }
 
 /**
+ * Make allowedRoots portable (#119999).
+ *
+ * The shipped .bridge-config.json may carry a dev-specific path
+ * (e.g. ~/Sites/freelabel/fl-docker-dev/) that does not exist on a client
+ * machine — leaving the file bridge with no usable root and silently broken.
+ * Keep only configured roots that actually exist; if none do, fall back to a
+ * real directory derived from the environment (project path → cwd → home).
+ */
+function normalizeAllowedRoots () {
+  const fsCfg = bridgeConfig.fileSystem
+  if (!fsCfg || !fsCfg.enabled) return
+  const configured = (fsCfg.allowedRoots || [])
+  const existing = configured.filter((r) => {
+    try { const rp = resolvePath(r); return rp && fs.existsSync(rp) } catch { return false }
+  })
+  if (existing.length > 0) {
+    fsCfg.allowedRoots = existing
+    return
+  }
+  const fallback = [
+    process.env.FREELABEL_PATH,
+    process.env.IRIS_PROJECT_ROOT,
+    process.cwd(),
+    process.env.HOME
+  ].find((p) => { try { return p && fs.existsSync(resolvePath(p)) } catch { return false } })
+  fsCfg.allowedRoots = fallback ? [fallback] : []
+  console.log('[fs-bridge] allowedRoots had no existing paths; defaulting to', fsCfg.allowedRoots)
+}
+normalizeAllowedRoots()
+
+/**
  * Check if a path is within allowed roots
  */
 function isPathAllowed (resolvedPath) {
