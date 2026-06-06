@@ -180,16 +180,16 @@ class NativeIMessageDriver extends EventEmitter {
         c.display_name           AS group_name,
         c.room_name              AS room_name,
         c.chat_identifier        AS chat_identifier,
+        hex(m.attributedBody)    AS body_hex,
         (SELECT COUNT(*) FROM chat_handle_join chj WHERE chj.chat_id = c.ROWID) AS participant_count
       FROM message m
       INNER JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
       INNER JOIN chat c ON c.ROWID = cmj.chat_id
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       WHERE m.ROWID > ${this.lastMessageRowId}
-        AND m.is_from_me = 0
         AND m.item_type = 0
         AND m.is_empty = 0
-        AND m.text IS NOT NULL
+        AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
       ORDER BY m.ROWID ASC
       LIMIT 100`
 
@@ -245,6 +245,30 @@ class NativeIMessageDriver extends EventEmitter {
   /**
    * Normalize a chat.db row to our standard message format
    */
+  /**
+   * Parse NSAttributedString hex blob to extract plain text.
+   * Modern macOS stores message content in attributedBody instead of text.
+   */
+  _parseAttributedBody(hexStr) {
+    if (!hexStr) return ''
+    try {
+      const buf = Buffer.from(hexStr, 'hex')
+      const text = buf.toString('utf-8', 0, buf.length)
+      const markerIdx = text.indexOf('NSString')
+      if (markerIdx === -1) return ''
+      const afterMarker = buf.indexOf(0x2b, markerIdx + 8)
+      if (afterMarker === -1) return ''
+      const strLen = buf[afterMarker + 1]
+      if (!strLen) return ''
+      const start = afterMarker + 2
+      const end = start + strLen
+      if (end > buf.length) return ''
+      return buf.subarray(start, end).toString('utf-8').replace(/[\x00-\x08\x0e-\x1f\x80-\xff]/g, '').trim()
+    } catch {
+      return ''
+    }
+  }
+
   normalizeMessage(row, attachments = []) {
     const isGroup = row.participant_count > 1 ||
       (row.room_name && row.room_name.length > 0)
@@ -259,12 +283,18 @@ class NativeIMessageDriver extends EventEmitter {
       })
     }
 
+    // Prefer text column, fall back to parsing attributedBody
+    let msgText = row.text || ''
+    if (!msgText && row.body_hex) {
+      msgText = this._parseAttributedBody(row.body_hex)
+    }
+
     return {
       chatGuid,
       messageId: row.message_guid,
       sender: row.sender_address || 'unknown',
       senderName: row.sender_address || 'unknown',
-      text: row.text || '',
+      text: msgText,
       attachments: attachments.map(a => ({
         guid: a.guid,
         name: a.transfer_name || path.basename(a.filename || ''),
@@ -275,7 +305,7 @@ class NativeIMessageDriver extends EventEmitter {
       timestamp: macDateToUnixMs(row.mac_date),
       isGroup,
       groupName: isGroup ? (row.group_name || row.room_name || 'Group Chat') : null,
-      isFromMe: false,
+      isFromMe: !!row.is_from_me,
       hasAttachments: attachments.length > 0
     }
   }
@@ -410,6 +440,47 @@ class NativeIMessageDriver extends EventEmitter {
     }
 
     return { ok: true }
+  }
+
+  /**
+   * Query recent messages in a chat for conversation context.
+   * Returns rows with: text, sender_address, is_from_me, mac_date
+   *
+   * @param {string} chatGuid - The chat GUID to query
+   * @param {number} limit - Max messages to return (default 10)
+   * @param {number|null} sinceMins - Only return messages from last N minutes (null = no limit)
+   */
+  async queryMessages(chatGuid, limit = 10, sinceMins = null) {
+    const escapedGuid = chatGuid.replace(/'/g, "''")
+    let timeFilter = ''
+    if (sinceMins) {
+      // Convert minutes to macOS Core Data timestamp (nanoseconds since 2001-01-01)
+      const cutoffUnixMs = Date.now() - (sinceMins * 60 * 1000)
+      const cutoffMacNs = (cutoffUnixMs - 978307200000) * 1000000
+      timeFilter = `AND m.date > ${cutoffMacNs}`
+    }
+
+    const sql = `
+      SELECT
+        m.text            AS text,
+        m.is_from_me      AS is_from_me,
+        m.date            AS mac_date,
+        h.id              AS sender_address,
+        hex(m.attributedBody) AS body_hex
+      FROM message m
+      INNER JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      INNER JOIN chat c ON c.ROWID = cmj.chat_id
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      WHERE c.guid = '${escapedGuid}'
+        AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+        AND m.is_empty = 0
+        ${timeFilter}
+      ORDER BY m.ROWID DESC
+      LIMIT ${limit}`
+
+    const rows = await this._runSqlite3(sql)
+    // Return in chronological order (oldest first)
+    return rows.reverse()
   }
 
   /**
