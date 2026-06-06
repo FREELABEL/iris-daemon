@@ -3,3 +3,15 @@ node_modules/
 daemon-data/
 *.log
 .DS_Store
+
+# Secrets / auth (never commit)
+youtube-auth.json
+som/youtube-auth.json
+instagram-auth-*.json
+
+# Local runtime state
+native-imessage-state.json
+
+# Test artifacts
+test-results/
+som/test-results/
