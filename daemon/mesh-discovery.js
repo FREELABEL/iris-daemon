@@ -36,15 +36,34 @@ class MeshDiscovery extends EventEmitter {
     this._running = true
 
     // Advertise this node
-    this.service = this.bonjour.publish({
-      name: this.nodeName,
-      type: 'iris-hive',
-      port: this.port,
-      txt: {
-        node_id: this.nodeId || '',
-        version: '1'
+    try {
+      this.service = this.bonjour.publish({
+        name: this.nodeName,
+        type: 'iris-hive',
+        port: this.port,
+        txt: {
+          node_id: this.nodeId || '',
+          version: '1'
+        }
+      })
+
+      // Handle the "name already in use" error that fires asynchronously
+      if (this.service) {
+        this.service.on('error', (err) => {
+          if (err && /already in use/i.test(err.message || String(err))) {
+            console.log(`[mesh-discovery] Service name "${this.nodeName}" already advertised on network — skipping`)
+          } else {
+            console.error('[mesh-discovery] Service error:', err)
+          }
+        })
       }
-    })
+    } catch (err) {
+      if (/already in use/i.test(err.message || String(err))) {
+        console.log(`[mesh-discovery] Service name "${this.nodeName}" already advertised on network — skipping`)
+      } else {
+        throw err
+      }
+    }
     console.log(`[mesh-discovery] Advertising as "${this.nodeName}" on port ${this.port}`)
 
     // Browse for peers

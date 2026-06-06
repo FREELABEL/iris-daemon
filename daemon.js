@@ -481,6 +481,11 @@ function startDaemon () {
       if (bridge && typeof bridge.setEmbeddedDaemon === 'function') {
         bridge.setEmbeddedDaemon(daemon)
       }
+      // Mount daemon routes on the bridge's express app so they're accessible
+      // on port 3200 (the daemon's standalone server can't bind that port)
+      if (bridge && bridge.app) {
+        daemon.externalApp = bridge.app
+      }
     } catch { /* bridge not available — daemon-only mode */ }
 
     // ─── IPC Server: Handle commands from CLI ─────────────────
@@ -513,48 +518,78 @@ function startDaemon () {
     process.on('SIGINT', () => cleanup('SIGINT'))
     process.on('SIGTERM', () => cleanup('SIGTERM'))
 
-    daemon.start().catch((err) => {
-      const errMsg = err.message || String(err)
-      console.error('Daemon cloud auth failed:', errMsg)
-      console.error('[daemon] Running in OFFLINE mode — local schedules and HTTP server still active')
-      console.error('[daemon] Cloud tasks will not be dispatched until auth is fixed')
-      console.error('[daemon] Retry: iris bridge restart')
+    // Retry cloud auth with exponential backoff so a transient DNS/network
+    // failure can't permanently take the node offline. Previously start()
+    // gave up after a single failure — a momentary `getaddrinfo ENOTFOUND`
+    // would silently kill all scheduled jobs (the daemon process kept running
+    // its local loop, so it *looked* healthy) until a manual `iris bridge
+    // restart`. Now it keeps retrying until cloud auth succeeds.
+    const startDaemonWithRetry = async () => {
+      let attempt = 0
+      const BASE_DELAY_MS = 5000
+      const MAX_DELAY_MS = 300000 // cap backoff at 5 min
 
-      // Persist failure to status.json so iris bridge status can show it
-      try {
-        const statusPath = path.join(os.homedir(), '.iris', 'status.json')
-        const statusDir = path.dirname(statusPath)
-        if (!fs.existsSync(statusDir)) fs.mkdirSync(statusDir, { recursive: true })
-        fs.writeFileSync(statusPath, JSON.stringify({
-          status: 'offline',
-          error: errMsg,
-          node_id: null,
-          node_name: os.hostname(),
-          heartbeat: { state: 'failed', fail_count: 1 },
-          running_tasks: 0,
-          uptime_s: Math.floor(process.uptime()),
-          last_updated: new Date().toISOString()
-        }, null, 2))
-      } catch { /* non-critical */ }
-
-      // Log to disk (LaunchAgent stderr may not be visible)
-      try {
-        const logDir = path.join(os.homedir(), '.iris', 'logs')
-        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true })
-        fs.appendFileSync(path.join(logDir, 'daemon-error.log'),
-          `[${new Date().toISOString()}] Cloud auth failed: ${errMsg}\n`)
-      } catch { /* non-critical */ }
-
-      // macOS notification so user sees it even without terminal
-      if (process.platform === 'darwin') {
+      while (true) {
         try {
-          require('child_process').execSync(
-            `osascript -e 'display notification "Cloud auth failed: ${errMsg.replace(/'/g, "'\\''").substring(0, 100)}" with title "IRIS Daemon" subtitle "Running in offline mode"'`,
-            { stdio: 'ignore', timeout: 5000 }
-          )
-        } catch { /* non-critical */ }
+          await daemon.start()
+          if (attempt > 0) {
+            console.log(`[daemon] Cloud auth recovered after ${attempt} ${attempt === 1 ? 'retry' : 'retries'} — node back online`)
+          }
+          return // success — heartbeat loop now owns connection health
+        } catch (err) {
+          attempt++
+          const errMsg = err.message || String(err)
+          const delayMs = Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS)
+          const delayS = Math.round(delayMs / 1000)
+
+          console.error(`[daemon] Cloud auth failed (attempt ${attempt}): ${errMsg}`)
+          console.error('[daemon] Local schedules and HTTP server still active')
+          console.error(`[daemon] Retrying cloud auth automatically in ${delayS}s...`)
+
+          // Persist failure to status.json so `iris bridge status` can show it
+          try {
+            const statusPath = path.join(os.homedir(), '.iris', 'status.json')
+            const statusDir = path.dirname(statusPath)
+            if (!fs.existsSync(statusDir)) fs.mkdirSync(statusDir, { recursive: true })
+            fs.writeFileSync(statusPath, JSON.stringify({
+              status: 'offline',
+              error: errMsg,
+              node_id: null,
+              node_name: os.hostname(),
+              heartbeat: { state: 'failed', fail_count: attempt },
+              retrying: true,
+              next_retry_s: delayS,
+              running_tasks: 0,
+              uptime_s: Math.floor(process.uptime()),
+              last_updated: new Date().toISOString()
+            }, null, 2))
+          } catch { /* non-critical */ }
+
+          // Log to disk (LaunchAgent stderr may not be visible)
+          try {
+            const logDir = path.join(os.homedir(), '.iris', 'logs')
+            if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true })
+            fs.appendFileSync(path.join(logDir, 'daemon-error.log'),
+              `[${new Date().toISOString()}] Cloud auth failed (attempt ${attempt}, retry in ${delayS}s): ${errMsg}\n`)
+          } catch { /* non-critical */ }
+
+          // macOS notification only on the FIRST failure — avoid spamming a
+          // notification on every backoff tick during an extended outage.
+          if (attempt === 1 && process.platform === 'darwin') {
+            try {
+              require('child_process').execSync(
+                `osascript -e 'display notification "Cloud auth failed: ${errMsg.replace(/'/g, "'\\''").substring(0, 100)}" with title "IRIS Daemon" subtitle "Retrying automatically..."'`,
+                { stdio: 'ignore', timeout: 5000 }
+              )
+            } catch { /* non-critical */ }
+          }
+
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+        }
       }
-    })
+    }
+
+    startDaemonWithRetry()
   })
 
   // ─── Handle IPC messages from CLI commands ──────────────────

@@ -61,6 +61,18 @@ class WorkspaceManager {
       this._walkDir(outputDir, outputDir, files, 20)
     }
 
+    // Collect Playwright test-results (videos, screenshots)
+    const testResultsDir = path.join(dir, 'test-results')
+    if (fs.existsSync(testResultsDir)) {
+      this._walkDir(testResultsDir, testResultsDir, files, 20)
+    }
+
+    // Collect from test-videos directory
+    const videoDir = path.join(dir, 'test-videos')
+    if (fs.existsSync(videoDir)) {
+      this._walkDir(videoDir, videoDir, files, 10)
+    }
+
     return files
   }
 

@@ -360,6 +360,20 @@ class TaskExecutor {
   // This prevents 5 Chromium windows opening simultaneously when schedules cluster.
   static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover']
 
+  // comms_sync auto-retries once on "instant death" (Bun spawn crash). Default
+  // OFF — a failed comms_sync just fails instead of retrying. Flip on with the
+  // env var IRIS_COMMS_SYNC_RETRY=1 (no code change needed), then restart daemon.
+  static COMMS_SYNC_RETRY = process.env.IRIS_COMMS_SYNC_RETRY === '1'
+
+  // Hard ceiling for browser (Playwright/Chromium) tasks. A hung browser task
+  // must NEVER hold the single browser slot for the full long-running default
+  // (3600s/60m) — that starves discover/inbox_scan/som_batch queued behind it
+  // (observed: a wedged som_batch held the slot ~40m). Cap browser-task timeouts
+  // at 30m (above any legit run: discover ~15m, inbox_scan ~15m, som_batch ~20m)
+  // so the existing timeout path (tmux kill-session → reap Chromium → free slot)
+  // fires in time. Override with IRIS_BROWSER_HARD_CEILING_S.
+  static BROWSER_HARD_CEILING_MS = (parseInt(process.env.IRIS_BROWSER_HARD_CEILING_S || '1800', 10) || 1800) * 1000
+
   constructor (cloudClient, workspaceManager) {
     this.cloud = cloudClient
     this.workspaces = workspaceManager
@@ -469,7 +483,7 @@ class TaskExecutor {
 
     // ── Dedup: reject if same task type is already running ──
     // Prevents duplicate som_batch / discover when scheduler fires faster than execution
-    const singletonTypes = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter', 'venue_enrich']
+    const singletonTypes = ['som_batch', 'som_swarm', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter', 'venue_enrich']
     if (singletonTypes.includes(task.type)) {
       // Count others of same type (exclude self — we just pushed above)
       const runningOfSameType = this._runningTasks.filter(t => t.type === task.type && t.id !== taskId)
@@ -829,8 +843,9 @@ class TaskExecutor {
 
       // ── Retry comms_sync on instant death (exit code null = signal kill) ──
       // Bun-compiled iris binary sometimes crashes on concurrent spawn (tempfile race).
-      // One retry after 3s delay typically succeeds.
-      if (task.type === 'comms_sync' && result.exitCode === null && (Date.now() - startTime) < 5000) {
+      // One retry after 3s delay typically succeeds. Gated by IRIS_COMMS_SYNC_RETRY
+      // (default OFF) — when disabled, an instant death just fails like any other.
+      if (TaskExecutor.COMMS_SYNC_RETRY && task.type === 'comms_sync' && result.exitCode === null && (Date.now() - startTime) < 5000) {
         console.log(`[executor] comms_sync: instant death (exit null, ${Date.now() - startTime}ms) — retrying in 3s`)
         await new Promise(r => setTimeout(r, 3000))
         const retryLines = []
@@ -1291,6 +1306,16 @@ class TaskExecutor {
           break
 
         case 'comms_sync': {
+          // DISABLED on this node: comms_sync (Pulse WhatsApp/iMessage/Gmail ingest)
+          // was being dispatched repeatedly by fl-api pulse:tick and kept launching
+          // WhatsApp Web over and over. Skip unless explicitly re-enabled with
+          // IRIS_COMMS_SYNC_ENABLED=1. (Source dispatch is also disabled in
+          // fl-api RunDueRequirements Phase 3.)
+          if (process.env.IRIS_COMMS_SYNC_ENABLED !== '1') {
+            console.log(`[executor] comms_sync DISABLED — skipping ${task.id?.substring(0, 8)} (set IRIS_COMMS_SYNC_ENABLED=1 to re-enable)`)
+            resolve({ success: true, skipped: true, output: 'comms_sync disabled on this node' })
+            return
+          }
           // Pulse-dispatched silent comms sync. Server queues these every 15 min
           // for users with stale lead_comms; bridge picks up and runs the iris
           // CLI sync-comms command which fetches iMessage/Mail/Gmail and POSTs
@@ -2134,6 +2159,104 @@ async function call(method, p, body) {
           break
         }
 
+        case 'som_swarm': {
+          // Parallel SOM — one tmux pane per campaign, director in pane 0
+          // Each campaign uses a different IG account, so they CAN run in parallel
+          // Director monitors for errors, blocked accounts, and coordinates reply handling
+          if (!this.tmux.available) {
+            reject(new Error('som_swarm requires tmux — falling back to som_batch'))
+            return
+          }
+
+          const swarmRoot = this.freelabelPath || findFreelabelPath()
+          const swarmBundledSomDir = path.join(__dirname, '..', 'som')
+          if (!swarmRoot && !fs.existsSync(path.join(swarmBundledSomDir, 'som.js'))) {
+            reject(new Error('Freelabel root or bundled SOM not found'))
+            return
+          }
+
+          const somDir = swarmRoot ? path.join(swarmRoot, 'tests', 'e2e') : swarmBundledSomDir
+          const somScript = path.join(somDir, 'som.js')
+
+          // Parse args from prompt
+          const swarmArgs = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
+          const limitArg = swarmArgs.find(a => a.startsWith('limit=')) || 'limit=15'
+          const dryArg = swarmArgs.find(a => a.startsWith('dry=')) || ''
+          const passThrough = [limitArg, dryArg].filter(Boolean)
+
+          // Get active campaigns
+          const { activeAccounts } = await getCampaignConfigs(swarmRoot || swarmBundledSomDir)
+          const activeCampaigns = activeAccounts.filter(c => c.active !== false)
+
+          if (activeCampaigns.length === 0) {
+            resolve({ skipped: true, reason: 'no_active_campaigns' })
+            return
+          }
+
+          console.log(`[executor] SOM Swarm: ${activeCampaigns.length} active campaigns → parallel panes`)
+
+          // Build worker roles — one pane per campaign
+          const workerRoles = activeCampaigns.map(campaign => ({
+            name: campaign.id || campaign.label || 'campaign',
+            cmd: 'node',
+            args: [somScript, campaign.id, ...passThrough],
+            env: {},
+            cwd: somDir
+          }))
+
+          // Director pane
+          const directorScript = path.join(__dirname, 'swarm-director.js')
+          const paneSpec = workerRoles.map((r, i) => `${i + 1}:${r.name}`).join(',')
+          const model = task.config?.model || 'iris/gpt-4.1-nano'
+
+          const directorRole = {
+            name: 'director',
+            cmd: 'node',
+            args: [
+              directorScript,
+              '--session', `iris-swarm-${task.id.substring(0, 8).replace(/[^a-zA-Z0-9]/g, '')}`,
+              '--goal', `Monitor ${activeCampaigns.length} SOM outreach campaigns running in parallel. Each campaign uses a different IG account so they can run simultaneously. Watch for: (1) login failures or blocked accounts — if a worker shows "blocked" or "login failed", SEND it C-c to stop, (2) rate limiting — if you see "429" or "rate limit", SEND a WAIT to that pane, (3) completion — when all workers show "complete" or "done" or have exited, respond DONE with a summary of total DMs sent across all campaigns. Do NOT interfere with workers that are running normally. Only act on errors.`,
+              '--panes', paneSpec,
+              '--model', model,
+              '--max-rounds', '30',
+              '--timeout', String(task.timeout_seconds || 3600)
+            ],
+            env: {},
+            cwd: somDir
+          }
+
+          const allRoles = [directorRole, ...workerRoles]
+          const swarm = this.tmux.createSwarm(task.id, allRoles)
+
+          this.runningTasks.set(task.id, {
+            sessionName: swarm.sessionName,
+            tmux: true,
+            _startedAt: Date.now(),
+            _taskTitle: `SOM Swarm: ${activeCampaigns.map(c => c.id || c.label).join(', ')}`,
+            _taskType: task.type
+          })
+
+          // Wait for director (pane 0) to finish
+          const directorPane = swarm.panes[0]
+          this.tmux.waitForCompletion(directorPane.channel, directorPane.exitFile, (task.timeout_seconds || 3600) * 1000 + 10000)
+            .then(exitCode => {
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = exitCode
+              const summaryFile = path.join(os.homedir(), '.iris', 'tmux-logs', `${swarm.sessionName}-summary.txt`)
+              let summary = ''
+              try { summary = fs.readFileSync(summaryFile, 'utf-8') } catch {}
+              outputLines.push(...summary.split('\n'))
+              resolve({ exitCode })
+            })
+            .catch(err => {
+              const entry = this.runningTasks.get(task.id)
+              if (entry) entry._exitCode = 1
+              resolve({ exitCode: 1 })
+            })
+
+          return // swarm handled
+        }
+
         case 'clip_cutter': {
           // Class A (portable / API-based) — NO local Laravel or Docker required (#117824).
           // The prod fl-api worker has ffmpeg + the assets container, so we POST to
@@ -2238,15 +2361,19 @@ const BODY = ${JSON.stringify(clipBody)};
           const since = scanArgs.find(a => a.startsWith('since='))?.split('=')[1] || '4h'
           const wb = scanArgs.some(a => a === 'wb=1' || a === 'wb=true') ? '1' : '0'
           const dry = scanArgs.some(a => a === 'dry=1' || a === 'dry=true') ? '1' : '0'
+          // send=1 enables the scripted auto-reply sender (advance the strategy by
+          // one step on each reply). OFF by default — the spec still previews the
+          // next-step text for auditing, it just doesn't send unless send=1.
+          const send = scanArgs.some(a => a === 'send=1' || a === 'send=true') ? '1' : '0'
 
-          console.log(`[executor] Inbox scan: ${scanAccounts.length} accounts (since=${since}, wb=${wb})`)
+          console.log(`[executor] Inbox scan: ${scanAccounts.length} accounts (since=${since}, wb=${wb}, send=${send})`)
           for (const a of scanAccounts) {
             console.log(`[executor]   → @${a.igAccount} (board ${a.boardId})`)
           }
 
           // Run sequentially — one browser per account
           const runnerScript = scanAccounts.map(a =>
-            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} LIMIT=100 npx playwright test tests/e2e/inbox-followup.spec.ts --headed --timeout=180000`
+            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 npx playwright test tests/e2e/inbox-followup.spec.ts --headed --timeout=180000`
           ).join(' && ')
           cmd = 'bash'
           args = ['-c', runnerScript]
@@ -3124,7 +3251,11 @@ exit 1
       const isLongRunning = longRunningTypes.includes(task.type)
       const typeDefault = isLongRunning ? 3600 : 600
       const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
-      const timeout = (explicit || typeDefault) * 1000
+      let timeout = (explicit || typeDefault) * 1000
+      // Cap browser tasks at the hard ceiling so a hung one can't starve the slot.
+      if (TaskExecutor.BROWSER_TYPES.includes(task.type)) {
+        timeout = Math.min(timeout, TaskExecutor.BROWSER_HARD_CEILING_MS)
+      }
       const timeoutLabel = timeout / 1000
       const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'comms_sync', 'custom_playwright']
       const isGraceful = gracefulTypes.includes(task.type)
@@ -3367,7 +3498,11 @@ exit 1
       const rtIsLongRunning = rtLongRunning.includes(task.type)
       const rtTypeDefault = rtIsLongRunning ? 3600 : 600
       const rtExplicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
-      const timeout = (rtExplicit || rtTypeDefault) * 1000
+      let timeout = (rtExplicit || rtTypeDefault) * 1000
+      // Cap browser tasks at the hard ceiling so a hung one can't starve the slot.
+      if (TaskExecutor.BROWSER_TYPES.includes(task.type)) {
+        timeout = Math.min(timeout, TaskExecutor.BROWSER_HARD_CEILING_MS)
+      }
       const rtTimeoutLabel = timeout / 1000
       const timer = setTimeout(() => {
         child.kill('SIGTERM')
@@ -3628,6 +3763,12 @@ exit 1
     if (stats.skipped != null) fields.push({ name: 'Skipped', value: `${stats.skipped}`, inline: true })
     if (stats.failed != null) fields.push({ name: 'Failed', value: `${stats.failed}`, inline: true })
     if (stats.quota_used != null) fields.push({ name: 'Daily Quota', value: `${stats.quota_used}/${stats.quota_total}`, inline: true })
+    // Inbox scan fields
+    if (stats.inbox_conversations != null) fields.push({ name: 'Conversations', value: `${stats.inbox_conversations}`, inline: true })
+    if (stats.inbox_replied != null) fields.push({ name: 'Replied', value: `${stats.inbox_replied}`, inline: true })
+    if (stats.inbox_no_response != null) fields.push({ name: 'No Response', value: `${stats.inbox_no_response}`, inline: true })
+    if (stats.inbox_unmatched != null) fields.push({ name: 'Unmatched', value: `${stats.inbox_unmatched}`, inline: true })
+    if (stats.inbox_leads_indexed != null) fields.push({ name: 'Leads Indexed', value: `${stats.inbox_leads_indexed}`, inline: true })
 
     // Top profiles / content preview
     let description = ''
@@ -3721,6 +3862,29 @@ exit 1
       stats.quota_total = parseInt(quotaMatch[2])
     }
 
+    // Inbox scan stats: "Replied: 3  |  No Response: 12  |  Unmatched: 5"
+    // and "42 conversations scanned" and individual "@handle Lead #123 "message preview""
+    const repliedMatch = output.match(/Replied:\s*(\d+)/i)
+    if (repliedMatch) stats.inbox_replied = parseInt(repliedMatch[1])
+    const noResponseMatch = output.match(/No Response:\s*(\d+)/i)
+    if (noResponseMatch) stats.inbox_no_response = parseInt(noResponseMatch[1])
+    const unmatchedMatch = output.match(/Unmatched:\s*(\d+)/i)
+    if (unmatchedMatch) stats.inbox_unmatched = parseInt(unmatchedMatch[1])
+    const convosMatch = output.match(/(\d+)\s+conversations? scanned/)
+    if (convosMatch) stats.inbox_conversations = parseInt(convosMatch[1])
+    const leadsIndexedMatch = output.match(/(\d+)\s+leads? indexed/)
+    if (leadsIndexedMatch) stats.inbox_leads_indexed = parseInt(leadsIndexedMatch[1])
+
+    // Extract replied handles with message previews
+    const replyPattern = /^\s+@(\S+)\s+Lead #\d+\s+"(.+)"$/gm
+    let replyMatch
+    while ((replyMatch = replyPattern.exec(output)) !== null && stats.topProfiles.length < 10) {
+      stats.topProfiles.push({
+        username: replyMatch[1],
+        comment: replyMatch[2].length > 60 ? replyMatch[2].substring(0, 57) + '...' : replyMatch[2]
+      })
+    }
+
     // General summary from the BATCH COMPLETE block
     const batchBlock = output.match(/BATCH COMPLETE[\s\S]*?━{10,}/g)
     if (batchBlock) {
@@ -3729,6 +3893,11 @@ exit 1
         .replace(/\s+/g, ' ')
         .trim()
         .substring(0, 300)
+    }
+
+    // Inbox scan summary (if no batch summary)
+    if (!stats.summary && stats.inbox_replied != null) {
+      stats.summary = `Inbox scan: ${stats.inbox_replied} replied, ${stats.inbox_no_response || 0} no response, ${stats.inbox_unmatched || 0} unmatched (${stats.inbox_conversations || '?'} conversations)`
     }
 
     return stats

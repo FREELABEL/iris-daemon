@@ -114,7 +114,10 @@ class Daemon {
     }
 
     // Step 0b: Start tmux zombie cleanup sweep (every 10 min)
-    if (this.executor.tmux.available) {
+    // Guard against double-creation: start() may be re-invoked by the cloud
+    // auth retry loop in daemon.js (this step runs before the auth that fails),
+    // and we must not leak a second interval on each retry.
+    if (this.executor.tmux.available && !this._tmuxCleanupInterval) {
       this._tmuxCleanupInterval = setInterval(() => {
         this.executor.tmux.cleanupZombies()
         this.executor.tmux.rotateLogs()
@@ -455,6 +458,22 @@ class Daemon {
       try {
         this.executor.tmux.sendInput(req.params.name, pane || 0, String(text))
         res.json({ ok: true })
+      } catch (err) {
+        res.status(500).json({ error: err.message })
+      }
+    })
+
+    // Swarm event log — returns structured JSONL events for a session
+    app.get(`${prefix}/tmux/sessions/:name/events`, (req, res) => {
+      const eventsFile = path.join(os.homedir(), '.iris', 'tmux-logs', `${req.params.name}-events.jsonl`)
+      try {
+        if (!fs.existsSync(eventsFile)) {
+          return res.json({ events: [], session: req.params.name })
+        }
+        const lines = fs.readFileSync(eventsFile, 'utf-8').split('\n').filter(Boolean)
+        const limit = parseInt(req.query.limit || '50', 10)
+        const events = lines.slice(-limit).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+        res.json({ events, session: req.params.name, total: lines.length })
       } catch (err) {
         res.status(500).json({ error: err.message })
       }
