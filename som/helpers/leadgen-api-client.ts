@@ -551,6 +551,55 @@ export class LeadgenApiClient {
   }
 
   /**
+   * Record an outbound DM as an OutreachMessage + legacy note.
+   * POST /api/v1/leads/{id}/outreach/record-dm
+   */
+  async recordDmSent(leadId: number, data: {
+    message: string;
+    channel_account: string;
+    campaign_name?: string;
+    bloq_id?: number;
+    ig_handle?: string;
+    step_index?: number;
+  }): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}/leads/${leadId}/outreach/record-dm`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.token}`,
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify(data),
+      });
+      const json = await resp.json();
+      return { success: resp.ok, data: json, message: json.message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
+   * Get outreach messages for a lead. Use for dedup checks.
+   * GET /api/v1/leads/{id}/outreach/messages
+   */
+  async getOutreachMessages(leadId: number, direction?: string): Promise<ApiResponse> {
+    try {
+      const qs = direction ? `?direction=${direction}` : '';
+      const resp = await fetch(`${BASE_URL}/leads/${leadId}/outreach/messages${qs}`, {
+        headers: {
+          'Authorization': `Bearer ${this.token}`,
+          'Accept': 'application/json',
+        },
+      });
+      const data = await resp.json();
+      return { success: resp.ok, data };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
    * Get a single lead with full data (notes, tags) via GET /api/v1/leads/{id}.
    */
   async getLead(leadId: number): Promise<ApiResponse> {
@@ -613,6 +662,41 @@ export class LeadgenApiClient {
   }
 
   /**
+   * Initialize outreach steps for a lead (creates the 5-step strategy).
+   * Mirrors the "Apply Strategy" button in the UI.
+   * Returns the created steps, or existing steps if already initialized.
+   */
+  async initializeOutreach(leadId: number, strategyKey?: string): Promise<{ success: boolean; steps: any[]; alreadyExisted: boolean }> {
+    try {
+      const endpoint = strategyKey
+        ? `${BASE_URL}/leads/${leadId}/outreach-steps/initialize-strategy`
+        : `${BASE_URL}/leads/${leadId}/outreach-steps/initialize-default`;
+      const body = strategyKey ? JSON.stringify({ strategy_key: strategyKey }) : undefined;
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.token}`,
+          'Accept': 'application/json',
+        },
+        body,
+      });
+      const result = await resp.json() as any;
+      if (resp.ok) {
+        return { success: true, steps: result.data?.steps || [], alreadyExisted: false };
+      }
+      // 400 = steps already exist — that's fine, fetch them
+      if (resp.status === 400 && result.message?.includes('already has')) {
+        const existing = await this.getSteps(leadId);
+        return { success: true, steps: existing, alreadyExisted: true };
+      }
+      return { success: false, steps: [], alreadyExisted: false };
+    } catch {
+      return { success: false, steps: [], alreadyExisted: false };
+    }
+  }
+
+  /**
    * Get outreach steps for a lead.
    */
   async getSteps(leadId: number): Promise<any[]> {
@@ -655,6 +739,25 @@ export class LeadgenApiClient {
   }
 
   /**
+   * Delete a lead via DELETE /api/v1/leads/{id}.
+   */
+  async deleteLead(leadId: number): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}/leads/${leadId}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${this.token}`,
+          'Accept': 'application/json',
+        },
+      });
+      const data = await resp.json().catch(() => ({}));
+      return { success: resp.ok, data, message: (data as any).message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
    * Enhanced lead map with full info — used by inbox follow-up to check tags/notes.
    * Returns Map of handle → { id, hasEmail, hasPhone, name, status, tagIds }
    */
@@ -667,21 +770,53 @@ export class LeadgenApiClient {
       name: string; status: string; tagIds: number[];
     }>();
 
+    // Paginate through ALL leads on the board. Fetching only page 1
+    // (the old per_page=500 behaviour) silently dropped most of a large board,
+    // so matching/dedup missed the majority of leads.
+    const PAGE_SIZE = 200;
+    const MAX_PAGES = 200; // safety cap = 40k leads — far above any real board
+    const PAGE_TIMEOUT_MS = 15000;
+    let page = 1;
+    let hasMore = true;
+    let leadCount = 0;
+
+    const addKey = (k: string | null | undefined, info: any) => {
+      if (!k) return;
+      const norm = String(k).toLowerCase().replace(/^@/, '').trim();
+      if (norm) map.set(norm, info);
+    };
+
     try {
-      const resp = await fetch(
-        `${BASE_URL}/leads?bloq_id=${this.boardId}&per_page=500`,
-        {
-          headers: {
-            'Authorization': `Bearer ${this.token}`,
-            'Accept': 'application/json',
-          },
+      while (hasMore && page <= MAX_PAGES) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
+
+        let resp: Response;
+        try {
+          resp = await fetch(
+            `${BASE_URL}/leads?bloq_id=${this.boardId}&per_page=${PAGE_SIZE}&page=${page}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Accept': 'application/json',
+              },
+              signal: controller.signal,
+            }
+          );
+        } finally {
+          clearTimeout(timeout);
         }
-      );
 
-      const data = await resp.json();
-      const leads = data.data?.data || data.data || [];
+        if (!resp.ok) {
+          console.log(`    Warning: Lead map API returned HTTP ${resp.status} on page ${page} (${leadCount} leads indexed so far)`);
+          break;
+        }
 
-      if (Array.isArray(leads)) {
+        const data = await resp.json();
+        const leads = data.data?.data || data.data || [];
+
+        if (!Array.isArray(leads) || leads.length === 0) break;
+
         for (const lead of leads) {
           const ci = lead.contact_info || {};
           const hasEmail = !!(ci.email || lead.email);
@@ -689,14 +824,29 @@ export class LeadgenApiClient {
           const tagIds = (lead.tags || []).map((t: any) => t.id || t);
           const info = { id: lead.id, hasEmail, hasPhone, name: lead.name || '', status: lead.status || '', tagIds };
 
-          const ig = ci.instagram;
-          if (ig) map.set(ig.toLowerCase().replace(/^@/, ''), info);
-          if (lead.nickname) map.set(lead.nickname.toLowerCase().replace(/^@/, ''), info);
-          if (lead.name) map.set(lead.name.toLowerCase().replace(/^@/, ''), info);
+          addKey(ci.instagram, info);
+          addKey(ci.social_handle, info);
+          addKey(lead.twitter, info);
+          addKey(lead.social_handle, info);
+          addKey(lead.nickname, info);
+          addKey(lead.name, info);
         }
+
+        leadCount += leads.length;
+        hasMore = leads.length === PAGE_SIZE;
+        page++;
       }
+
+      if (page > MAX_PAGES) {
+        console.log(`    Warning: Lead map hit MAX_PAGES cap (${MAX_PAGES}) — board may have more than ${MAX_PAGES * PAGE_SIZE} leads`);
+      }
+      console.log(`   Lead map: ${leadCount} leads across ${page - 1} page(s), ${map.size} match keys`);
     } catch (err: any) {
-      console.log(`    Warning: Could not fetch lead map: ${err.message}`);
+      if (err.name === 'AbortError') {
+        console.log(`    Warning: Lead map API timed out on page ${page} (${leadCount} leads indexed so far)`);
+      } else {
+        console.log(`    Warning: Could not fetch lead map: ${err.message}`);
+      }
     }
 
     return map;

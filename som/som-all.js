@@ -42,7 +42,7 @@ const rawArgs = process.argv.slice(2);
 // ── Parse flags ──────────────────────────────────────────────────
 let useAll = false;
 let onlyCampaigns = null;
-let parallel = false; // SEQUENTIAL by default — parallel causes race conditions on shared IG accounts
+let parallel = true; // PARALLEL by default — all active campaigns use different IG accounts (max 2 concurrent)
 let enrich = null; // null = auto (true for email mode), true/false = explicit
 let enrichGoal = 'email'; // email, phone, all
 let outreachMode = 'outreach'; // outreach (DM) or email
@@ -581,21 +581,31 @@ function runCampaign(campaign, index, total) {
     console.log(`${prefix} ── Campaign ${index + 1}/${total}: ${reg.label} ──\n`);
 
     const startTime = Date.now();
+    let dmsSent = 0, dmsFailed = 0, leadsProcessed = 0, errors = [];
     const child = spawn('node', [somScript, campaign, ...args], {
       cwd: __dirname,
-      env: process.env,
+      env: { ...process.env, SOM_CAMPAIGN_NAME: campaign },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     child.stdout.on('data', (data) => {
       for (const line of data.toString().split('\n')) {
-        if (line.trim()) process.stdout.write(`${prefix} ${line}\n`);
+        if (line.trim()) {
+          process.stdout.write(`${prefix} ${line}\n`);
+          // Parse status signals from output
+          if (line.includes('DM sent')) dmsSent++;
+          if (line.includes('No DM input') || line.includes('No message input') || line.includes('Cannot DM')) dmsFailed++;
+          if (/━━━ Lead \d+/.test(line)) leadsProcessed++;
+        }
       }
     });
 
     child.stderr.on('data', (data) => {
       for (const line of data.toString().split('\n')) {
-        if (line.trim()) process.stderr.write(`${prefix} ${line}\n`);
+        if (line.trim()) {
+          process.stderr.write(`${prefix} ${line}\n`);
+          if (line.includes('Error:')) errors.push(line.trim().substring(0, 200));
+        }
       }
     });
 
@@ -603,7 +613,8 @@ function runCampaign(campaign, index, total) {
       const elapsed = formatDuration(Date.now() - startTime);
       const status = code === 0 ? '✓' : '✗';
       console.log(`\n${prefix} ${status} ${reg.label} finished in ${elapsed} (code ${code})\n`);
-      resolve(code);
+      // Attach stats to the result for status file
+      resolve({ code, elapsed, dmsSent, dmsFailed, leadsProcessed, errors: errors.slice(0, 3) });
     });
   });
 }
@@ -613,7 +624,7 @@ function runCampaign(campaign, index, total) {
 // ── Run campaigns in parallel ────────────────────────────────────
 
 function runAllParallel(campaignList) {
-  const maxParallel = parseInt(process.env.SOM_MAX_PARALLEL || '3', 10);
+  const maxParallel = parseInt(process.env.SOM_MAX_PARALLEL || '2', 10);
 
   // If throttled, run in batches instead of all-at-once
   if (maxParallel < campaignList.length) {
@@ -652,7 +663,7 @@ runAllParallel.__raw = function(campaignList) {
         const startTime = Date.now();
         const child = spawn('node', [somScript, campaign, ...args], {
           cwd: __dirname,
-          env: process.env,
+          env: { ...process.env, SOM_CAMPAIGN_NAME: campaign },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
@@ -867,8 +878,10 @@ async function main() {
     } else {
       results = [];
       for (let i = 0; i < campaigns.length; i++) {
-        const code = await runCampaign(campaigns[i], i, campaigns.length);
-        results.push({ campaign: campaigns[i], code });
+        const res = await runCampaign(campaigns[i], i, campaigns.length);
+        // runCampaign now returns { code, elapsed, dmsSent, dmsFailed, leadsProcessed, errors }
+        const result = typeof res === 'object' ? { campaign: campaigns[i], ...res } : { campaign: campaigns[i], code: res };
+        results.push(result);
       }
     }
 
@@ -879,9 +892,13 @@ async function main() {
     for (const r of results) {
       const reg = campaignRegistry[r.campaign] || {};
       const icon = r.code === 0 ? '✓' : '✗';
-      console.log(`    ${icon} ${(reg.label || r.campaign).padEnd(25)} ${r.elapsed || ''}`);
+      const stats = r.dmsSent !== undefined ? ` (${r.dmsSent} sent, ${r.dmsFailed} failed, ${r.leadsProcessed} leads)` : '';
+      console.log(`    ${icon} ${(reg.label || r.campaign).padEnd(25)} ${r.elapsed || ''}${stats}`);
     }
     console.log('  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    // ── Write SOM status file ──
+    writeSomStatus(results, batchElapsed);
 
     // Repeat?
     if (!repeatMs) break;
@@ -891,6 +908,92 @@ async function main() {
     }
 
     await countdown(repeatMs);
+  }
+}
+
+// ── SOM Status File ──────────────────────────────────────────────
+// Writes ~/.iris/som-status.json after each batch with per-campaign health.
+// Read by: `iris som status`, daemon /daemon/som-status endpoint, Hive UI.
+
+function readTodayLedger(campaignName) {
+  const fs = require('fs');
+  const os = require('os');
+  const ledgerDate = new Date().toISOString().slice(0, 10);
+  const ledgerFile = path.join(os.homedir(), '.iris', 'som-ledger', `${campaignName}-${ledgerDate}.jsonl`);
+  try {
+    if (!fs.existsSync(ledgerFile)) return null;
+    const lines = fs.readFileSync(ledgerFile, 'utf-8').trim().split('\n').filter(Boolean);
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const resultCounts = {};
+    for (const e of entries) {
+      resultCounts[e.result] = (resultCounts[e.result] || 0) + 1;
+    }
+    const sent = entries.filter(e => e.result === 'dm_sent').length;
+    const retryable = entries.filter(e => e.retryable && e.result !== 'dm_sent').length;
+    const permanent = entries.filter(e => !e.retryable && e.result !== 'dm_sent').length;
+    return { total: entries.length, sent, retryable, permanent, results: resultCounts };
+  } catch { return null; }
+}
+
+function writeSomStatus(results, batchElapsed) {
+  const fs = require('fs');
+  const os = require('os');
+  const statusPath = path.join(os.homedir(), '.iris', 'som-status.json');
+
+  // Load existing status to preserve history
+  let existing = {};
+  try {
+    if (fs.existsSync(statusPath)) {
+      existing = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
+    }
+  } catch { /* fresh start */ }
+
+  const campaigns = existing.campaigns || {};
+  const now = new Date().toISOString();
+
+  for (const r of results) {
+    const reg = campaignRegistry[r.campaign] || {};
+    const health = r.code === 0 ? 'healthy' : (r.dmsSent > 0 ? 'degraded' : 'broken');
+    const todayLedger = readTodayLedger(r.campaign);
+    campaigns[r.campaign] = {
+      label: reg.label || r.campaign,
+      ig_account: reg.igAccount || somConfig.getSomCampaigns()[r.campaign]?.IG_ACCOUNT || null,
+      board_id: reg.boardId || null,
+      health,
+      last_run: now,
+      last_code: r.code || 0,
+      last_elapsed: r.elapsed || null,
+      dms_sent: r.dmsSent || 0,
+      dms_failed: r.dmsFailed || 0,
+      leads_processed: r.leadsProcessed || 0,
+      last_errors: r.errors || [],
+      // Rolling stats (increment)
+      total_sent: (campaigns[r.campaign]?.total_sent || 0) + (r.dmsSent || 0),
+      total_failed: (campaigns[r.campaign]?.total_failed || 0) + (r.dmsFailed || 0),
+      run_count: (campaigns[r.campaign]?.run_count || 0) + 1,
+      // Today's ledger aggregates
+      today_ledger: todayLedger,
+    };
+  }
+
+  const status = {
+    last_batch: now,
+    last_duration: batchElapsed,
+    campaigns,
+    summary: {
+      total_sent: Object.values(campaigns).reduce((s, c) => s + (c.dms_sent || 0), 0),
+      total_failed: Object.values(campaigns).reduce((s, c) => s + (c.dms_failed || 0), 0),
+      healthy: Object.values(campaigns).filter(c => c.health === 'healthy').length,
+      degraded: Object.values(campaigns).filter(c => c.health === 'degraded').length,
+      broken: Object.values(campaigns).filter(c => c.health === 'broken').length,
+    },
+  };
+
+  try {
+    fs.writeFileSync(statusPath, JSON.stringify(status, null, 2));
+    console.log(`  Status written to ${statusPath}`);
+  } catch (e) {
+    console.error(`  Failed to write status: ${e.message}`);
   }
 }
 

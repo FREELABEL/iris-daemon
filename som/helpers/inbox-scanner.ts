@@ -141,17 +141,23 @@ export async function isAlreadyTagged(apiBase: string, token: string, leadId: nu
   }
 }
 
-/** Post a note to a lead — always uses `message` field (not `content`) */
+/** Record an inbound reply as an OutreachMessage (single source of truth).
+ *  Also sets has_replied cache on the lead via the record-dm endpoint. */
 export async function tagLeadAsReplied(
-  apiBase: string, token: string, leadId: number, noteText: string, dryRun: boolean
+  apiBase: string, token: string, leadId: number, noteText: string, dryRun: boolean,
+  platform?: string, account?: string, bloqId?: number,
 ): Promise<boolean> {
   if (dryRun) {
     console.log(`    [DRY RUN] Would tag lead #${leadId}`);
     return true;
   }
   try {
+    const msgType = platform === 'linkedin' ? 'linkedin_dm'
+      : platform === 'whatsapp' ? 'whatsapp_message'
+      : 'instagram_dm';
+
     const res = await fetch(
-      `${apiBase}/api/v1/leads/${leadId}/notes`,
+      `${apiBase}/api/v1/leads/${leadId}/outreach/record-dm`,
       {
         method: 'POST',
         headers: {
@@ -159,11 +165,17 @@ export async function tagLeadAsReplied(
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify({ message: noteText, type: 'system' }),
+        body: JSON.stringify({
+          message: noteText,
+          direction: 'inbound',
+          type: msgType,
+          channel_account: account || platform || 'unknown',
+          bloq_id: bloqId,
+        }),
       }
     );
     if (res.ok) {
-      console.log(`    Tagged lead #${leadId}`);
+      console.log(`    Tagged lead #${leadId} (OutreachMessage inbound)`);
       return true;
     }
     console.log(`    Tag failed: ${res.status}`);
@@ -399,7 +411,8 @@ export async function runInboxScan(
     const noteText = `[inbox reply] ${notePrefix} reply from ${contactLabel}: "${preview}"`;
 
     const success = await tagLeadAsReplied(
-      config.apiBase, config.token, matchedLead.id, noteText, config.dryRun
+      config.apiBase, config.token, matchedLead.id, noteText, config.dryRun,
+      config.platform, config.account, config.boardId,
     );
     if (success) {
       tagged.push({ name: matchedLead.name, leadId: matchedLead.id, contact: contactName, lastMsg: preview });
