@@ -34,7 +34,7 @@ CONFIG_FILE="${IRIS_DIR}/config.json"
 PLIST_NAME="io.heyiris.daemon.plist"
 PLIST_DEST="${HOME}/Library/LaunchAgents/${PLIST_NAME}"
 REPO_URL="https://github.com/FREELABEL/iris-daemon.git"
-DEFAULT_API_URL="https://iris-api.freelabel.net"
+DEFAULT_API_URL="https://freelabel.net"
 MIN_NODE_VERSION=18
 HEALTH_PORT=3200
 

@@ -28,7 +28,7 @@ node -e "
 "
 
 echo "Bridge API key: $(printf '%.8s' "$API_KEY")..."
-echo "IRIS API URL: ${IRIS_API_URL:-https://web.heyiris.io}"
+echo "IRIS API URL: ${IRIS_API_URL:-https://freelabel.net}"
 
 # ─── Restore any persistent PM2 processes ───
 pm2 resurrect 2>/dev/null || true

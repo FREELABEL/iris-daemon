@@ -67,7 +67,7 @@ case "${1:-status}" in
             echo "Daemon already running"; exit 0
         fi
         rm -f "$SOCK"
-        nohup node "$BRIDGE_DIR/daemon.js" > "$BRIDGE_DIR/daemon.log" 2>&1 &
+        nohup node "$BRIDGE_DIR/daemon.js" >> "$BRIDGE_DIR/daemon.log" 2>&1 &
         sleep 3
         if [ -S "$SOCK" ]; then
             echo "Hive daemon started (PID: $!)"

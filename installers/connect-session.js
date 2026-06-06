@@ -7,7 +7,7 @@
  * and publishes them encrypted to the IRIS project vault.
  *
  * Usage:
- *   node connect-session.js --platform linkedin --project 217 --api-url https://iris-api.freelabel.net --user-id 193
+ *   node connect-session.js --platform linkedin --project 217 --api-url https://freelabel.net --user-id 193
  *   node connect-session.js --platform instagram --project 217
  *   node connect-session.js --platform twitter --project 217
  *   node connect-session.js --platform youtube --project 217
@@ -44,7 +44,7 @@ const args = parseArgs()
 const PLATFORM = (args.platform || '').toLowerCase()
 const PROJECT_ID = args.project || args['project-id'] || args['bloq-id']
 const USER_ID = args['user-id'] || args.user || '193'
-const API_URL = (args['api-url'] || args.api || 'https://iris-api.freelabel.net').replace(/\/$/, '')
+const API_URL = (args['api-url'] || args.api || 'https://freelabel.net').replace(/\/$/, '')
 const API_TOKEN = args.token || args['api-token'] || process.env.FL_RAICHU_API_TOKEN || ''
 
 // ── Platform configs ────────────────────────────────────────────
@@ -141,7 +141,7 @@ async function main () {
     console.log('    --platform     Platform to log into (required)')
     console.log('    --project      IRIS project/bloq ID (required)')
     console.log('    --user-id      Your IRIS user ID (default: 193)')
-    console.log('    --api-url      IRIS API URL (default: https://iris-api.freelabel.net)')
+    console.log('    --api-url      IRIS API URL (default: https://freelabel.net)')
     console.log('    --token        API auth token (or set FL_RAICHU_API_TOKEN env var)\n')
     process.exit(1)
   }
