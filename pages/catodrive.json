@@ -1,0 +1,449 @@
+{
+  "id": 94,
+  "slug": "catodrive",
+  "title": "CatoDrive - Premium Car Rentals, Dallas/Fort Worth",
+  "seo_title": "CatoDrive | Premium Car Rentals Delivered to You | DFW",
+  "seo_description": "75+ premium vehicles delivered to DFW Airport, Love Field, hotels, or anywhere in Dallas/Fort Worth. From $79/day with white-glove service.",
+  "og_image": null,
+  "status": "published",
+  "owner_type": "user",
+  "owner_id": 193,
+  "json_content": {
+    "version": "1.0",
+    "type": "landing",
+    "theme": {
+      "mode": "light",
+      "backgroundColor": "#ffffff",
+      "branding": {
+        "name": "CATODRIVE",
+        "primaryColor": "#1e3a5f",
+        "secondaryColor": "#d97706",
+        "description": "Airport Mobility & P2P Fleet Management — Dallas/Fort Worth",
+        "fontFamily": "Inter, sans-serif",
+        "faviconUrl": "https://iris-cdn.sfo3.cdn.digitaloceanspaces.com/cloud-files/1775835719_IMG_5303.png"
+      }
+    },
+    "components": [
+      {
+        "type": "SiteNavigation",
+        "id": "catodrive-nav",
+        "props": {
+          "themeMode": "light",
+          "transparent": true,
+          "logo": {
+            "imageUrl": "https://iris-cdn.sfo3.cdn.digitaloceanspaces.com/cloud-files/1775835719_IMG_5303.png",
+            "url": "/p/catodrive",
+            "text": "CATODRIVE"
+          },
+          "links": [
+            {
+              "label": "Book Now",
+              "url": "/p/catodrive-booking"
+            },
+            {
+              "label": "Asset Partners",
+              "url": "/p/catodrive-fleet-partners"
+            },
+            {
+              "label": "Contact",
+              "url": "/p/catodrive-contact"
+            }
+          ],
+          "ctaButton": {
+            "text": "Join Fleet",
+            "url": "/p/catodrive-fleet-partners"
+          },
+          "ctaColor": "#d97706"
+        }
+      },
+      {
+        "type": "Hero",
+        "id": "catodrive-hero",
+        "props": {
+          "themeMode": "dark",
+          "title": "Airport Mobility is Trapped in 1995.",
+          "subtitle": "Every rental company makes you take a shuttle bus to a satellite lot. CatoDrive delivers your car curbside at the terminal. DFW and Love Field. Keys in hand.",
+          "labelText": "CATODRIVE · DFW",
+          "labelColor": "#d97706",
+          "logoImage": "https://iris-cdn.sfo3.cdn.digitaloceanspaces.com/cloud-files/1775835719_IMG_5303.png",
+          "logoSize": "80px",
+          "primaryButtonText": "Become an Asset Partner",
+          "primaryButtonUrl": "/p/catodrive-fleet-partners",
+          "primaryButtonVariant": "amber",
+          "secondaryButtonText": "Contact Us →",
+          "secondaryButtonUrl": "/p/catodrive-contact",
+          "secondaryButtonVariant": "outline",
+          "backgroundImage": "https://images.unsplash.com/photo-1503376780353-7e6692767b70?w=1600&q=80",
+          "fullHeight": true,
+          "showScrollIndicator": true,
+          "showFloatingElements": false,
+          "textAlign": "center",
+          "overlayOpacity": 0.75
+        }
+      },
+      {
+        "type": "StatsSection",
+        "id": "catodrive-traction",
+        "props": {
+          "heading": "Proven Traction. Zero Outside Capital.",
+          "subheading": "Real numbers from a real fleet. 100% bootstrapped.",
+          "layout": "grid",
+          "accentColor": "amber",
+          "themeMode": "light",
+          "stats": [
+            {
+              "value": "$307K",
+              "label": "2025 Fleet Revenue"
+            },
+            {
+              "value": "4.96",
+              "suffix": "★",
+              "label": "Rating (2,053 Reviews)"
+            },
+            {
+              "value": "72",
+              "label": "Vehicles Under Management"
+            },
+            {
+              "value": "2,607",
+              "suffix": "+",
+              "label": "Trips Completed"
+            }
+          ]
+        }
+      },
+      {
+        "type": "BenefitsSection",
+        "id": "catodrive-solution",
+        "props": {
+          "themeMode": "light",
+          "accentColor": "amber",
+          "sectionLabel": "The Solution",
+          "title": "Premium Experience for Travelers. Passive Income for Owners.",
+          "description": "CatoDrive built what Enterprise, Hertz, and Avis never would — actual terminal delivery at both DFW airports. And we turned it into a passive income engine for vehicle owners.",
+          "benefits": [
+            {
+              "icon": "sparkles",
+              "title": "Free Terminal Valet",
+              "description": "Car delivered straight to your terminal at DFW International and Love Field. Returned the same way. No shuttles. No satellite lots. Ever."
+            },
+            {
+              "icon": "shieldCheck",
+              "title": "Exact Car, Guaranteed",
+              "description": "Book the precise vehicle you want. Real photos, real car. No bait-and-switch. Every vehicle SOP-maintained, spotless, and road-ready."
+            },
+            {
+              "icon": "wallet",
+              "title": "Owners Net $1,066–$1,878/mo",
+              "description": "80% of every booking goes to you. After maintenance costs (~$100–200/mo), the average owner nets over $1,000/month per vehicle. Vehicle pays for itself in 36–40 months."
+            },
+            {
+              "icon": "lineChart",
+              "title": "Full Fleet Management",
+              "description": "Owners do nothing. We list, price, deliver, clean, and service. 24/7 operations team based in DFW. Your only job is cashing the check."
+            }
+          ]
+        }
+      },
+      {
+        "type": "ProcessSteps",
+        "id": "catodrive-how-it-works",
+        "props": {
+          "themeMode": "light",
+          "label": "How It Works",
+          "heading": "Five Steps. Zero Headaches. Income in 30 Days.",
+          "subheading": "From vehicle to passive income — CatoDrive handles 100% of operations from list to payout.",
+          "accentColor": "#d97706",
+          "steps": [
+            {
+              "icon": "file-check",
+              "title": "Finance Your Car",
+              "description": "Purchase or finance a vehicle through our Hendrick VW partnership or your own source. We help you select the highest-demand model for DFW airport routes.",
+              "callout": "~$550–$850/mo payment"
+            },
+            {
+              "icon": "sparkles",
+              "title": "CatoDrive Lists It",
+              "description": "We photograph, list, price dynamically, and manage your car. You do nothing.",
+              "callout": "$0 additional effort from you"
+            },
+            {
+              "icon": "rocket",
+              "title": "Guest Books Online",
+              "description": "A vetted traveler books online. CatoDrive screens every trip. You're never involved.",
+              "callout": "Full vetting on every reservation"
+            },
+            {
+              "icon": "wrench",
+              "title": "We Manage Everything",
+              "description": "Valet pickup, terminal delivery, cleaning, maintenance coordination. Full white-glove service.",
+              "callout": "100% of operations handled"
+            },
+            {
+              "icon": "wallet",
+              "title": "You Get Paid",
+              "description": "80% of every booking hits your account monthly. No invoices. No chasing.",
+              "callout": "Net $1,066–$1,878/month"
+            }
+          ]
+        }
+      },
+      {
+        "type": "TestimonialsSection",
+        "id": "catodrive-testimonials",
+        "props": {
+          "themeMode": "light",
+          "heading": "Don't Take Our Word For It",
+          "subheading": "4.96 stars across 2,053 verified reviews. Here's what our partners say.",
+          "accentColor": "amber",
+          "layout": "grid",
+          "columns": 3,
+          "testimonials": [
+            {
+              "name": "Portfolio Owner",
+              "role": "6 vehicles · Partner since 2024",
+              "text": "I was skeptical at first — I'd never rented my car before. CatoDrive listed it, handled every guest, and I made $1,400 my first month. I financed a second car within 90 days. Now I have six cars on the platform.",
+              "rating": 5
+            },
+            {
+              "name": "Asset Partner",
+              "role": "2 vehicles",
+              "text": "The car wash alone would've been a headache. CatoDrive handles it all. My only job is cashing the check.",
+              "rating": 5
+            },
+            {
+              "name": "DFW Investor",
+              "role": "3 vehicles",
+              "text": "They told me 18-month payback. I hit breakeven in 14. The airport market is insane right now.",
+              "rating": 5
+            }
+          ]
+        }
+      },
+      {
+        "type": "FeatureIconsGrid",
+        "id": "catodrive-who-its-for",
+        "props": {
+          "themeMode": "light",
+          "accentColor": "amber",
+          "sectionLabel": "Who CatoDrive Serves",
+          "title": "Two Sides of the Platform",
+          "titleGradient": false,
+          "subtitle": "Travel without hassle. Earn without effort.",
+          "features": [
+            {
+              "icon": "wallet",
+              "title": "Asset Partners",
+              "description": "Finance a vehicle through our Hendrick VW partnership or bring your own. Net $1,066–$1,878/month. Vehicle pays for itself in 36–40 months, then pure profit."
+            },
+            {
+              "icon": "barChart2",
+              "title": "Business Travelers",
+              "description": "Car delivered to your terminal at DFW or Love Field. 5–15% below market rate. Paperless end-to-end. Zero friction."
+            },
+            {
+              "icon": "shieldCheck",
+              "title": "Dealership Partners",
+              "description": "Hendrick VW partnership: zero-down financing for asset partners. High-demand models selected for DFW airport routes."
+            },
+            {
+              "icon": "rocket",
+              "title": "Corporate Accounts",
+              "description": "Volume pricing, dedicated account management, consolidated billing, and priority terminal delivery for regular DFW travel."
+            }
+          ]
+        }
+      },
+      {
+        "type": "FeatureGrid",
+        "id": "catodrive-risk",
+        "props": {
+          "themeMode": "light",
+          "accentColor": "amber",
+          "labelText": "RISK & RESPONSIBILITY",
+          "title": "Every Risk Has an Owner. Most of Them Are Us.",
+          "subtitle": "Insurance backed by commercial policy. $750K liability per trip. Owner never files a claim directly.",
+          "columns": 2,
+          "features": [
+            {
+              "icon": "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z",
+              "title": "Renter Damages Vehicle",
+              "description": "$750K liability + collision coverage per trip. Owner does not pay.",
+              "stat": "CatoDrive",
+              "accentColor": "amber"
+            },
+            {
+              "icon": "M13 10V3L4 14h7v7l9-11h-7z",
+              "title": "Car Sits Empty",
+              "description": "We manage pricing, listing optimization, and booking pipeline 24/7. Your exposure is zero.",
+              "stat": "CatoDrive",
+              "accentColor": "amber"
+            },
+            {
+              "icon": "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z|M15 12a3 3 0 11-6 0 3 3 0 016 0z",
+              "title": "Routine Maintenance",
+              "description": "Owner's only cost: ~$100–200/month for oil, tires, wash. Offset many times over by net income.",
+              "stat": "Owner",
+              "accentColor": "amber"
+            },
+            {
+              "icon": "M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
+              "title": "Guest No-Show or Late Return",
+              "description": "Our operations team handles all guest issues, rescheduling, and late fee recovery.",
+              "stat": "CatoDrive",
+              "accentColor": "amber"
+            }
+          ]
+        }
+      },
+      {
+        "type": "FAQAccordion",
+        "id": "faq",
+        "props": {
+          "title": "Frequently Asked Questions",
+          "subtitle": "Everything you need to know about CatoDrive.",
+          "themeMode": "light",
+          "accentColor": "#d97706",
+          "items": [
+            {
+              "question": "What is CatoDrive?",
+              "answer": "CatoDrive is a locally-operated, peer-to-peer fleet management platform in Dallas/Fort Worth. We connect vehicle owners (asset partners) with travelers who need premium airport mobility. 72 vehicles under management, $307K in 2025 revenue, 4.96-star rating across 2,053 reviews. 100% bootstrapped."
+            },
+            {
+              "question": "How much can I earn as an asset partner?",
+              "answer": "Average daily rate: $65–$120. Utilization: 22–26 days/month. After CatoDrive's 20% commission and your maintenance costs (~$100–200/month), owners net $1,066–$1,878/month per vehicle. Vehicle pays for itself in 36–40 months — then it's pure profit."
+            },
+            {
+              "question": "What vehicles perform best?",
+              "answer": "Top 2025 performers: VW Atlas ($1,400–$1,600/mo avg), VW Tiguan ($1,200–$1,400/mo avg), Kia Sportage ($1,000–$1,200/mo avg), Jeep Grand Cherokee ($1,400–$1,600/mo avg). AWD SUVs with 5–7 seats perform best at DFW."
+            },
+            {
+              "question": "What about insurance?",
+              "answer": "$750,000 liability + collision coverage on every trip via commercial auto insurance. Owner never files a claim directly. Off-trip coverage under CatoDrive umbrella. Your only insurance responsibility is personal coverage when you personally drive."
+            },
+            {
+              "question": "What does CatoDrive charge?",
+              "answer": "20% commission on every booking. That covers listing, pricing, valet pickup/delivery, cleaning, maintenance coordination, guest screening, 24/7 support, and monthly payouts. Owner keeps 80%."
+            },
+            {
+              "question": "How do I get started?",
+              "answer": "Finance a vehicle through our Hendrick VW partnership or bring your own (2013+, clean title, under 100K miles). We photograph, list, and manage everything. First payout within 30 days."
+            },
+            {
+              "question": "What makes CatoDrive different?",
+              "answer": "Terminal delivery. We are the only platform in DFW delivering vehicles curbside at both DFW International and Love Field. No shuttle buses. Plus full SOP fleet management — owners do literally nothing except collect monthly deposits."
+            },
+            {
+              "question": "What areas do you serve?",
+              "answer": "The entire DFW metroplex: DFW Airport, Love Field, Downtown Dallas, Uptown, Fort Worth, Arlington, Plano, Frisco, McKinney, and surrounding areas."
+            }
+          ]
+        }
+      },
+      {
+        "type": "VehicleGrid",
+        "id": "fleet-teaser",
+        "props": {
+          "themeMode": "light",
+          "heading": "Browse Our Fleet",
+          "subheading": "75+ premium vehicles available for delivery across DFW. Sign up to book.",
+          "layout": "carousel",
+          "maxVehicles": 8,
+          "bloqId": 359,
+          "apiBaseUrl": "https://raichu.heyiris.io",
+          "accentColor": "#d97706",
+          "ctaText": "Sign Up to Book",
+          "ctaUrl": "/p/catodrive-booking",
+          "defaultValues": {
+            "url": "/p/catodrive-booking",
+            "hostName": "CatoDrive Fleet",
+            "deliveryAvailable": true,
+            "instantBook": true,
+            "mileage": "200 mi/day"
+          }
+        }
+      },
+      {
+        "type": "CommunityCTA",
+        "id": "catodrive-cta",
+        "props": {
+          "themeMode": "dark",
+          "accentColor": "amber",
+          "title": "Buy a Car. We Run It.",
+          "titleAccent": "You Collect Every Month.",
+          "description": "80% of every booking. Net $1,066–$1,878/month. Vehicle pays for itself in 36–40 months. Then it's pure profit.",
+          "ctaText": "Become an Asset Partner",
+          "ctaUrl": "/p/catodrive-fleet-partners",
+          "showDiscordIcon": false
+        }
+      },
+      {
+        "type": "SiteFooter",
+        "id": "catodrive-footer",
+        "props": {
+          "themeMode": "dark",
+          "accentColor": "amber",
+          "logo": {
+            "text": "CatoDrive",
+            "tagline": "Airport Mobility · P2P Fleet Management · Dallas/Fort Worth, TX"
+          },
+          "copyright": "© 2026 CatoDrive Inc. All rights reserved.",
+          "columns": [
+            {
+              "title": "Platform",
+              "links": [
+                {
+                  "label": "Home",
+                  "url": "/p/catodrive"
+                },
+                {
+                  "label": "Asset Partners",
+                  "url": "/p/catodrive-fleet-partners"
+                },
+                {
+                  "label": "Blog",
+                  "url": "/p/catodrive-blog"
+                },
+                {
+                  "label": "Contact",
+                  "url": "/p/catodrive-contact"
+                }
+              ]
+            },
+            {
+              "title": "Contact",
+              "links": [
+                {
+                  "label": "shoaib@catodrive.com",
+                  "url": "mailto:shoaib@catodrive.com"
+                },
+                {
+                  "label": "(817) 797-1698",
+                  "url": "tel:+18177971698"
+                },
+                {
+                  "label": "Dallas/Fort Worth, TX",
+                  "url": "#"
+                }
+              ]
+            }
+          ],
+          "socialLinks": [
+            {
+              "platform": "instagram",
+              "url": "https://instagram.com/catodrive"
+            },
+            {
+              "platform": "twitter",
+              "url": "https://twitter.com/catodrive"
+            },
+            {
+              "platform": "linkedin",
+              "url": "https://linkedin.com/company/catodrive"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
