@@ -358,27 +358,23 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
 
   console.log('  Opening n8n...\n');
 
-  // Navigate to n8n
-  await page.goto(N8N_URL, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(2000);
-
   // ── 6a. Login to n8n if needed ──────────────────────────────────────
-  // Robust detection (#133858): unauthenticated sessions get redirected to
-  // /signin. A hosted n8n (e.g. Railway) cold-loads slower than the old 3s
-  // detection, so login was being SKIPPED and the run proceeded unauthenticated
-  // → every downstream step (chat panel/input) silently failed. Key off the URL
-  // AND wait longer for the form.
-  const emailInput = page.locator('input[type="email"], input[name="email"]').first();
-  let needLogin = /\/(signin|setup)/.test(page.url());
-  if (!needLogin) {
-    needLogin = await emailInput.isVisible({ timeout: 10000 }).catch(() => false);
-  }
+  // Go STRAIGHT to /signin (deterministic). The old approach loaded the base URL
+  // and waited for a client-side redirect to /signin — on a cold-loading hosted
+  // n8n that took longer than the detection window, so login was SKIPPED and the
+  // run proceeded UNAUTHENTICATED → "no chat input" red herring (#133858). n8n's
+  // real field name is `emailOrLdapLoginId` (verified against the live form), NOT
+  // `email` — the old selector never matched. If already authenticated, n8n
+  // bounces /signin → home and the form never appears, so login is skipped.
+  await page.goto(`${N8N_URL}/signin`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const emailInput = page.locator('input[name="emailOrLdapLoginId"], input[type="email"]').first();
+  const needLogin = await emailInput.isVisible({ timeout: 20000 }).catch(() => false);
   if (needLogin) {
     console.log('  Logging into n8n...');
 
-    await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-    const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
+    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
     await emailInput.fill(N8N_EMAIL);
     await passwordInput.fill(N8N_PASSWORD);
     await page.waitForTimeout(500);
@@ -386,18 +382,19 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
     const signInBtn = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
     await signInBtn.click();
     // Wait until we leave the sign-in page (auth completed), not a fixed sleep.
-    await page.waitForURL((u) => !/\/(signin|setup)/.test(u.toString()), { timeout: 25000 }).catch(() => {});
+    await page.waitForURL((u) => !/\/signin/.test(u.toString()), { timeout: 25000 }).catch(() => {});
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.waitForTimeout(1500);
 
-    // Verify auth actually succeeded — fail LOUD instead of silently proceeding
-    // unauthenticated (which produced the "no chat input" red herring).
-    const stillSignedOut = /\/(signin|setup)/.test(page.url())
-      || await page.locator('input[type="password"]').first().isVisible({ timeout: 2000 }).catch(() => false);
+    // Verify auth actually succeeded — fail LOUD instead of silently proceeding.
+    const stillSignedOut = /\/signin/.test(page.url())
+      || await page.locator('input[name="emailOrLdapLoginId"], input[type="password"]').first().isVisible({ timeout: 2000 }).catch(() => false);
     if (stillSignedOut) {
       throw new Error('n8n login failed — still on the sign-in page. Check N8N_EMAIL / N8N_PASSWORD / N8N_URL.');
     }
     console.log('  Logged in to n8n.\n');
+  } else {
+    console.log('  Already authenticated to n8n.\n');
   }
 
   // ── 6b. Open the workflow directly by ID ────────────────────────────
