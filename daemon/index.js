@@ -209,6 +209,15 @@ class Daemon {
       pause_reason: this.pauseReason,
       active_sessions: this._getLocalSessions(),
       session_capabilities: this._getSessionCapabilities(),
+      // Power/load truth so the cloud can SEE which nodes are on battery / hibernating and
+      // route heavy (browser) work to AC-powered nodes. The daemon already computes this for
+      // its own battery-aware throttling; we just surface it. Additive — no behavior change.
+      power: (this.resourceMonitor && this.resourceMonitor.capacity) ? {
+        on_battery: this.resourceMonitor.capacity.on_battery,
+        battery_pct: this.resourceMonitor.capacity.battery_pct,
+        level: this.resourceMonitor.capacity.level,
+        cpu_pct: this.resourceMonitor.capacity.cpu_pct
+      } : null,
       local_schedules: this.scheduleRegistry
         ? (() => {
             const list = this.scheduleRegistry.list()
