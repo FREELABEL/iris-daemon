@@ -167,7 +167,10 @@ async function main () {
   const context = await browser.newContext()
   const page = await context.newPage()
 
-  await page.goto(config.url)
+  // YouTube (and other heavy SPAs) never reliably fire the default 'load' event, so
+  // page.goto() was timing out at 30s and crashing the capture BEFORE the user could log
+  // in. Use domcontentloaded + a generous timeout, and don't let a slow load abort capture.
+  await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
   await page.waitForTimeout(3000)
 
   // Handle cookie consent
