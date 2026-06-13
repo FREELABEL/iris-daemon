@@ -120,6 +120,28 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
 
   console.log(`  Logged in to YouTube. Scraping ${ytSource.label}...\n`);
 
+  // ── DEBUG: which account are we ACTUALLY logged in as? ──────────────
+  // The "wrong account" failure (a stale/other session got pulled from the cloud)
+  // is invisible until we surface it. Log the active account + session size before
+  // scraping so we can tell at a glance whether the right account is in play.
+  try {
+    const cookieCount = (storageState.cookies || []).length;
+    console.log(`  [DEBUG] Session: ${cookieCount} cookies | file: ${YT_AUTH_FILE}`);
+    await page.locator('button#avatar-btn, img.yt-spec-avatar-shape__avatar').first().click({ timeout: 5000 });
+    await page.waitForTimeout(1500);
+    const acct = await page.evaluate(() => {
+      const t = (sel: string) => (document.querySelector(sel)?.textContent || '').trim();
+      const name = t('#account-name') || t('ytd-active-account-header-renderer #channel-title') || t('#channel-title');
+      const handle = t('#channel-handle') || t('#email') || t('ytd-active-account-header-renderer #email');
+      return { name, handle };
+    });
+    console.log(`  [DEBUG] Logged-in account: ${acct.name || '(unknown)'}${acct.handle ? ' · ' + acct.handle : ''}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(500);
+  } catch (e: any) {
+    console.log(`  [DEBUG] Could not read account: ${e?.message}`);
+  }
+
   // ── 3b. Apply sort order for playlists ──────────────────────────────
   if (ytSource.isPlaylist && SORT) {
     const sortMap: Record<string, string> = {
@@ -315,7 +337,16 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
   const liveCount = videos.filter(v => v.duration === 'LIVE').length;
   const adCount = videos.length - cleanVideos.length - liveCount;
 
+  console.log(`  [DEBUG] DOM cards seen: ${videos.length} | clean: ${cleanVideos.length} | ads: ${adCount} | live: ${liveCount}`);
   console.log(`  Scraped ${cleanVideos.length} videos (${adCount > 0 ? adCount + ' ads, ' : ''}${liveCount > 0 ? liveCount + ' live streams ' : ''}filtered)\n`);
+
+  // Loud signal when a playlist (e.g. Watch Later) comes back empty — usually means
+  // the WRONG account's session is in play (its Watch Later is empty/different), or
+  // the playlist genuinely has nothing. Either way, surface it instead of silently
+  // delivering 0 videos to n8n.
+  if (cleanVideos.length === 0) {
+    console.log(`  [DEBUG] ⚠️  0 videos scraped from ${ytSource.label}. If this is Watch Later, the logged-in account (above) likely isn't the one with the videos — re-capture the session on the correct account.`);
+  }
 
   // Print summary table
   console.log('  ┌─────┬────────────────────────────────────────────────────┬──────────────────────────┐');
