@@ -975,6 +975,19 @@ class TaskExecutor {
       } else {
         taskStatus = 'completed_with_warnings'
       }
+
+      // A non-zero browser task is usually benign (scrape succeeded, n8n hiccup
+      // on the trailing chat step). But a CATASTROPHIC crash — the script never
+      // ran at all (missing module, broken npx/bin, no tests found) — must NOT be
+      // laundered into a green "completed". Otherwise a total infra break reports
+      // success to the scheduler and never alerts. Escalate those to real failures.
+      if (taskStatus === 'completed_with_warnings') {
+        const fatalCrash = /Cannot find module|MODULE_NOT_FOUND|command not found|No tests found|npm ERR!|npm error|Missing script|Unknown discover script|Cannot find package|Executable doesn't exist|ENOENT/i.test(truncatedOutput)
+        if (fatalCrash) {
+          taskStatus = 'failed'
+          console.log(`[executor] [${ts()}] Task ${taskId} escalated to FAILED — catastrophic crash detected (script never ran)`)
+        }
+      }
       // iris-api's NodeTaskController validator only accepts:
       //   completed, failed, skipped, timeout
       // `completed_with_warnings` triggers HTTP 422 "selected status is invalid",
@@ -1146,8 +1159,13 @@ class TaskExecutor {
         }
       }
 
-      // Discord notification
-      this.notifyDiscord(task, 'completed', Date.now() - startTime, outputLines).catch(() => {})
+      // Discord notification — reflect the REAL status. A catastrophic browser
+      // crash escalated to 'failed' above must fire a ❌ alert, not a green ✅.
+      const notifyStatus = taskStatus === 'failed' ? 'failed' : 'completed'
+      const notifyError = taskStatus === 'failed'
+        ? `Task exited ${result.exitCode} and never produced output — likely a crashed/missing dependency. Check daemon logs.`
+        : undefined
+      this.notifyDiscord(task, notifyStatus, Date.now() - startTime, outputLines, notifyError).catch(() => {})
     } catch (err) {
       clearInterval(progressInterval)
 
@@ -2385,8 +2403,16 @@ const BODY = ${JSON.stringify(clipBody)};
           // prompt format: "{subcommand} [key=value ...]"
           // e.g. "import-yt-feed limit=50 dry=0"
           const discoverParts = task.prompt.trim().split(/\s+/)
-          const discoverSubcommand = discoverParts[0] // import-yt-feed
+          let discoverSubcommand = discoverParts[0] // import-yt-feed
           const discoverExtraArgs = discoverParts.slice(1)
+
+          // Defensive: some dispatch paths leak the campaign-arg form `campaign=<x>`
+          // as the first token (iris-api NodeTaskController normalizes these, but an
+          // older client or a direct dispatch may not). Strip the prefix so we never
+          // build the bogus `npm run discover:campaign=<x>` (Missing script → no-op).
+          if (discoverSubcommand.startsWith('campaign=')) {
+            discoverSubcommand = discoverSubcommand.slice('campaign='.length)
+          }
 
           // Try monorepo first, fall back to bridge (portable)
           let discoverRoot = this.freelabelPath || findFreelabelPath()
@@ -2412,8 +2438,25 @@ const BODY = ${JSON.stringify(clipBody)};
             }
           }
 
+          // Fail loudly if the resolved npm script doesn't exist. Otherwise npm
+          // exits instantly with "Missing script" and the browser-task path
+          // launders that into a green "completed" — a silent no-op that looks
+          // like success (the exact failure mode behind the YT-feed campaign bug).
+          const scriptName = `discover:${discoverSubcommand}`
+          try {
+            const pkg = JSON.parse(fs.readFileSync(path.join(discoverRoot, 'package.json'), 'utf8'))
+            if (!pkg.scripts || !pkg.scripts[scriptName]) {
+              const available = Object.keys(pkg.scripts || {}).filter(s => s.startsWith('discover:'))
+              reject(new Error(`Unknown discover script "${scriptName}" (from prompt "${task.prompt}"). Available: ${available.join(', ') || '(none)'}. The campaign likely dispatched a template id instead of a subcommand.`))
+              return
+            }
+          } catch (e) {
+            reject(new Error(`Could not validate discover script "${scriptName}": ${e.message}`))
+            return
+          }
+
           cmd = 'npm'
-          args = ['run', `discover:${discoverSubcommand}`, '--', ...discoverExtraArgs]
+          args = ['run', scriptName, '--', ...discoverExtraArgs]
           workspace.projectDir = discoverRoot
           break
         }
