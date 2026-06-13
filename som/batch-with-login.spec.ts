@@ -7,7 +7,7 @@ import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
-import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from '../../fl-docker-dev/coding-agent-bridge/som/helpers/inbox-scanner';
+import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
 
