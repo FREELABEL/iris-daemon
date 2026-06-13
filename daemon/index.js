@@ -208,6 +208,7 @@ class Daemon {
       paused: this.paused,
       pause_reason: this.pauseReason,
       active_sessions: this._getLocalSessions(),
+      session_capabilities: this._getSessionCapabilities(),
       local_schedules: this.scheduleRegistry
         ? (() => {
             const list = this.scheduleRegistry.list()
@@ -2145,6 +2146,28 @@ LIMIT ${limit}
       return this._cachedSessions || []
     } catch {
       return []
+    }
+  }
+
+  // Capabilities this node can serve, derived from the browser-session files it holds.
+  // The cloud maps these onto ComputeNode.capabilities so the dispatcher routes
+  // session-bound tasks (e.g. YouTube discover) ONLY to a node that can actually run
+  // them. Sync (fs) — safe in the heartbeat callback. Reports the FULL current set so
+  // a deleted/expired session clears the capability on the next heartbeat.
+  _getSessionCapabilities () {
+    try {
+      const fs = require('fs'); const path = require('path'); const os = require('os')
+      const somDir = path.join(os.homedir(), '.iris', 'bridge', 'som')
+      const caps = {}
+      if (fs.existsSync(path.join(somDir, 'youtube-auth.json'))) caps.youtube = true
+      let files = []
+      try { files = fs.readdirSync(somDir) } catch { files = [] }
+      if (files.some(f => f.startsWith('instagram-auth-'))) caps.instagram = true
+      if (files.some(f => f.startsWith('linkedin-auth'))) caps.linkedin = true
+      if (files.some(f => f.startsWith('twitter-auth') || f.startsWith('x-auth'))) caps.twitter = true
+      return caps
+    } catch {
+      return {}
     }
   }
 
