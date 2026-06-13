@@ -244,6 +244,52 @@ async function getCampaignConfigs (freelabelRoot) {
   }
 }
 
+// Pull any MISSING Instagram sessions from the user's encrypted cloud store before
+// a SOM run, so a fresh node self-heals instead of skipping with no login (the gap
+// behind bugs #133740/#133744). Sessions live in platform_credentials keyed by
+// bloq_id+platform; we fetch the decrypted storageState per active campaign board
+// and write som/instagram-auth-<igAccount>.json. Best-effort + loud on absence.
+async function ensureSomSessions (somDir, configs) {
+  const { userId, token } = resolveDaemonIdentity()
+  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
+  const seen = new Set()
+  const missing = []
+  for (const c of Object.values(configs || {})) {
+    const ig = c.igAccount
+    const board = c.boardId
+    if (!ig || !board || seen.has(ig)) continue
+    seen.add(ig)
+    const sessionFile = path.join(somDir, `instagram-auth-${ig}.json`)
+    if (fs.existsSync(sessionFile)) continue // already present locally
+    try {
+      const url = `${apiBase}/api/v1/project-credentials/session?bloq_id=${board}&platform=instagram&user_id=${userId}`
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!res.ok) {
+        console.log(`[executor] No cloud IG session for ${ig} (board ${board}): ${res.status} — run 'iris som push-sessions'`)
+        missing.push(ig)
+        continue
+      }
+      const data = await res.json()
+      if (data && data.credentials) {
+        fs.writeFileSync(sessionFile, JSON.stringify(data.credentials, null, 2))
+        console.log(`[executor] Pulled IG session for ${ig} from cloud → ${sessionFile}`)
+      } else {
+        missing.push(ig)
+      }
+    } catch (err) {
+      console.log(`[executor] IG session fetch failed for ${ig}: ${err.message}`)
+      missing.push(ig)
+    }
+  }
+  if (missing.length) {
+    console.log(`[executor] ⚠️  ${missing.length} campaign account(s) have no IG session (cloud or local): ${missing.join(', ')} — run 'iris som push-sessions' from a machine that has them`)
+  }
+  return { missing }
+}
+
 // SOM Preflight — delegated to som-config.js (single source of truth).
 // Lazy-loaded because freelabel path may not be resolved yet at module load time.
 let _somPreflightCheck = null
@@ -2183,6 +2229,14 @@ async function call(method, p, body) {
               } catch (cacheErr) {
                 console.log(`[executor] ⚠️  Failed to write SOM cache: ${cacheErr.message}`)
               }
+            }
+
+            // Self-heal: pull any missing IG sessions from the user's encrypted
+            // cloud store so a fresh node can actually send (not silently skip).
+            try {
+              await ensureSomSessions(somDir, allConfigs)
+            } catch (sessErr) {
+              console.log(`[executor] ⚠️  IG session ensure failed: ${sessErr.message}`)
             }
             let anyEligible = false
             const skippedCampaigns = []
