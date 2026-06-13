@@ -11,6 +11,7 @@ instagram-auth-*.json
 
 # Local runtime state
 native-imessage-state.json
+.uptime-monitor-state.json
 
 # Test artifacts
 test-results/

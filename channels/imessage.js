@@ -380,6 +380,21 @@ class IMessageChannel extends EventEmitter {
       const when = isNaN(sentAt.getTime()) ? new Date() : sentAt
       const date = when.toISOString().slice(0, 10)
       const logFile = path.join(logDir, `${date}.jsonl`)
+
+      // Capture attachment file paths (screenshots etc.) so downstream tooling
+      // (`iris imessage mentions respond`) can actually SEE what the client sent.
+      // localPath comes through as ~/Library/Messages/Attachments/... — expand ~
+      // here so consumers get a directly-readable absolute path.
+      const attachments = (event.attachments || [])
+        .filter(a => a && a.localPath)
+        .map(a => ({
+          name: a.name || null,
+          mimeType: a.mimeType || null,
+          path: a.localPath.startsWith('~')
+            ? path.join(os.homedir(), a.localPath.slice(1))
+            : a.localPath
+        }))
+
       const entry = JSON.stringify({
         ts: when.toISOString(),
         sender: event.sender_id,
@@ -387,7 +402,8 @@ class IMessageChannel extends EventEmitter {
         lead_name: event.lead_name || null,
         chat: event.conversation_id,
         is_group: event.is_group,
-        text: event.text.slice(0, 500)
+        text: event.text.slice(0, 500),
+        ...(attachments.length ? { attachments } : {})
       })
       fs.appendFileSync(logFile, entry + '\n')
       console.log(`[imessage] Mention logged to ${logFile}`)
