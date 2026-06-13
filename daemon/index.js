@@ -232,10 +232,12 @@ class Daemon {
       heartbeat_state: this.heartbeat.state,
       local_ip: this._getLocalIp(),
       max_concurrent: parseInt(process.env.MAX_CONCURRENT || '3', 10),
-      running_task_ids: [
-        ...(this.executor ? [...this.executor.runningTasks.keys()] : []),
+      // running ∪ reserved ∪ queued (gate.visibleIds) ∪ pending-accept — so the server
+      // sees gate-queued tasks and never orphans or double-dispatches them.
+      running_task_ids: [...new Set([
+        ...(this.executor ? this.executor.gate.visibleIds() : []),
         ...this.pendingTaskIds
-      ]
+      ])]
     })
     this.heartbeat.onPingCallback = () => {
       this._writeStatusFile()
@@ -416,7 +418,9 @@ class Daemon {
         paused: this.paused,
         capacity: capacity.level || 'unknown',
         tasks,
-        pending_local: this.pendingTaskIds || [],
+        pending_local: [...this.pendingTaskIds],
+        // Admission gate: running/reserved holders, the visible queue, and live resource locks.
+        gate: this.executor && this.executor.gate ? this.executor.gate.snapshot() : null,
       })
     })
 
@@ -1698,25 +1702,11 @@ LIMIT ${limit}
         }
       }
 
-      // ── Pre-flight: singleton type check (AFTER fetch, we now have task.type) ──
-      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter']
-      if (task && singletonTypesPost.includes(task.type)) {
-        const executorRunning = (this.executor?._runningTasks || []).map(t => t.type)
-        if (executorRunning.includes(task.type)) {
-          console.log(`[daemon] ⏭ SINGLETON: Rejecting ${task.type} (${event.task_id.substring(0, 12)}) — another ${task.type} is already running`)
-          this.pendingTaskIds.delete(event.task_id)
-          try {
-            await this.cloud.submitResult(event.task_id, {
-              status: 'failed',
-              error: `Singleton: another ${task.type} is already running on this node`
-            })
-          } catch {}
-          return
-        }
-      }
-
-      // Browser concurrency is enforced by TaskExecutor.BROWSER_TYPES gate (max 1, queue 3).
-      // No process count pre-flight needed — the gate is the single source of truth.
+      // Singleton / resource exclusion + browser concurrency are enforced in ONE place:
+      // the executor's AdmissionGate (executor.execute → gate.admit). It derives "is this
+      // resource busy?" from the live runningTasks map reconciled against tmux, so a task
+      // here flows straight through to the gate, which runs / queues / dedups / rejects it.
+      // No duplicate daemon-side singleton check (that was the leaky, divergent copy).
 
       // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
       try {

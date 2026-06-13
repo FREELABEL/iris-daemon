@@ -36,6 +36,9 @@ try {
   console.warn(`[daemon] tmux-manager unavailable — Hive tasks will run via direct spawn (no tmux): ${err.message}`)
 }
 
+// Single local admission-control authority (idempotency + resource exclusion).
+const { AdmissionGate } = require('./admission-gate')
+
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
   const nvmDir = path.join(os.homedir(), '.nvm', 'versions', 'node')
@@ -463,17 +466,26 @@ class TaskExecutor {
   constructor (cloudClient, workspaceManager) {
     this.cloud = cloudClient
     this.workspaces = workspaceManager
-    this.runningTasks = new Map() // taskId → childProcess or { sessionName, tmux: true }
+    this.runningTasks = new Map() // taskId → entry { childProcess | { sessionName, tmux }, _resourceKeys, ... }
     this.flApiPath = findFlApiPath()
     this.dockerMode = null // lazily detected
-    this._browserQueue = []   // queued browser tasks waiting for their turn
-    this._browserRunning = false // true when a browser task is executing
-    this._executedTaskIds = new Map() // taskId -> timestamp (prevents re-execution from duplicate Pusher events)
+    this._executedTaskIds = new Map() // taskId -> timestamp (idempotency for duplicate Pusher events)
     // If the tmux module failed to load, use a null-object so every `this.tmux.available`
     // gate falls through to direct spawn and cleanup calls are safe no-ops.
     this.tmux = TmuxManager
       ? new TmuxManager()
       : { available: false, cleanup () {}, cleanupAll () {} }
+    // Single admission-control authority: idempotency + resource exclusion (browser slot,
+    // per-account session locks), with "is it busy?" DERIVED from runningTasks reconciled
+    // against live tmux. Replaces the old _runningTasks array, _browserRunning/_browserQueue
+    // boolean+array, and the two divergent per-type singleton checks. browserCapacity=1 is
+    // behaviour-identical to the old max-1 gate; raise IRIS_BROWSER_CAPACITY for parallelism.
+    this.gate = new AdmissionGate({
+      runningTasks: this.runningTasks,
+      tmux: this.tmux,
+      browserCapacity: parseInt(process.env.IRIS_BROWSER_CAPACITY || '1', 10) || 1,
+      queueLimit: parseInt(process.env.IRIS_BROWSER_QUEUE || '3', 10) || 3
+    })
     const verbose = process.env.DAEMON_VERBOSE || process.env.FL_API_PATH || process.env.FREELABEL_PATH
     if (this.flApiPath) {
       if (verbose) console.log(`[executor] fl-api path: ${this.flApiPath}`)
@@ -542,96 +554,59 @@ class TaskExecutor {
     return null
   }
 
-  async execute (task) {
+  async execute (task, opts = {}) {
     const taskId = task.id
     const runtime = task.runtime || task.config?.runtime || process.env.RUNTIME || 'iris_agent'
     const startTime = Date.now()
+    const fromGate = opts.fromGate === true // re-entry from the gate's queue drain
 
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
-    // ── Task ID dedup: reject if we've already executed/are executing this exact task ──
-    const now = Date.now()
-    for (const [id, seenTs] of this._executedTaskIds) {
-      if (now - seenTs > 3600000) this._executedTaskIds.delete(id)
-    }
-    if (this._executedTaskIds.has(taskId)) {
-      console.log(`[executor] [${ts()}] Duplicate task ${taskId.substring(0, 12)} — already executed/executing. Ignoring.`)
-      return
-    }
-    this._executedTaskIds.set(taskId, now)
-
-    // Track running tasks IMMEDIATELY (before any await) so concurrent calls see it
-    if (!this._runningTasks) this._runningTasks = []
-    this._runningTasks.push({ id: taskId, type: task.type, requirementId: task.config?.requirement_id || null })
-    const _cleanupRunning = () => {
-      this._runningTasks = (this._runningTasks || []).filter(t => t.id !== taskId)
-    }
-
-    // ── Dedup: reject if same task type is already running ──
-    // Prevents duplicate som_batch / discover when scheduler fires faster than execution
-    const singletonTypes = ['som_batch', 'som_swarm', 'discover', 'enrich_batch', 'inbox_scan', 'comms_sync', 'clip_cutter', 'venue_enrich']
-    if (singletonTypes.includes(task.type)) {
-      // Count others of same type (exclude self — we just pushed above)
-      const runningOfSameType = this._runningTasks.filter(t => t.type === task.type && t.id !== taskId)
-      if (runningOfSameType.length > 0) {
-        console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate ${task.type} — already running (${runningOfSameType[0].id.substring(0, 12)})`)
-        _cleanupRunning()
-        try {
-          await this.cloud.submitResult(taskId, {
-            status: 'failed',
-            error: `Duplicate ${task.type} rejected — another instance is already running`,
-            output: '',
-            duration_ms: 0
-          })
-        } catch {}
-        return
-      }
-    }
-
-    // ── Dedup: reject duplicate custom_playwright for same requirement_id ──
-    if (task.type === 'custom_playwright' && task.config?.requirement_id) {
-      const runningReq = this._runningTasks.find(
-        t => t.type === 'custom_playwright' && t.requirementId === task.config.requirement_id && t.id !== taskId
-      )
-      if (runningReq) {
-        console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate custom_playwright for requirement ${task.config.requirement_id} — already running`)
-        _cleanupRunning()
-        try {
-          await this.cloud.submitResult(taskId, {
-            status: 'failed',
-            error: `Duplicate custom_playwright for requirement ${task.config.requirement_id} rejected`,
-            output: '',
-            duration_ms: 0
-          })
-        } catch {}
-        return
-      }
-    }
-
-    // ── Browser concurrency gate: max 1 Chromium at a time ──
-    // When a browser task arrives while another is running, queue it locally
-    // and execute it when the current one finishes. Prevents 5 Chromium windows.
     const isBrowserTask = TaskExecutor.BROWSER_TYPES.includes(task.type)
-    if (isBrowserTask && this._browserRunning) {
-      const queueLen = this._browserQueue.length
-      if (queueLen >= 3) {
-        console.log(`[executor] [${ts()}] ⏭ Browser queue full (${queueLen}) — rejecting ${task.type} ${taskId.substring(0, 12)}`)
-        _cleanupRunning()
+
+    if (fromGate) {
+      // Re-entry from the gate's queue drain: already admitted + reserved upstream
+      // (the reservation persists until this run's finally). Re-running admission would
+      // reject the task against its own reservation, so skip it — just record idempotency.
+      this._executedTaskIds.set(taskId, Date.now())
+    } else {
+      // ── Idempotency: never run the same task id twice (duplicate Pusher events) ──
+      const now = Date.now()
+      for (const [id, seenTs] of this._executedTaskIds) {
+        if (now - seenTs > 3600000) this._executedTaskIds.delete(id)
+      }
+      if (this._executedTaskIds.has(taskId)) {
+        console.log(`[executor] [${ts()}] Duplicate task ${taskId.substring(0, 12)} — already executed. Ignoring.`)
+        return
+      }
+
+      // ── Admission: idempotency (live/queued) + resource exclusion (browser slot,
+      // per-account session locks). The single gate replaces both old singleton checks,
+      // the custom_playwright requirement dedup, and the _browserRunning/_browserQueue gate.
+      const decision = this.gate.admit(task)
+      if (decision.verdict === 'duplicate') {
+        console.log(`[executor] [${ts()}] Duplicate ${task.type} ${taskId.substring(0, 12)} — already live/queued. Ignoring.`)
+        return
+      }
+      if (decision.verdict === 'queue') {
+        console.log(`[executor] [${ts()}] ⏳ Resource busy — queued ${task.type} ${taskId.substring(0, 12)} (${this.gate.queuedCount()} waiting)`)
+        return // gate holds it; heartbeat reports it; it drains when a slot frees
+      }
+      if (decision.verdict === 'reject') {
+        console.log(`[executor] [${ts()}] ⏭ Local queue full — rejecting ${task.type} ${taskId.substring(0, 12)} (server will re-dispatch)`)
         try {
           await this.cloud.submitResult(taskId, {
             status: 'failed',
-            error: `Browser queue full (${queueLen} waiting) — task rejected to prevent resource exhaustion`,
+            error: 'Local browser queue full — task rejected; server will re-dispatch when a slot frees',
             output: '',
             duration_ms: 0
           })
         } catch {}
         return
       }
-      console.log(`[executor] [${ts()}] ⏳ Browser busy — queuing ${task.type} ${taskId.substring(0, 12)} (position ${queueLen + 1})`)
-      this._browserQueue.push(task)
-      return
+      // verdict === 'run' — reserved by the gate (keys held in the reservation)
+      this._executedTaskIds.set(taskId, now)
     }
-    if (isBrowserTask) this._browserRunning = true
 
     // Auto-install Playwright browsers on first browser task (idempotent — instant if already installed)
     // Pin to exact version from package.json to prevent version drift across nodes
@@ -753,15 +728,17 @@ class TaskExecutor {
         console.log(`\n[${tsNow}] \x1b[36m${senderName}\x1b[0m: ${msgText}\n`)
 
         // Hive inbox: persist to ~/.iris/hive/inbox/
+        let inboxEntry = null
         if (msgConfig.hive_inbox) {
           try {
-            await this._saveToHiveInbox(task)
+            inboxEntry = await this._saveToHiveInbox(task)
           } catch (err) {
             console.error(`[hive-inbox] Save failed: ${err.message}`)
           }
         }
 
-        // Smart notification truncation — long messages get a CLI hint
+        // Notification — clickable when it's an inbox message: clicking opens
+        // the web UI inbox (Option B) instead of dead-ending in Script Editor.
         try {
           const MAX_NOTIF = 140
           let notifText = msgText
@@ -769,11 +746,21 @@ class TaskExecutor {
             notifText = `File: ${msgConfig.file_name || 'download'}`
           }
           if (notifText.length > MAX_NOTIF) {
-            notifText = notifText.substring(0, MAX_NOTIF) + '... Run: iris hive inbox'
+            notifText = notifText.substring(0, MAX_NOTIF) + '…'
           }
-          const safeNotif = notifText.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
-          const safeTitle = `IRIS ${msgConfig.hive_inbox ? 'Inbox' : 'Message'} from ${senderName}`.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
-          execSync(`osascript -e 'display notification "${safeNotif}" with title "${safeTitle}"'`, { timeout: 5000, stdio: 'ignore' })
+          const title = `IRIS ${msgConfig.hive_inbox ? 'Inbox' : 'Message'} from ${senderName}`
+          if (msgConfig.hive_inbox) {
+            // Deep-link to the exact item when we have its id; else the inbox.
+            const webBase = process.env.IRIS_WEB_UI_URL || 'https://web.freelabel.net'
+            const nodeId = task.node_id || (this.cloud && this.cloud.nodeId) || null
+            const params = []
+            if (nodeId) params.push(`node=${encodeURIComponent(nodeId)}`)
+            if (inboxEntry && inboxEntry.id) params.push(`item=${encodeURIComponent(inboxEntry.id)}`)
+            const url = `${webBase}/hive/inbox${params.length ? `?${params.join('&')}` : ''}`
+            this._notifyClickable(title, notifText, url)
+          } else {
+            this._notifyClickable(title, notifText, null)
+          }
         } catch { /* non-macOS or notification failed */ }
         clearInterval(progressInterval)
         await this.cloud.submitResult(taskId, {
@@ -1272,7 +1259,10 @@ class TaskExecutor {
         fs.unlinkSync(credentialFilePath)
         console.log(`[executor] Credential file cleaned up: ${credentialFilePath}`)
       }
-      _cleanupRunning() // Remove from dedup tracking
+      // Free this task's gate hold (reservation), reap its tmux session, then drop it
+      // from the live map. This is the ONE release point — it runs on every exit path
+      // including catch — which is why a leaked lock is now structurally impossible.
+      this.gate.release(taskId)
       // Clean up tmux session if this task used one (with completion data for ledger)
       const runningEntry = this.runningTasks.get(taskId)
       if (runningEntry?.tmux && runningEntry.sessionName) {
@@ -1281,21 +1271,17 @@ class TaskExecutor {
       }
       this.runningTasks.delete(taskId)
 
-      // ── Browser queue drain: run next queued browser task ──
-      if (isBrowserTask) {
-        this._browserRunning = false
-        if (this._browserQueue.length > 0) {
-          const next = this._browserQueue.shift()
-          console.log(`[executor] [${ts()}] 🔄 Browser slot free — executing queued ${next.type} ${next.id.substring(0, 12)} (${this._browserQueue.length} remaining)`)
-          // Small delay to let Chromium processes fully exit
-          setTimeout(() => this.execute(next), 3000)
-        }
+      // ── Drain: start every queued task whose resources are now free ──
+      // The gate reserves each as it dequeues (so cross-resource tasks can start
+      // together); re-entry uses { fromGate: true } to skip re-admission. A small
+      // delay lets Chromium fully exit before the next browser task spawns.
+      for (const next of this.gate.drain()) {
+        console.log(`[executor] [${ts()}] 🔄 Resource free — running queued ${next.type} ${next.id.substring(0, 12)}`)
+        setTimeout(() => this.execute(next, { fromGate: true }), 2000)
       }
 
       // Clean up workspace after a delay (keep for debugging)
       setTimeout(() => this.workspaces.cleanup(taskId), 60000)
-
-      // Browser gate (BROWSER_TYPES + max 1) prevents concurrent Chromium — no cleanup needed
     }
   }
 
@@ -1446,7 +1432,7 @@ class TaskExecutor {
           // Stagger comms_sync start by 2s to avoid concurrent Bun binary spawn races.
           // The iris binary (Bun-compiled) can crash with exit code null when multiple
           // instances initialize simultaneously (shared tempfile/lockfile contention).
-          const otherIrisTasks = (this._runningTasks || []).filter(t => t.type === 'comms_sync' || t.type === 'inbox_scan')
+          const otherIrisTasks = [...this.runningTasks.values()].filter(e => e._taskType === 'comms_sync' || e._taskType === 'inbox_scan')
           if (otherIrisTasks.length > 0) {
             console.log(`[executor] comms_sync: waiting 3s — another iris task running`)
             await new Promise(r => setTimeout(r, 3000))
@@ -3696,6 +3682,41 @@ exit 1
   }
 
   /**
+   * Fire a macOS notification that OPENS A URL when clicked.
+   *
+   * Native `osascript display notification` cannot carry a click action —
+   * clicking it just opens the sending app (Script Editor), which is the
+   * #133850 dead-end. terminal-notifier supports `-open <url>`, so when it
+   * is installed we use it to make the notification open the web UI inbox.
+   * Falls back to a plain (non-clickable) osascript notification otherwise.
+   */
+  _notifyClickable (title, message, url) {
+    const { execFileSync } = require('child_process')
+    // Resolve terminal-notifier once and cache (undefined = unchecked).
+    if (this._tnPath === undefined) {
+      try {
+        this._tnPath = execFileSync('command', ['-v', 'terminal-notifier'], { shell: '/bin/bash', encoding: 'utf-8' }).trim() || null
+      } catch { this._tnPath = null }
+    }
+    try {
+      if (this._tnPath && url) {
+        execFileSync(this._tnPath, [
+          '-title', title,
+          '-message', message,
+          '-open', url,
+          '-sound', 'default',
+          '-group', 'iris-hive-inbox',
+        ], { timeout: 5000, stdio: 'ignore' })
+        return
+      }
+      // Fallback: plain notification (no click target). Strip quotes/non-ASCII.
+      const safeMsg = message.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
+      const safeTitle = title.replace(/['"\\]/g, '').replace(/[^\x20-\x7E]/g, '')
+      execSync(`osascript -e 'display notification "${safeMsg}" with title "${safeTitle}"'`, { timeout: 5000, stdio: 'ignore' })
+    } catch { /* non-macOS or notification failed — not critical */ }
+  }
+
+  /**
    * Save an incoming hive_inbox message to ~/.iris/hive/inbox/
    * Handles file downloads (streaming), text, and link types.
    * Security: path traversal protection, streaming I/O, TTL checks.
@@ -3847,6 +3868,10 @@ exit 1
 
     // Phase 4: Auto-prune old items (>14 days) — runs after every save
     this._pruneHiveInbox(inboxDir, manifestPath)
+
+    // Return the saved entry so callers can deep-link the notification
+    // to this exact item (web UI inbox — Option B).
+    return entry
   }
 
   /**
