@@ -400,7 +400,12 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
   // ── 6b. Open the workflow directly by ID ────────────────────────────
   console.log(`  Opening workflow "${WORKFLOW_NAME}" (${WORKFLOW_ID})...`);
 
-  await page.goto(`${N8N_URL}/workflow/${WORKFLOW_ID}`, { waitUntil: 'networkidle', timeout: 15000 });
+  // The n8n editor is a heavy SPA with persistent websockets, so it NEVER reaches
+  // `networkidle` — using that as the wait condition timed out at 15s (#133858).
+  // Wait for domcontentloaded (generous timeout), then for the canvas to render.
+  await page.goto(`${N8N_URL}/workflow/${WORKFLOW_ID}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.locator('.vue-flow__node, [data-test-id="canvas-node"], #node-view, .node-view')
+    .first().waitFor({ state: 'visible', timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(3000);
   console.log('  Workflow opened.\n');
 
