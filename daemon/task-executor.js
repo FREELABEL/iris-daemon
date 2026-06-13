@@ -139,6 +139,45 @@ let _dbCampaignCache = null
 let _dbCampaignCacheTs = 0
 const DB_CAMPAIGN_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
+// Resolve the daemon's identity (user_id + API token) for server-to-server calls.
+// On a fresh client machine the HEYIRIS_* env vars are unset, so we must fall back
+// to the same stores the rest of the daemon uses (~/.iris/sdk/.env, ~/.iris/config.json)
+// instead of the hardcoded user-1 default — otherwise we query the WRONG user's
+// campaigns and SOM no-ops (bug #133634). Read once and memoize.
+let _daemonIdentity = null
+function resolveDaemonIdentity () {
+  if (_daemonIdentity) return _daemonIdentity
+
+  let userId = process.env.HEYIRIS_USER_ID || process.env.IRIS_USER_ID || null
+  let token = process.env.HEYIRIS_TOKEN || process.env.IRIS_API_KEY || null
+
+  // ~/.iris/sdk/.env (written by iris auth login) — IRIS_USER_ID / IRIS_API_KEY
+  try {
+    const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
+    if (fs.existsSync(sdkEnv)) {
+      const raw = fs.readFileSync(sdkEnv, 'utf8')
+      if (!userId) userId = (raw.match(/^IRIS_USER_ID=(.+)$/m) || [])[1]?.trim() || null
+      if (!token) token = (raw.match(/^IRIS_API_KEY=(.+)$/m) || [])[1]?.trim() || null
+    }
+  } catch { /* ignore */ }
+
+  // ~/.iris/config.json — daemon node config (user_id / node_api_key)
+  try {
+    const cfgFile = path.join(os.homedir(), '.iris', 'config.json')
+    if (fs.existsSync(cfgFile)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'))
+      if (!userId) userId = cfg.user_id || cfg.userId || null
+      if (!token) token = cfg.node_api_key || cfg.api_key || null
+    }
+  } catch { /* ignore */ }
+
+  _daemonIdentity = {
+    userId: userId ? String(userId) : '1',
+    token: token || 'ca54cd87e7046098eee99de3b9c98cfd',
+  }
+  return _daemonIdentity
+}
+
 async function fetchDbCampaignConfigs () {
   const now = Date.now()
   if (_dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
@@ -146,8 +185,7 @@ async function fetchDbCampaignConfigs () {
   }
 
   const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
-  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
-  const userId = process.env.HEYIRIS_USER_ID || '1'
+  const { userId, token: apiToken } = resolveDaemonIdentity()
 
   try {
     const url = `${apiBase}/api/v1/campaign-templates/daemon-configs?user_id=${userId}`
@@ -191,9 +229,11 @@ async function getCampaignConfigs (freelabelRoot) {
     }
   }
 
-  // Fallback to som-config.js
+  // Fallback to som-config.js — `freelabelRoot` here is the som dir
+  // (batchRoot || batchBundledSomDir), so som-config.js sits alongside it,
+  // NOT under tests/e2e/. The old path silently never resolved (bug #133634).
   try {
-    const somConfig = require(path.join(freelabelRoot, 'tests/e2e/som-config.js'))
+    const somConfig = require(path.join(freelabelRoot, 'som-config.js'))
     return {
       configs: somConfig.getDaemonConfigs(),
       activeAccounts: Object.values(somConfig.getActiveAccounts()),
@@ -982,7 +1022,7 @@ class TaskExecutor {
       // laundered into a green "completed". Otherwise a total infra break reports
       // success to the scheduler and never alerts. Escalate those to real failures.
       if (taskStatus === 'completed_with_warnings') {
-        const fatalCrash = /Cannot find module|MODULE_NOT_FOUND|command not found|No tests found|npm ERR!|npm error|Missing script|Unknown discover script|Cannot find package|Executable doesn't exist|ENOENT/i.test(truncatedOutput)
+        const fatalCrash = /Cannot find module|MODULE_NOT_FOUND|command not found|No tests found|npm ERR!|npm error|Missing script|Unknown discover script|Cannot find package|Executable doesn't exist|ENOENT|No SOM campaigns configured/i.test(truncatedOutput)
         if (fatalCrash) {
           taskStatus = 'failed'
           console.log(`[executor] [${ts()}] Task ${taskId} escalated to FAILED — catastrophic crash detected (script never ran)`)
@@ -2125,8 +2165,25 @@ async function call(method, p, body) {
             const batchWaitArg = batchArgs.find(a => a.toLowerCase().startsWith('wait_days='))
             const batchWait = batchWaitArg ? parseInt(batchWaitArg.split('=')[1], 10) : 2
 
-            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(batchRoot || batchBundledSomDir)
+            const somDir = batchRoot || batchBundledSomDir
+            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(somDir)
             console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts, mode=${batchMode})`)
+
+            // ── Bridge the disconnect (bug #133634) ──────────────────────────
+            // The spawned som-all.js reads campaigns synchronously from
+            // som-config.js at module load, which only knows about the on-disk
+            // cache. So before spawning we materialize the DB configs into the
+            // cache file the child will read — otherwise the child sees an empty
+            // registry and silently exits "nothing to run" on any fresh machine.
+            if (source === 'database' && allConfigs && Object.keys(allConfigs).length) {
+              try {
+                const cacheFile = path.join(somDir, '.som-campaigns-cache.json')
+                fs.writeFileSync(cacheFile, JSON.stringify({ syncedAt: new Date().toISOString(), campaigns: allConfigs }, null, 2))
+                console.log(`[executor] Wrote ${Object.keys(allConfigs).length} DB campaigns → ${cacheFile}`)
+              } catch (cacheErr) {
+                console.log(`[executor] ⚠️  Failed to write SOM cache: ${cacheErr.message}`)
+              }
+            }
             let anyEligible = false
             const skippedCampaigns = []
 

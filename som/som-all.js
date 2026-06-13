@@ -25,6 +25,18 @@ const somConfig = require('./som-config');
 const campaignRegistry = somConfig.getCampaignRegistry();
 const { preflightCheck } = somConfig;
 
+// ── Loud failure on missing config (bug #133634) ─────────────────────────────
+// An EMPTY registry means campaigns were never synced to this machine — that is
+// a real misconfiguration, NOT "all campaigns exhausted". Exiting 0 here would
+// launder a broken install into a green "completed" run (same silent-failure
+// class as the YT-feed outage). Exit non-zero so the daemon escalates + alerts.
+if (Object.keys(campaignRegistry).length === 0) {
+  console.error('\x1b[31m✖ No SOM campaigns configured on this machine.\x1b[0m');
+  console.error('  The campaign cache is empty — run:  \x1b[1miris som sync\x1b[0m');
+  console.error('  (or set HEYIRIS_USER_ID so the daemon can fetch them from the DB)');
+  process.exit(1);
+}
+
 const API_BASE = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
 const API_TOKEN = process.env.HEYIRIS_TOKEN || (() => {
   try {
