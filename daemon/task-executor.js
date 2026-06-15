@@ -2428,11 +2428,22 @@ const API = ${JSON.stringify(clipApiBase)};
 const BODY = ${JSON.stringify(clipBody)};
 
 (async () => {
-  const res = await fetch(API + '/api/v1/clips/cut-scheduled', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(BODY)
-  });
+  // Fail fast: the endpoint should enqueue + return a job_id in ~1-2s. Without a timeout a slow/
+  // hung response left the daemon task "running" for minutes until reconciliation marked it
+  // "orphaned — daemon restarted or process died" (#853). 90s tolerates a still-synchronous
+  // endpoint while never hanging into an orphan; a timeout exits non-zero (clean failure).
+  let res;
+  try {
+    res = await fetch(API + '/api/v1/clips/cut-scheduled', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(BODY),
+      signal: AbortSignal.timeout(90000)
+    });
+  } catch (err) {
+    console.error('[clip_cutter] request failed/timed out (90s): ' + err.message);
+    process.exit(1);
+  }
   const text = await res.text();
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) { console.error('[clip_cutter] HTTP ' + res.status + ': ' + text.slice(0, 300)); process.exit(1); }
