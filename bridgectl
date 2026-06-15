@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the REAL script location through any symlinks before computing BRIDGE_DIR.
+# iris-bridge is a symlink at ~/.iris/bin/iris-bridge → ~/.iris/bridge/bridgectl; using
+# "$0" directly would resolve BRIDGE_DIR to ~/.iris/bin and run ~/.iris/bin/index.js
+# (which does not exist), so `iris-bridge start/restart` took the bridge down with no
+# recovery (#136550). This portable loop follows the link chain (no GNU readlink -f).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [ "${SOURCE#/}" = "$SOURCE" ] && SOURCE="$DIR/$SOURCE"
+done
+BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 case "${1:-status}" in
     start)
         PID=$(lsof -ti :3200 2>/dev/null || true)

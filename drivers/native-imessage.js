@@ -72,11 +72,22 @@ class NativeIMessageDriver extends EventEmitter {
       const maxId = rows[0]?.max_id || 0
       console.log(`[native-imessage] ✓ chat.db accessible (${maxId} messages)`)
 
-      // Load persisted state or use current max
+      // Load persisted state, then guard against replaying a backlog. A stale state
+      // file (from a run hours/days ago) would make the first poll match EVERY message
+      // since then and auto-reply to all of them — the #137256 incident (28 acks blasted
+      // to 9 contacts in 5s the instant the channel was enabled). Only resume from
+      // persisted state when it's within a small window of the current max; otherwise
+      // snap to the latest message so we NEVER replay a backlog on start.
       this._loadState()
+      const BACKLOG_REPLAY_WINDOW = 20
+      const replayOptIn = process.env.IMESSAGE_REPLAY_BACKLOG === '1'
       if (this.lastMessageRowId === 0) {
         this.lastMessageRowId = maxId
         console.log(`[native-imessage] Starting from message #${maxId} (no history replay)`)
+      } else if (!replayOptIn && this.lastMessageRowId < maxId - BACKLOG_REPLAY_WINDOW) {
+        const behind = maxId - this.lastMessageRowId
+        console.log(`[native-imessage] Persisted #${this.lastMessageRowId} is ${behind} messages behind — snapping to #${maxId} to avoid a startup backlog blast (set IMESSAGE_REPLAY_BACKLOG=1 to replay)`)
+        this.lastMessageRowId = maxId
       } else {
         console.log(`[native-imessage] Resuming from message #${this.lastMessageRowId}`)
       }

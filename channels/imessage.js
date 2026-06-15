@@ -27,6 +27,7 @@ class IMessageChannel extends EventEmitter {
     this.errorCount = 0
     this._mentionCooldowns = new Map() // chatGuid → timestamp
     this._contactCache = new Map()     // senderAddress → { lead, expires }
+    this._replyTimes = []              // timestamps of recent auto-replies (global rate-limit)
   }
 
   /**
@@ -183,6 +184,15 @@ class IMessageChannel extends EventEmitter {
         lead_name: contact?.name || null
       }
 
+      // Global reply rate-limit (defense in depth): the per-chat cooldown above does
+      // NOT stop a burst SPREAD ACROSS many chats (the #137256 blast hit 9 contacts in
+      // ~5s). Cap total auto-replies in a rolling 60s window; the mention was already
+      // logged locally, so excess is logged-not-replied rather than lost.
+      if (!normalized.is_from_me && !this._globalReplyAllowed()) {
+        console.log(`[imessage] Global reply rate-limit reached — logged, skipping reply to ${normalized.sender_id}`)
+        return
+      }
+
       // Forward to IRIS API
       await this.forwardToAPI(enrichedEvent)
 
@@ -199,6 +209,20 @@ class IMessageChannel extends EventEmitter {
   detectMention(text) {
     if (!text) return false
     return MENTION_REGEX.test(text)
+  }
+
+  /**
+   * Global auto-reply rate-limit across ALL conversations. Returns true (and records
+   * the send) when under the rolling-60s cap, false when the cap is hit. Caps the blast
+   * radius of any future regression. Configurable via IMESSAGE_MAX_REPLIES_PER_MIN.
+   */
+  _globalReplyAllowed() {
+    const max = parseInt(process.env.IMESSAGE_MAX_REPLIES_PER_MIN || '8', 10)
+    const now = Date.now()
+    this._replyTimes = this._replyTimes.filter((t) => now - t < 60000)
+    if (this._replyTimes.length >= max) return false
+    this._replyTimes.push(now)
+    return true
   }
 
   /**
@@ -287,10 +311,70 @@ class IMessageChannel extends EventEmitter {
     // Loop safety: IRIS replies never contain @heyiris, plus _recentlySent dedup
     if (event.is_from_me) {
       console.log(`[imessage] Wake-word in own message (self-test mode)`)
-    } else {
-      console.log(`[imessage] Wake-word detected from ${event.sender_id} in ${event.is_group ? 'group' : 'DM'}`)
+      return true
     }
+
+    // Honor scope policies. Previously this gate keyed ONLY on mention detection and
+    // returned true for ANY mention, ignoring dm_policy / group_policy / allowlist —
+    // so an enable with dm_policy=pairing, group_policy=closed, empty allowlist (which
+    // should process nothing) still auto-replied to everyone who said @heyiris (#137256).
+    // Fail closed: an unrecognized policy value blocks rather than blasts.
+    const dmPolicy = (this.config.dmPolicy || 'open').toLowerCase()
+    const groupPolicy = (this.config.groupPolicy || 'closed').toLowerCase()
+    const allowlist = Array.isArray(this.config.allowlist) ? this.config.allowlist : []
+    const allowed = this._isAllowlisted(event, allowlist)
+
+    if (event.is_group) {
+      // group_policy: 'open' = reply to mentions in groups; anything else = closed.
+      if (groupPolicy !== 'open') {
+        console.log(`[imessage] group_policy=${groupPolicy} — skip group reply to ${event.sender_id}`)
+        return false
+      }
+      if (allowlist.length > 0 && !allowed) {
+        console.log(`[imessage] group ${String(event.conversation_id).slice(0, 24)} not in allowlist — skip`)
+        return false
+      }
+    } else {
+      // dm_policy: 'open' = anyone; 'pairing' = only allowlisted/paired contacts;
+      // 'closed' = never auto-reply in DMs.
+      if (dmPolicy === 'closed') {
+        console.log(`[imessage] dm_policy=closed — skip DM reply to ${event.sender_id}`)
+        return false
+      }
+      if (dmPolicy === 'pairing' && !allowed) {
+        console.log(`[imessage] dm_policy=pairing and ${event.sender_id} not paired/allowlisted — skip`)
+        return false
+      }
+      if (dmPolicy === 'open' && allowlist.length > 0 && !allowed) {
+        console.log(`[imessage] ${event.sender_id} not in allowlist — skip`)
+        return false
+      }
+    }
+
+    console.log(`[imessage] Wake-word detected from ${event.sender_id} in ${event.is_group ? 'group' : 'DM'} (policy passed)`)
     return true
+  }
+
+  /**
+   * Check whether a message's sender or conversation matches the configured allowlist.
+   * Matches phone numbers (last 7+ digits) and email/handle substrings, case-insensitive.
+   */
+  _isAllowlisted(event, allowlist) {
+    if (!allowlist || allowlist.length === 0) return false
+    const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9@.]/g, '')
+    const digits = (s) => String(s || '').replace(/\D/g, '')
+    const candidates = [event.sender_id, event.conversation_id, event.group_name].filter(Boolean)
+    for (const entry of allowlist) {
+      const e = norm(entry)
+      const ed = digits(entry)
+      for (const c of candidates) {
+        const cn = norm(c)
+        const cd = digits(c)
+        if (e && cn && (cn === e || cn.includes(e) || e.includes(cn))) return true
+        if (ed.length >= 7 && cd.length >= 7 && (cd.endsWith(ed) || ed.endsWith(cd))) return true
+      }
+    }
+    return false
   }
 
   /**
