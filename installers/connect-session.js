@@ -53,6 +53,9 @@ const PLATFORMS = {
     name: 'LinkedIn',
     url: 'https://www.linkedin.com/login',
     cookieConsent: 'button:has-text("Accept cookies"), button:has-text("Accept & join")',
+    // Auth cookies are the source of truth for "logged in" — DOM selectors alone
+    // false-positive on logged-out chrome. li_at is set only after a real login.
+    authCookies: ['li_at'],
     loginChecks: [
       '.feed-identity-module, .scaffold-layout__main',
       'nav[aria-label="Primary"], .global-nav',
@@ -65,6 +68,7 @@ const PLATFORMS = {
     name: 'Instagram',
     url: 'https://www.instagram.com/accounts/login/',
     cookieConsent: 'button:has-text("Allow all cookies"), button:has-text("Allow essential and optional cookies")',
+    authCookies: ['sessionid'],
     loginChecks: [
       'svg[aria-label="Home"]',
       'svg[aria-label="Search"]',
@@ -76,6 +80,7 @@ const PLATFORMS = {
     name: 'Twitter / X',
     url: 'https://x.com/i/flow/login',
     cookieConsent: 'button:has-text("Accept all cookies"), button:has-text("Accept all")',
+    authCookies: ['auth_token'],
     loginChecks: [
       '[data-testid="AppTabBar_Home_Link"]',
       'a[aria-label="Home"]',
@@ -87,9 +92,12 @@ const PLATFORMS = {
     name: 'YouTube',
     url: 'https://www.youtube.com',
     cookieConsent: 'button:has-text("Accept all"), button:has-text("Accept"), button:has-text("I agree")',
+    // A real YouTube session has SAPISID/SID. The old ytd-guide-renderer selector
+    // matched for LOGGED-OUT users too → captured an anonymous 8-cookie session
+    // → every downstream scrape failed [LOGIN_EXPIRED]. Gate on auth cookies.
+    authCookies: ['SAPISID', '__Secure-1PSID', 'SID'],
     loginChecks: [
-      'button#avatar-btn, img.yt-spec-avatar-shape__avatar',
-      'ytd-mini-guide-renderer, ytd-guide-renderer'
+      'button#avatar-btn'
     ],
     timeout: 600
   }
@@ -190,20 +198,38 @@ async function main () {
   console.log('  └──────────────────────────────────────────┘')
   console.log('')
 
-  // Poll for login
+  // Poll for login. Auth cookies (li_at, sessionid, auth_token, SAPISID) are the
+  // source of truth — they only exist after a REAL login, so they can't false-positive
+  // on logged-out chrome the way DOM selectors can. When a platform defines authCookies,
+  // we require one of them present; selectors are only a fallback for platforms without.
   let loggedIn = false
   for (let i = 0; i < config.timeout; i++) {
-    for (const selector of config.loginChecks) {
-      const visible = await page.locator(selector).first().isVisible().catch(() => false)
-      if (visible) {
+    if (config.authCookies && config.authCookies.length) {
+      const cookies = await context.cookies().catch(() => [])
+      const names = new Set(cookies.map((c) => c.name))
+      if (config.authCookies.some((n) => names.has(n))) {
         loggedIn = true
         break
       }
+    } else {
+      for (const selector of config.loginChecks) {
+        const visible = await page.locator(selector).first().isVisible().catch(() => false)
+        if (visible) {
+          loggedIn = true
+          break
+        }
+      }
+      if (loggedIn) { break }
     }
-    if (loggedIn) { break }
 
     if (i > 0 && i % 15 === 0) {
-      console.log(`  Waiting for login... (${i}s)`)
+      let diag = ''
+      if (config.authCookies) {
+        const cookies = await context.cookies().catch(() => [])
+        const present = config.authCookies.filter((n) => cookies.some((c) => c.name === n))
+        diag = ` [cookies:${cookies.length} auth:${present.join(',') || 'none'}]`
+      }
+      console.log(`  Waiting for login... (${i}s)${diag}`)
     }
     await page.waitForTimeout(1000)
   }
@@ -223,6 +249,18 @@ async function main () {
 
   const cookieCount = (storageState.cookies || []).length
   console.log(`  Captured ${cookieCount} cookies.`)
+
+  // Final guard: never upload an anonymous session. If the platform defines auth
+  // cookies, at least one MUST be in the captured state — otherwise we'd publish a
+  // logged-out session that fails every downstream scrape with [LOGIN_EXPIRED].
+  if (config.authCookies && config.authCookies.length) {
+    const capturedNames = new Set((storageState.cookies || []).map((c) => c.name))
+    if (!config.authCookies.some((n) => capturedNames.has(n))) {
+      console.log(`  Error: No auth cookie captured (need one of: ${config.authCookies.join(', ')}).`)
+      console.log('  You were not fully signed in. Nothing uploaded — please run this again and complete login.')
+      process.exit(1)
+    }
+  }
 
   if (cookieCount === 0) {
     console.log('  Warning: No cookies captured. The session may not work.')

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  IRIS Uptime Monitor — macOS LaunchAgent
+
+  Runs uptime-monitor.js every 5 minutes (StartInterval). Lives on Alex's Mac so it is
+  INDEPENDENT of Railway — if the account is suspended again, this still runs and alerts.
+
+  INSTALL:
+    cp io.heyiris.uptime-monitor.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/io.heyiris.uptime-monitor.plist
+  CHECK:    launchctl list | grep uptime-monitor
+  LOGS:     tail -f fl-docker-dev/coding-agent-bridge/uptime-monitor.log
+  REMOVE:   launchctl unload ~/Library/LaunchAgents/io.heyiris.uptime-monitor.plist
+
+  NOTE: update the node path in ProgramArguments if you change nvm versions
+        (`which node` -> paste here).
+-->
+<dict>
+  <key>Label</key>
+  <string>io.heyiris.uptime-monitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/AlexMayo/.nvm/versions/node/v20.19.1/bin/node</string>
+    <string>/Users/AlexMayo/Sites/freelabel/fl-docker-dev/coding-agent-bridge/uptime-monitor.js</string>
+  </array>
+
+  <!-- Run once on load, then every 5 minutes -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/AlexMayo/Sites/freelabel/fl-docker-dev/coding-agent-bridge</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/AlexMayo/Sites/freelabel/fl-docker-dev/coding-agent-bridge/uptime-monitor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/AlexMayo/Sites/freelabel/fl-docker-dev/coding-agent-bridge/uptime-monitor.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd has a minimal PATH; add node + railway + doctl + homebrew + system bins -->
+    <key>PATH</key>
+    <string>/Users/AlexMayo/.nvm/versions/node/v20.19.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

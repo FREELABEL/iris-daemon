@@ -156,13 +156,22 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
     console.log(`  Setting sort order: ${sortLabel}\n`);
 
     // Click the Sort button to open dropdown
-    const sortBtn = page.locator('button:has-text("Sort"), yt-sort-filter-sub-menu-renderer button, [aria-label="Sort"]').first();
+    // YouTube's current WL sort control is a CHIP combobox (button.ytChipShapeButtonReset
+    // role="combobox", e.g. showing "Date published (oldest)") — NOT a <button aria-label=
+    // "Sort"> nor the (present-but-hidden) tp-yt-paper-button. Clicking the chip opens a
+    // dropdown whose options are <a class="yt-simple-endpoint ... yt-dropdown-menu"> /
+    // tp-yt-paper-item[role="option"] ("Date added (newest)", etc). Verified via live DOM.
+    const sortBtn = page.locator('chip-shape button[role="combobox"], button.ytChipShapeButtonReset[role="combobox"], yt-sort-filter-sub-menu-renderer tp-yt-paper-button, tp-yt-paper-button[aria-label="Ordering"], [aria-label="Sort"]').first();
     if (await sortBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
       await sortBtn.click();
       await page.waitForTimeout(1000);
 
       // Click the desired sort option
-      const sortOption = page.locator(`tp-yt-paper-listbox a:has-text("${sortLabel}"), yt-dropdown-menu a:has-text("${sortLabel}"), [role="option"]:has-text("${sortLabel}"), [role="menuitem"]:has-text("${sortLabel}")`).first();
+      // The opened menu is a yt-list-view-model of yt-list-item-view-model[role="menuitem"]
+      // (older YT used tp-yt-paper-item[role="option"]). A HIDDEN duplicate menu with the same
+      // labels also exists, so restrict to :visible + match by label — otherwise .first()
+      // grabs the hidden copy and the click silently no-ops. Verified against live WL DOM.
+      const sortOption = page.locator('yt-list-item-view-model[role="menuitem"]:visible, ytd-menu-service-item-renderer:visible, [role="option"]:visible, yt-dropdown-menu a:visible', { hasText: sortLabel }).first();
       if (await sortOption.isVisible({ timeout: 3000 }).catch(() => false)) {
         await sortOption.click();
         await page.waitForTimeout(2000); // Wait for playlist to re-sort
@@ -230,7 +239,11 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
       // ── Playlist scraping (Watch Later, custom playlists) ──
       const items = document.querySelectorAll('ytd-playlist-video-renderer');
       items.forEach((item, index) => {
-        const linkEl = item.querySelector('a#video-title, a[href*="/watch"]') as HTMLAnchorElement;
+        // a#video-title holds the real title (its `title` attr is the full, untruncated text).
+        // querySelector with a comma list returns the DOCUMENT-order first match, so including
+        // the thumbnail's watch-link grabbed the duration overlay ("18:01 / Now playing").
+        const titleLink = item.querySelector('a#video-title') as HTMLAnchorElement;
+        const linkEl = (titleLink || item.querySelector('a[href*="/watch"]')) as HTMLAnchorElement;
         if (!linkEl) return;
 
         const href = linkEl.getAttribute('href') || '';
@@ -238,7 +251,7 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
         const idMatch = url.match(/v=([^&]+)/);
         const videoId = idMatch ? idMatch[1] : null;
 
-        const title = linkEl.textContent?.trim() || null;
+        const title = (titleLink?.getAttribute('title') || titleLink?.textContent || '').trim() || null;
 
         const durationEl = item.querySelector(
           '.ytBadgeShapeText, .yt-badge-shape__text, .badge-shape-wiz__text, span.ytd-thumbnail-overlay-time-status-renderer'

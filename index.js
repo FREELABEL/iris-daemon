@@ -30,6 +30,7 @@ const CORS_ALLOWLIST = new Set([
   'https://freelabel.net',
   'https://web.freelabel.net',
   'https://heyiris.io',
+  'https://web.heyiris.io', // production BloqChatAssistant sidebar (Elon multi-brand)
   'https://app.heyiris.io',
   ..._configCors,
   ...(process.env.BRIDGE_CORS_ORIGINS || '').split(',').filter(Boolean)
@@ -42,6 +43,14 @@ app.use((req, res, next) => {
   }
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Bridge-Key, X-Mesh-Key')
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+  // Private Network Access (PNA): a page on https://web.freelabel.net (public)
+  // fetching http://127.0.0.1:3200 (local) triggers a Chrome PNA preflight that
+  // carries `Access-Control-Request-Private-Network: true`. We must answer with
+  // the matching allow header or the browser blocks the request. Only echo it
+  // for allowlisted origins so we don't open localhost to arbitrary sites.
+  if (origin && CORS_ALLOWLIST.has(origin) && req.headers['access-control-request-private-network'] === 'true') {
+    res.header('Access-Control-Allow-Private-Network', 'true')
+  }
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
 })
@@ -64,7 +73,11 @@ app.use(bridgeAuth({
     '/daemon/queue'
   ]),
   openPrefixes: [
-    '/daemon/mesh/' // mesh routes use their own X-Mesh-Key auth
+    '/daemon/mesh/', // mesh routes use their own X-Mesh-Key auth
+    '/hive/inbox' // inbox read/mark-read — protected by CORS allowlist (only
+    // localhost + freelabel/heyiris origins can read responses); a random
+    // site's fetch to localhost:3200 is blocked by the browser. Token-based
+    // hardening (cloud pairing) is a planned fast-follow for XSS'd origins.
   ]
 }))
 
@@ -74,6 +87,87 @@ const OPENCODE_BIN = process.env.OPENCODE_BIN || '/opt/homebrew/bin/opencode'
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'
 const IRIS_API_URL = process.env.IRIS_API_URL || 'https://freelabel.net'
 const BRIDGE_VERSION = require('./package.json').version
+
+// ─── Hive Inbox (read API for the web UI — Option B) ────────────
+// The encrypted Send/Inbox store lives at ~/.iris/hive/inbox/. The daemon
+// WRITES it (_saveToHiveInbox in daemon/task-executor.js); these endpoints
+// let an authenticated cloud page (https://web.freelabel.net/hive/inbox)
+// READ it over localhost so a human can actually see received messages —
+// instead of the notification dead-ending in Script Editor (#133850).
+// All routes are protected by bridgeAuth (X-Bridge-Key) via the global
+// middleware above; CORS + PNA headers allow the cloud origin to reach them.
+const HIVE_INBOX_DIR = path.join(process.env.HOME, '.iris', 'hive', 'inbox')
+const HIVE_INBOX_MANIFEST = path.join(HIVE_INBOX_DIR, '.manifest.jsonl')
+
+function readHiveInboxManifest () {
+  try {
+    if (!fs.existsSync(HIVE_INBOX_MANIFEST)) return []
+    return fs.readFileSync(HIVE_INBOX_MANIFEST, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => { try { return JSON.parse(line) } catch { return null } })
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function writeHiveInboxManifest (items) {
+  const tmp = `${HIVE_INBOX_MANIFEST}.tmp`
+  fs.writeFileSync(tmp, items.map((i) => JSON.stringify(i)).join('\n') + (items.length ? '\n' : ''))
+  fs.renameSync(tmp, HIVE_INBOX_MANIFEST)
+}
+
+// List inbox items (newest first). ?unread=1 filters unread; ?limit=N caps.
+app.get('/hive/inbox', (req, res) => {
+  try {
+    let items = readHiveInboxManifest().reverse() // newest first
+    if (req.query.unread === '1' || req.query.unread === 'true') {
+      items = items.filter((i) => !i.read)
+    }
+    const limit = parseInt(req.query.limit || '100', 10)
+    const unreadCount = readHiveInboxManifest().filter((i) => !i.read).length
+    res.json({ items: items.slice(0, limit), count: items.length, unread: unreadCount, node: process.env.HIVE_NODE_NAME || null })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Get one item with full message body (manifest truncates text to 500 chars —
+// read the backing file for the complete content). Marks the item read.
+app.get('/hive/inbox/:id', (req, res) => {
+  try {
+    const items = readHiveInboxManifest()
+    const item = items.find((i) => i.id === req.params.id)
+    if (!item) return res.status(404).json({ error: 'Inbox item not found' })
+
+    let body = item.message || ''
+    if (item.file && item.type !== 'file') {
+      // text/link bodies are safe to inline; resolve inside inbox dir only
+      const filePath = path.resolve(HIVE_INBOX_DIR, path.basename(item.file))
+      if (filePath.startsWith(path.resolve(HIVE_INBOX_DIR)) && fs.existsSync(filePath)) {
+        body = fs.readFileSync(filePath, 'utf-8')
+      }
+    }
+    res.json({ ...item, body, has_file: item.type === 'file' && !!item.file })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Mark an item read (or unread with {read:false}).
+app.post('/hive/inbox/:id/read', (req, res) => {
+  try {
+    const items = readHiveInboxManifest()
+    const idx = items.findIndex((i) => i.id === req.params.id)
+    if (idx === -1) return res.status(404).json({ error: 'Inbox item not found' })
+    items[idx].read = req.body && req.body.read === false ? false : true
+    writeHiveInboxManifest(items)
+    res.json({ ok: true, id: req.params.id, read: items[idx].read })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
 
 // ─── Messaging Bot State ────────────────────────────────────────
 
