@@ -11,7 +11,7 @@
  *   node social-feed-sync.js moore-life api_url=http://localhost:8000
  *
  * Environment variables:
- *   FL_API_URL            — fl-api base URL (default: https://apiv2.heyiris.io)
+ *   FL_API_URL            — fl-api base URL (default: https://raichu.heyiris.io)
  *   FL_RAICHU_API_TOKEN   — Auth token for fl-api (also resolves from
  *                           FL_API_TOKEN/IRIS_API_KEY, ~/.iris/sdk/.env, ~/.iris/config.json)
  */
@@ -40,7 +40,7 @@ if (!profileArg) {
   process.exit(1)
 }
 
-const API_URL = params.api_url || process.env.FL_API_URL || 'https://apiv2.heyiris.io'
+const API_URL = params.api_url || process.env.FL_API_URL || 'https://raichu.heyiris.io'
 const API_TOKEN = resolveIrisToken({ override: params.api_token }).token
 const MAX_POSTS = parseInt(params.max_posts || '9', 10)
 const MAX_PROFILES = parseInt(params.max_profiles || '50', 10)
