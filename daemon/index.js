@@ -28,6 +28,7 @@ const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
+const { ensureChromiumInstalled, chromiumInstalled } = require('../lib/playwright-setup')
 const { execSync, spawn } = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -194,6 +195,17 @@ class Daemon {
       this._writeStatusFile()
     })
     this.resourceMonitor.start()
+
+    // Provision Playwright Chromium on every node (#137525). Browser-driven
+    // discovery (venue scrape, SOM, discover) silently returns 0 results when the
+    // Chromium binary is missing. Install it once on startup — non-blocking so a
+    // ~100MB download never holds up the daemon; idempotent (instant if present).
+    if (chromiumInstalled()) {
+      console.log('[daemon] Playwright Chromium present ✓')
+    } else {
+      console.log('[daemon] Playwright Chromium missing — installing in background (browser discovery needs it)')
+      ensureChromiumInstalled({ background: true })
+    }
 
     // Step 4: Start A2A HTTP server
     await this.startA2AServer()

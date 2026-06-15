@@ -242,6 +242,28 @@ async function main () {
     info('No pusher_key in config — will get from cloud on connect')
   }
 
+  // ─── 7. Playwright Chromium check (#137525) ──────────
+  // Browser-driven discovery (venue scrape, SOM, discover) silently returns 0
+  // results when Chromium is missing — so a node can look healthy yet produce
+  // nothing. Verify the browser is provisioned; --fix installs it.
+  console.log('\nPlaywright browser:')
+  try {
+    const { chromiumInstalled, ensureChromiumInstalled, pinnedPlaywrightVersion } = require('./lib/playwright-setup')
+    if (chromiumInstalled()) {
+      ok(`Chromium installed${pinnedPlaywrightVersion() ? ` (pinned ${pinnedPlaywrightVersion()})` : ''}`)
+    } else if (autoFix) {
+      info('Chromium missing — installing (this can take ~1 min)…')
+      const res = ensureChromiumInstalled()
+      if (res.installed) fixApplied('Chromium installed via npx playwright install chromium')
+      else fail(`Chromium install failed${res.error ? `: ${res.error}` : ''} — run: npx playwright install chromium`)
+    } else {
+      fail('Chromium NOT installed — browser discovery (venue scrape, SOM) will return 0 results silently')
+      info('Fix: npx playwright install chromium  (or run this doctor with --fix)')
+    }
+  } catch (e) {
+    warn(`Could not check Playwright: ${e.message}`)
+  }
+
   // ─── Summary ──────────────────────────────────────────
   console.log('\n──────────────────────────────────────────')
   if (issues === 0) {

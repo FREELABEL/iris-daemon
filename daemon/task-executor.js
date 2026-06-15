@@ -38,6 +38,7 @@ try {
 
 // Single local admission-control authority (idempotency + resource exclusion).
 const { AdmissionGate } = require('./admission-gate')
+const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -1060,6 +1061,18 @@ class TaskExecutor {
           taskStatus = 'failed'
           console.log(`[executor] [${ts()}] Task ${taskId} escalated to FAILED — catastrophic crash detected (script never ran)`)
         }
+      }
+
+      // 🌐 BROWSER-MISSING is a SILENT killer (#137525): a Playwright scrape can hit
+      // "please run npx playwright install" / missing-executable and STILL EXIT 0,
+      // reporting 0 results as success. The check above only runs for non-zero exits,
+      // so it never catches this. Detect the launch-failure signature REGARDLESS of
+      // exit code and fail loudly so the operator sees "browser unavailable", not an
+      // empty list. (Provisioning at daemon startup should prevent this; this is the
+      // defense-in-depth that guarantees we never launder a dead browser into green.)
+      if (taskStatus !== 'failed' && BROWSER_LAUNCH_FAILURE_RE.test(truncatedOutput)) {
+        taskStatus = 'failed'
+        console.log(`[executor] [${ts()}] Task ${taskId} escalated to FAILED — Playwright/Chromium unavailable (browser never launched, #137525). Run \`npm run bridge:doctor -- --fix\` or \`npx playwright install chromium\`.`)
       }
       // iris-api's NodeTaskController validator only accepts:
       //   completed, failed, skipped, timeout
