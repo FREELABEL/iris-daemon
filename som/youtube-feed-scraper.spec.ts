@@ -420,36 +420,53 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
   // responds in <1s (the page just keeps streaming). `commit` resolves the instant the
   // server response is received; the form-visibility check below is what actually gates
   // login readiness. Longer timeout is belt-and-suspenders for a Railway cold start.
-  await page.goto(`${N8N_URL}/signin`, { waitUntil: 'commit', timeout: 60000 });
-  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  // Robust login: n8n's signin SPA renders the form slowly on a cold start.
+  // The OLD check "email not visible within 20s → assume authenticated" produced a
+  // FALSE POSITIVE — the form simply hadn't painted yet, so login was skipped and the
+  // run proceeded UNAUTHENTICATED, then the workflow page bounced straight back to the
+  // sign-in wall ("no chat input" red herring). This helper POLLS for the form, treats
+  // a real redirect-away-from-/signin as the only "already authed" signal, broadens the
+  // email selector across n8n versions, and is re-callable if we get bounced later.
+  const emailSel = 'input[name="emailOrLdapLoginId"], input[type="email"], input[name="email"]';
+  const pwdSel = 'input[name="password"], input[type="password"]';
+  const ensureN8nLogin = async (reason: string): Promise<void> => {
+    const emailInput = page.locator(emailSel).first();
+    const passwordInput = page.locator(pwdSel).first();
 
-  const emailInput = page.locator('input[name="emailOrLdapLoginId"], input[type="email"]').first();
-  const needLogin = await emailInput.isVisible({ timeout: 20000 }).catch(() => false);
-  if (needLogin) {
-    console.log('  Logging into n8n...');
+    // Poll up to 40s: either the login form appears, or we're clearly inside the app.
+    let formVisible = false;
+    for (let i = 0; i < 40; i++) {
+      formVisible = await emailInput.isVisible().catch(() => false);
+      if (formVisible) break;
+      // Redirected away from /signin with no form → already authenticated.
+      if (!/\/signin|\/login/.test(page.url())) {
+        const inApp = await page.locator('.vue-flow__node, [data-test-id="main-sidebar"], #sidebar, [data-test-id="canvas"]')
+          .first().isVisible().catch(() => false);
+        if (inApp) { console.log(`  Already authenticated to n8n (${reason}).\n`); return; }
+      }
+      await page.waitForTimeout(1000);
+    }
+    if (!formVisible) { console.log(`  No n8n login form detected (${reason}); assuming authenticated.\n`); return; }
 
-    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
+    console.log(`  Logging into n8n (${reason})...`);
     await emailInput.fill(N8N_EMAIL);
     await passwordInput.fill(N8N_PASSWORD);
-    await page.waitForTimeout(500);
-
-    const signInBtn = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
-    await signInBtn.click();
-    // Wait until we leave the sign-in page (auth completed), not a fixed sleep.
-    await page.waitForURL((u) => !/\/signin/.test(u.toString()), { timeout: 25000 }).catch(() => {});
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.waitForTimeout(1500);
-
-    // Verify auth actually succeeded — fail LOUD instead of silently proceeding.
+    await page.waitForTimeout(400);
+    await page.locator('button:has-text("Sign in"), button[type="submit"]').first().click();
+    // Auth completes when we leave /signin — wait on that, not a fixed sleep.
+    await page.waitForURL((u) => !/\/signin/.test(u.toString()), { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2000);
     const stillSignedOut = /\/signin/.test(page.url())
-      || await page.locator('input[name="emailOrLdapLoginId"], input[type="password"]').first().isVisible({ timeout: 2000 }).catch(() => false);
+      || await page.locator(emailSel).first().isVisible({ timeout: 2000 }).catch(() => false);
     if (stillSignedOut) {
       throw new Error('n8n login failed — still on the sign-in page. Check N8N_EMAIL / N8N_PASSWORD / N8N_URL.');
     }
     console.log('  Logged in to n8n.\n');
-  } else {
-    console.log('  Already authenticated to n8n.\n');
-  }
+  };
+
+  await page.goto(`${N8N_URL}/signin`, { waitUntil: 'commit', timeout: 60000 });
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await ensureN8nLogin('initial');
 
   // ── 6b. Open the workflow directly by ID ────────────────────────────
   console.log(`  Opening workflow "${WORKFLOW_NAME}" (${WORKFLOW_ID})...`);
@@ -458,6 +475,17 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
   // `networkidle` — using that as the wait condition timed out at 15s (#133858).
   // Wait for domcontentloaded (generous timeout), then for the canvas to render.
   await page.goto(`${N8N_URL}/workflow/${WORKFLOW_ID}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+  // SAFETY NET: if n8n bounced us back to the auth wall (session not actually valid),
+  // log in for real and re-open the workflow. This is what was silently failing before.
+  const bouncedToLogin = /\/signin|\/login/.test(page.url())
+    || await page.locator(pwdSel).first().isVisible({ timeout: 3000 }).catch(() => false);
+  if (bouncedToLogin) {
+    console.log('  n8n bounced to sign-in — authenticating, then reopening workflow...');
+    await ensureN8nLogin('post-workflow bounce');
+    await page.goto(`${N8N_URL}/workflow/${WORKFLOW_ID}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  }
+
   await page.locator('.vue-flow__node, [data-test-id="canvas-node"], #node-view, .node-view')
     .first().waitFor({ state: 'visible', timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(3000);
