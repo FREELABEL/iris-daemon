@@ -186,8 +186,26 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
 
     const countVideosInDOM = () => document.querySelectorAll(videoSelector).length;
 
+    // YouTube's home feed is VIRTUALIZED — cards that scroll off-screen are
+    // removed from the DOM and recycled. Harvesting only once at the end would
+    // capture just the small window of currently-rendered cards (~5-15), not the
+    // 50 we scrolled past. So we harvest incrementally on every scroll pass into
+    // a Map keyed by video id, capturing cards before they're recycled away.
+    const collected = new Map<string, any>();
+    const harvest = () => {
+      const results: any[] = [];
+      collectInto(results);
+      for (const v of results) {
+        if (v && v.id && !collected.has(v.id)) collected.set(v.id, v);
+      }
+    };
+
     let lastHeight = 0, sameHeight = 0;
-    while (countVideosInDOM() < maxVideos && sameHeight < 8) {
+    // Keep scrolling until we've collected enough unique videos, or the page
+    // truly stops growing for many cycles. Threshold raised from 8 → 15 because
+    // YouTube's lazy-load is bursty and momentary stalls are common.
+    while (collected.size < maxVideos && sameHeight < 15) {
+      harvest(); // capture what's visible NOW, before it scrolls out and gets recycled
       window.scrollBy(0, 1500);
       await pause(1200);
       // Trigger lazy load by scrolling back up slightly then down again
@@ -205,9 +223,9 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
         lastHeight = newHeight;
       }
     }
+    harvest(); // final pass to grab anything loaded after the last scroll
 
-    const results: any[] = [];
-
+    function collectInto(results: any[]) {
     if (isPlaylist) {
       // ── Playlist scraping (Watch Later, custom playlists) ──
       const items = document.querySelectorAll('ytd-playlist-video-renderer');
@@ -327,9 +345,9 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
         results.push({ id: videoId, url, title, channel, views, uploaded, duration });
       });
     }
+    } // end collectInto
 
-    const unique = Array.from(new Map(results.map(v => [v.id, v])).values());
-    return unique.slice(0, maxVideos);
+    return Array.from(collected.values()).slice(0, maxVideos);
   }, { maxVideos: LIMIT, isPlaylist: ytSource.isPlaylist });
 
   // Filter out entries without a title and live streams (can't clip a live stream)
@@ -397,8 +415,13 @@ test('Scrape YouTube home feed and send to n8n', async ({ browser }) => {
   // real field name is `emailOrLdapLoginId` (verified against the live form), NOT
   // `email` — the old selector never matched. If already authenticated, n8n
   // bounces /signin → home and the form never appears, so login is skipped.
-  await page.goto(`${N8N_URL}/signin`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForLoadState('networkidle').catch(() => {});
+  // n8n's signin is a websocket-heavy SPA that never reliably fires `domcontentloaded`
+  // or `networkidle` — a 30s domcontentloaded wait timed out even though the server
+  // responds in <1s (the page just keeps streaming). `commit` resolves the instant the
+  // server response is received; the form-visibility check below is what actually gates
+  // login readiness. Longer timeout is belt-and-suspenders for a Railway cold start.
+  await page.goto(`${N8N_URL}/signin`, { waitUntil: 'commit', timeout: 60000 });
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
 
   const emailInput = page.locator('input[name="emailOrLdapLoginId"], input[type="email"]').first();
   const needLogin = await emailInput.isVisible({ timeout: 20000 }).catch(() => false);
