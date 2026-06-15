@@ -2075,15 +2075,25 @@ async function call(method, p, body) {
             args = ['artisan', ...enrichArtisanArgs]
             workspace.projectDir = flApiPath
           } else {
-            // Fallback: run enrichment via npm script that calls the API
+            // No fl-api checkout — run enrichment through som-all.js, which calls the
+            // API directly. Prefer the monorepo npm script; fall back to the bundled
+            // som-all.js so this works on a client machine with no checkout (#133745).
             const enrichRoot = this.freelabelPath || findFreelabelPath()
-            if (!enrichRoot) {
-              reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
+            const enrichBundledSomDir = path.join(__dirname, '..', 'som')
+            const hasBundledSomAll = fs.existsSync(path.join(enrichBundledSomDir, 'som-all.js'))
+            const enrichSomArgs = ['only=custom', 'enrich=1', 'enrich_goal=email', 'limit=0']
+            if (enrichRoot) {
+              cmd = 'npm'
+              args = ['run', 'som:all', '--', ...enrichSomArgs]
+              workspace.projectDir = enrichRoot
+            } else if (hasBundledSomAll) {
+              cmd = 'node'
+              args = [path.join(enrichBundledSomDir, 'som-all.js'), ...enrichSomArgs]
+              workspace.projectDir = enrichBundledSomDir
+            } else {
+              reject(new Error('Enrichment needs the fl-api checkout, the Freelabel checkout, or a bundled som-all.js. Set FL_API_PATH / freelabel_path, or update the bridge.'))
               return
             }
-            cmd = 'npm'
-            args = ['run', 'som:all', '--', `only=custom`, `enrich=1`, `enrich_goal=email`, `limit=0`]
-            workspace.projectDir = enrichRoot
           }
           break
         }
@@ -2450,15 +2460,19 @@ const BODY = ${JSON.stringify(clipBody)};
           const scanArgs = scanParts.slice(1)
 
           const scanRoot = this.freelabelPath || findFreelabelPath()
-          if (!scanRoot) {
-            reject(new Error('This task requires the Freelabel project checkout. Set freelabel_path in ~/.iris/config.json or FREELABEL_PATH env var.'))
+          // Bundled inbox spec (shipped with daemon package) — used when the full
+          // monorepo checkout isn't present on this machine (#134871/#133746).
+          const scanBundledSomDir = path.join(__dirname, '..', 'som')
+          const hasBundledInboxSpec = fs.existsSync(path.join(scanBundledSomDir, 'inbox-followup.spec.ts'))
+          if (!scanRoot && !hasBundledInboxSpec) {
+            reject(new Error('Inbox scan needs the Freelabel checkout or a bundled inbox spec. Set freelabel_path in ~/.iris/config.json / FREELABEL_PATH, or update the bridge.'))
             return
           }
 
           // Use DB-first config — same source of truth as SOM outreach
           let scanAccounts
           try {
-            const { activeAccounts: allActive, source } = await getCampaignConfigs(scanRoot)
+            const { activeAccounts: allActive, source } = await getCampaignConfigs(scanRoot || scanBundledSomDir)
             console.log(`[executor] Inbox scan config from ${source}`)
             scanAccounts = scanTarget === 'all'
               ? allActive
@@ -2486,13 +2500,18 @@ const BODY = ${JSON.stringify(clipBody)};
             console.log(`[executor]   → @${a.igAccount} (board ${a.boardId})`)
           }
 
+          // Resolve spec path + working dir: prefer the monorepo, fall back to the
+          // bundled som/ copy so inbox scan runs on a client machine with no checkout.
+          const inboxSpecPath = scanRoot ? 'tests/e2e/inbox-followup.spec.ts' : 'inbox-followup.spec.ts'
+          const inboxProjectDir = scanRoot || scanBundledSomDir
+
           // Run sequentially — one browser per account
           const runnerScript = scanAccounts.map(a =>
-            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 npx playwright test tests/e2e/inbox-followup.spec.ts --headed --timeout=180000`
+            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 npx playwright test ${inboxSpecPath} --headed --timeout=180000`
           ).join(' && ')
           cmd = 'bash'
           args = ['-c', runnerScript]
-          workspace.projectDir = scanRoot
+          workspace.projectDir = inboxProjectDir
           break
         }
 

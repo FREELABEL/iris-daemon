@@ -16,12 +16,14 @@
  *   SERPER_API_KEY        — Serper.dev API key (for places search + thumbnails)
  *   DELAY_MS              — Delay between API calls in ms (default: 3000)
  *   FL_API_URL            — fl-api base URL (default: https://raichu.heyiris.io)
- *   FL_RAICHU_API_TOKEN   — Auth token for fl-api
+ *   FL_RAICHU_API_TOKEN   — Auth token for fl-api (also resolves from
+ *                           FL_API_TOKEN/IRIS_API_KEY, ~/.iris/sdk/.env, ~/.iris/config.json)
  */
 
 const https = require('https')
 const http = require('http')
 const { URL } = require('url')
+const { resolveIrisToken } = require('../lib/resolve-iris-token')
 
 // ─── Parse CLI args ───────────────────────────────────────────
 const params = {}
@@ -40,12 +42,12 @@ const STRATEGY_ID = params.strategy_id || process.env.STRATEGY_ID || ''
 const SERPER_API_KEY = params.serper_api_key || process.env.SERPER_API_KEY || 'ff1effc31b786e21d631c1bb8840072e7175a24a'
 const DELAY_MS = parseInt(params.delay_ms || process.env.DELAY_MS || '3000', 10)
 const API_URL = params.api_url || process.env.FL_API_URL || 'https://raichu.heyiris.io'
-const API_TOKEN = params.api_token || process.env.FL_RAICHU_API_TOKEN || ''
+const API_TOKEN = resolveIrisToken({ override: params.api_token }).token || ''
 
 const PREFIX = '[venue-enrich]'
 
 if (!API_TOKEN) {
-  console.error(`${PREFIX} Error: No API token. Set FL_RAICHU_API_TOKEN or pass api_token=...`)
+  console.error(`${PREFIX} Error: No API token. Set FL_RAICHU_API_TOKEN / FL_API_TOKEN / IRIS_API_KEY, run \`iris auth login\`, or pass api_token=...`)
   process.exit(1)
 }
 

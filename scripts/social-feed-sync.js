@@ -12,12 +12,14 @@
  *
  * Environment variables:
  *   FL_API_URL            — fl-api base URL (default: https://apiv2.heyiris.io)
- *   FL_RAICHU_API_TOKEN   — Auth token for fl-api
+ *   FL_RAICHU_API_TOKEN   — Auth token for fl-api (also resolves from
+ *                           FL_API_TOKEN/IRIS_API_KEY, ~/.iris/sdk/.env, ~/.iris/config.json)
  */
 
 const https = require('https')
 const http = require('http')
 const { URL } = require('url')
+const { resolveIrisToken } = require('../lib/resolve-iris-token')
 
 // ─── Parse CLI args ───────────────────────────────────────────
 const args = process.argv.slice(2)
@@ -39,13 +41,13 @@ if (!profileArg) {
 }
 
 const API_URL = params.api_url || process.env.FL_API_URL || 'https://apiv2.heyiris.io'
-const API_TOKEN = params.api_token || process.env.FL_RAICHU_API_TOKEN
+const API_TOKEN = resolveIrisToken({ override: params.api_token }).token
 const MAX_POSTS = parseInt(params.max_posts || '9', 10)
 const MAX_PROFILES = parseInt(params.max_profiles || '50', 10)
 const DELAY_MS = parseInt(params.delay_ms || '2000', 10) // delay between IG requests to avoid rate-limit
 
 if (!API_TOKEN) {
-  console.error('[social-feed-sync] Error: No API token. Set FL_RAICHU_API_TOKEN or pass api_token=...')
+  console.error('[social-feed-sync] Error: No API token. Set FL_RAICHU_API_TOKEN / FL_API_TOKEN / IRIS_API_KEY, run `iris auth login`, or pass api_token=...')
   process.exit(1)
 }
 
