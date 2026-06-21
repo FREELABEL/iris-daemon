@@ -269,12 +269,34 @@ class NativeIMessageDriver extends EventEmitter {
       if (markerIdx === -1) return ''
       const afterMarker = buf.indexOf(0x2b, markerIdx + 8)
       if (afterMarker === -1) return ''
-      const strLen = buf[afterMarker + 1]
+
+      // Length is a typedstream varint, NOT a single byte:
+      //   < 0x80        -> that byte is the length
+      //   0x81 + uint16 -> length is the next 2 bytes (LE)
+      //   0x82 + uint32 -> length is the next 4 bytes (LE)
+      // Reading only one byte truncated any message >= 128 bytes.
+      let strLen
+      let start
+      const lenByte = buf[afterMarker + 1]
+      if (lenByte === 0x81) {
+        strLen = buf.readUInt16LE(afterMarker + 2)
+        start = afterMarker + 4
+      } else if (lenByte === 0x82) {
+        strLen = buf.readUInt32LE(afterMarker + 2)
+        start = afterMarker + 6
+      } else {
+        strLen = lenByte
+        start = afterMarker + 2
+      }
       if (!strLen) return ''
-      const start = afterMarker + 2
       const end = start + strLen
       if (end > buf.length) return ''
-      return buf.subarray(start, end).toString('utf-8').replace(/[\x00-\x08\x0e-\x1f\x80-\xff]/g, '').trim()
+
+      // Decode as UTF-8 and strip only true control chars (keep \t and \n).
+      // Do NOT strip 0x80-0xFF — those are UTF-8 continuation bytes (emoji/accents).
+      return buf.subarray(start, end).toString('utf-8')
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')
+        .trim()
     } catch {
       return ''
     }
