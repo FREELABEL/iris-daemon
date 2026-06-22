@@ -182,6 +182,42 @@ function resolveDaemonIdentity () {
   return _daemonIdentity
 }
 
+// Resolve a saved account-scoped script by slug for the `user_script` task type.
+// Cache-first: use the local copy if present, otherwise PULL it from the cloud
+// (the Hive "pull the script if it doesn't exist on the machine" use case) and
+// cache it under ~/.iris/data/scripts/<slug>.json for next time.
+async function resolveUserScriptBySlug (slug) {
+  const cacheDir = path.join(os.homedir(), '.iris', 'data', 'scripts')
+  const cacheFile = path.join(cacheDir, `${slug}.json`)
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+      if (cached && typeof cached.script_content === 'string') {
+        console.log(`[executor] user_script '${slug}' — using cached copy`)
+        return cached
+      }
+    } catch { /* fall through to a fresh pull */ }
+  }
+
+  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
+  const { token } = resolveDaemonIdentity()
+  const url = `${apiBase}/api/v6/node-agent/scripts/${encodeURIComponent(slug)}`
+  console.log(`[executor] user_script '${slug}' — not cached, pulling from cloud`)
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`Failed to pull script '${slug}' from cloud: HTTP ${res.status}`)
+  const json = await res.json()
+  const script = json.data || json
+  if (!script || typeof script.script_content !== 'string') {
+    throw new Error(`Script '${slug}' returned no script_content`)
+  }
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true })
+    fs.writeFileSync(cacheFile, JSON.stringify(script))
+  } catch { /* cache write is best-effort */ }
+  return script
+}
+
 async function fetchDbCampaignConfigs () {
   const now = Date.now()
   if (_dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
@@ -1400,6 +1436,29 @@ class TaskExecutor {
           fs.writeFileSync(scriptPath, task.prompt, 'utf-8')
           fs.chmodSync(scriptPath, '755')
           args = [scriptPath]
+          break
+        }
+
+        case 'user_script': {
+          // Run a saved, account-scoped script BY SLUG. The script content is
+          // pulled from the cloud if this machine doesn't have it (Hive "named
+          // script" use case), then run per its runtime.
+          const slug = (task.config?.script_slug || task.prompt || '').trim()
+          if (!slug) throw new Error('user_script requires a script_slug')
+          const script = await resolveUserScriptBySlug(slug)
+          const runtime = task.config?.runtime || script.runtime || 'bash'
+          const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
+          const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
+          fs.writeFileSync(scriptPath, script.script_content, 'utf-8')
+          if (runtime === 'node') {
+            cmd = 'node'; args = [scriptPath]
+          } else if (runtime === 'python') {
+            cmd = 'python3'; args = [scriptPath]
+          } else if (runtime === 'playwright') {
+            cmd = 'npx'; args = ['playwright', 'test', scriptPath]
+          } else {
+            cmd = '/bin/bash'; fs.chmodSync(scriptPath, '755'); args = [scriptPath]
+          }
           break
         }
 
