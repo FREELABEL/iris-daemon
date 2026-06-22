@@ -39,7 +39,10 @@ const LIMIT = parseInt(params.limit || process.env.LIMIT || '10', 10)
 const DRY_RUN = (params.dry_run || process.env.DRY_RUN || '0') === '1'
 const BOARD_ID = params.board_id || process.env.BOARD_ID || ''
 const STRATEGY_ID = params.strategy_id || process.env.STRATEGY_ID || ''
-const SERPER_API_KEY = params.serper_api_key || process.env.SERPER_API_KEY || 'ff1effc31b786e21d631c1bb8840072e7175a24a'
+// No hardcoded fallback key: the old default (ff1eff…) is exhausted, and
+// defaulting to a dead key masks "no key configured" as a per-venue HTTP 400
+// (#133856). Require an explicit, funded key.
+const SERPER_API_KEY = params.serper_api_key || process.env.SERPER_API_KEY || ''
 const DELAY_MS = parseInt(params.delay_ms || process.env.DELAY_MS || '3000', 10)
 const API_URL = params.api_url || process.env.FL_API_URL || 'https://raichu.heyiris.io'
 const API_TOKEN = resolveIrisToken({ override: params.api_token }).token || ''
@@ -106,6 +109,25 @@ async function fetchVenues () {
   return venues.filter(v => !v.google_place_id || !v.photo || (typeof v.photo === 'string' && v.photo.includes('unsplash.com')) || !v.description)
 }
 
+// Classify a non-200 Serper response. A 400 "Not enough credits" or a 401/403
+// is a GLOBAL config/billing problem — it hits every venue identically, so it
+// must abort the run with an actionable message, not be swallowed into a
+// generic "HTTP 400 → enriched 0" (#133856, same masked-failure family as
+// #147277). Rate limits are transient (warn, continue).
+function classifySerperError (resp) {
+  let msg = ''
+  try { msg = (JSON.parse(resp.body) || {}).message || '' } catch (_) {}
+  const lower = String(msg).toLowerCase()
+  const isCredits = lower.includes('credit')
+  const isAuth = resp.status === 401 || resp.status === 403 || lower.includes('unauthorized') || lower.includes('api key') || lower.includes('invalid')
+  let hint
+  if (isCredits) hint = 'Serper API key is OUT OF CREDITS — top up at serper.dev or set a funded SERPER_API_KEY.'
+  else if (isAuth) hint = 'Serper API key is invalid/unauthorized — set a valid SERPER_API_KEY.'
+  else if (resp.status === 429) hint = 'Serper rate limit hit — increase delay_ms and retry.'
+  else hint = `Serper HTTP ${resp.status}${msg ? ` — ${msg}` : ''}.`
+  return { fatal: isCredits || isAuth, message: hint }
+}
+
 // ─── Phase B: Enrich via Serper (Places + Images) ─────────────
 async function enrichViaSerper (venue) {
   const city = venue.city || CITY
@@ -124,7 +146,15 @@ async function enrichViaSerper (venue) {
     const placesData = JSON.parse(placesResp.body)
     place = (placesData.places || [])[0] || null
   } else {
-    console.warn(`${PREFIX}   Serper Places error for "${venue.name}": HTTP ${placesResp.status}`)
+    const err = classifySerperError(placesResp)
+    if (err.fatal) {
+      // Global failure — don't loop every venue printing the same error and
+      // then lie "enriched 0". Abort with the real, actionable cause.
+      const e = new Error(err.message)
+      e.serperFatal = true
+      throw e
+    }
+    console.warn(`${PREFIX}   Serper Places error for "${venue.name}": ${err.message}`)
   }
 
   // Step 2: Serper Images — get a real photo of the venue
@@ -302,7 +332,17 @@ async function main () {
     console.log(`${PREFIX} Processing: "${venue.name}" (ID: ${venue.id})`)
 
     // Phase B: Enrich
-    const data = await enrichViaSerper(venue)
+    let data
+    try {
+      data = await enrichViaSerper(venue)
+    } catch (e) {
+      if (e && e.serperFatal) {
+        console.error(`${PREFIX} ABORTING: ${e.message}`)
+        console.error(`${PREFIX} Enriched 0 because the Serper provider is unavailable — this is NOT "no venues to enrich". Fix the key, then re-run.`)
+        process.exit(1)
+      }
+      throw e
+    }
     if (!data) {
       await delay(DELAY_MS)
       continue
