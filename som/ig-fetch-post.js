@@ -23,11 +23,13 @@ const account = (process.argv[3] && !process.argv[3].startsWith('--')) ? process
 function out (obj) { process.stdout.write(JSON.stringify(obj) + '\n') }
 function fail (error, extra = {}) { out({ ok: false, url: igUrl || null, error, ...extra }); process.exit(1) }
 
-if (!igUrl || !/instagram\.com\/(p|reel|tv)\//.test(igUrl)) {
+// Accept both instagram.com/p/<code> and the username-prefixed
+// instagram.com/<user>/p/<code> form (the latter is what Share links produce).
+if (!igUrl || !/instagram\.com\/(?:[^/?#]+\/)?(p|reel|tv)\//.test(igUrl)) {
   fail('Provide an Instagram post/reel URL (instagram.com/p/… or /reel/…)')
 }
 
-const shortcode = (igUrl.match(/instagram\.com\/(?:p|reel|tv)\/([^/?#]+)/) || [])[1] || null
+const shortcode = (igUrl.match(/instagram\.com\/(?:[^/?#]+\/)?(?:p|reel|tv)\/([^/?#]+)/) || [])[1] || null
 const authFile = path.join(__dirname, `instagram-auth-${account}.json`)
 if (!fs.existsSync(authFile)) { fail(`No stored IG session for "${account}" (${path.basename(authFile)})`) }
 

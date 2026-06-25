@@ -223,7 +223,9 @@ class IMessageChannel extends EventEmitter {
    * when handled (caller skips the agent forward); false to fall through unchanged.
    */
   async _tryImportInstagramEvent(text, conversationId) {
-    const igMatch = (text || '').match(/https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel|tv)\/[A-Za-z0-9_-]+/i)
+    // Match both instagram.com/p/<code> and the username-prefixed share-link form
+    // instagram.com/<user>/p/<code>.
+    const igMatch = (text || '').match(/https?:\/\/(?:www\.)?instagram\.com\/(?:[^/?#]+\/)?(?:p|reel|tv)\/[A-Za-z0-9_-]+/i)
     if (!igMatch) return false
     // Require an event/add intent so ordinary IG links still go to the agent.
     if (!/\b(add|event|flyer|happening|show|concert)\b/i.test(text)) return false
