@@ -13,6 +13,10 @@ const NativeIMessageDriver = require('../drivers/native-imessage')
 const EventEmitter = require('events')
 const http = require('http')
 const https = require('https')
+const os = require('os')
+const path = require('path')
+const fs = require('fs')
+const { execFile } = require('child_process')
 
 // Wake-word pattern: @heyiris or @iris (case-insensitive)
 const MENTION_REGEX = /(?:^|\s)@(?:heyiris|iris)\b/i
@@ -164,6 +168,15 @@ class IMessageChannel extends EventEmitter {
         cleanText = normalized.text.replace(MENTION_REGEX, '').trim()
       }
 
+      // IG event auto-import (#152145): handle "add this event <IG link>" locally via
+      // the iris CLI (authenticated bridge fetcher) instead of the fl-api agent, whose
+      // server-side web_scraper hits Instagram's login wall. Short-circuits on success.
+      if (hasMention && !normalized.is_from_me &&
+          await this._tryImportInstagramEvent(cleanText, normalized.conversation_id)) {
+        this.messageCount++
+        return
+      }
+
       // Fetch conversation context for richer AI responses
       let conversationHistory = []
       if (hasMention && this.driver?.queryMessages) {
@@ -200,6 +213,46 @@ class IMessageChannel extends EventEmitter {
     } catch (err) {
       console.error(`[imessage] Handle inbound error: ${err.message}`)
       this.errorCount++
+    }
+  }
+
+  /**
+   * IG event auto-import (#152145). If the message carries an Instagram post/reel URL
+   * AND an add-event intent, import it via the local iris CLI (which uses the
+   * authenticated bridge fetcher to get past IG's login wall) and reply. Returns true
+   * when handled (caller skips the agent forward); false to fall through unchanged.
+   */
+  async _tryImportInstagramEvent(text, conversationId) {
+    const igMatch = (text || '').match(/https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel|tv)\/[A-Za-z0-9_-]+/i)
+    if (!igMatch) return false
+    // Require an event/add intent so ordinary IG links still go to the agent.
+    if (!/\b(add|event|flyer|happening|show|concert)\b/i.test(text)) return false
+
+    const irisCmd = path.join(os.homedir(), '.iris', 'bin', 'iris')
+    if (!fs.existsSync(irisCmd)) return false
+
+    const igUrl = igMatch[0]
+    console.log(`[imessage] IG event auto-import: ${igUrl}`)
+    try {
+      const ev = await new Promise((resolve, reject) => {
+        execFile(irisCmd, ['content', 'event', 'import-from-ig', igUrl, '--json'],
+          { timeout: 120000 }, (err, stdout) => {
+            if (err) return reject(err)
+            const line = String(stdout).trim().split('\n').filter(Boolean).pop() || ''
+            try { resolve(JSON.parse(line)) } catch (e) { reject(new Error(`bad JSON: ${line.slice(0, 160)}`)) }
+          })
+      })
+      const e = ev?.event ?? ev?.data ?? ev ?? {}
+      const title = e.title || 'the event'
+      const id = e.id
+      await this.sendReply(conversationId,
+        `✅ Added "${title}"${id ? ` (#${id})` : ''} to the events page — flyer + details pulled from Instagram.`)
+      return true
+    } catch (err) {
+      // Don't reply here — fall through to the normal log/agent path so the mention
+      // isn't lost. The auto-import is best-effort.
+      console.error(`[imessage] IG event auto-import failed: ${err.message}`)
+      return false
     }
   }
 
