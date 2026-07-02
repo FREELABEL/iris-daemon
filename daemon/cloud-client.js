@@ -42,6 +42,27 @@ class CloudClient {
     this.usingFallback = false
     this.requestsSinceFallback = 0
     this.primaryProbeInterval = 10 // try primary every N successful requests on fallback
+
+    // Task-signature enforcement (#157524). The hub HMAC-signs each task
+    // payload; the node validates it with its api_key as the shared secret.
+    // Enforcement is GATED so we don't brick hubs that haven't started signing
+    // yet, while still moving toward the security floor:
+    //   HIVE_REQUIRE_SIGNATURE=1|true|yes  → reject tasks with a MISSING sig
+    //   HIVE_REQUIRE_SIGNATURE=0|false|no  → warn-only on missing sig
+    //   unset (default)                    → enforce IFF a dedicated signing
+    //                                        secret (HIVE_SIGNING_SECRET) is set
+    // NOTE: a *bad* (present-but-invalid) signature is ALWAYS rejected in
+    // fetchTask regardless of this flag — this switch only governs how a
+    // *missing* signature is treated, preserving backward-compat by default.
+    const reqEnv = (process.env.HIVE_REQUIRE_SIGNATURE || '').toLowerCase()
+    if (reqEnv === '1' || reqEnv === 'true' || reqEnv === 'yes') {
+      this.requireSignature = true
+    } else if (reqEnv === '0' || reqEnv === 'false' || reqEnv === 'no') {
+      this.requireSignature = false
+    } else {
+      // Default: opt into enforcement only when a signing secret is configured.
+      this.requireSignature = !!process.env.HIVE_SIGNING_SECRET
+    }
   }
 
   /**
@@ -86,9 +107,12 @@ class CloudClient {
         throw new Error(`Task ${taskId} signature verification failed — payload may be tampered`)
       }
     } else {
-      // Unsigned task — log warning but allow execution for backward compatibility
-      // TODO: make signature required once all hubs are updated
-      console.warn(`[cloud-client] WARNING: Task ${taskId} has no signature — hub may be outdated`)
+      // Missing signature. A present-but-invalid signature is already rejected
+      // above; here we only decide how to treat the *absence* of one (#157524).
+      if (this.requireSignature) {
+        throw new Error(`Task ${taskId} rejected: task signature required but missing — refusing to execute unsigned payload (a forged dispatch could run arbitrary commands). Hub must sign task payloads, or unset HIVE_REQUIRE_SIGNATURE / HIVE_SIGNING_SECRET to allow unsigned tasks.`)
+      }
+      console.warn(`[cloud-client] WARNING: Task ${taskId} has no signature — executing anyway (enforcement off; hub may be outdated). Set HIVE_REQUIRE_SIGNATURE=1 to reject unsigned tasks.`)
     }
 
     return task

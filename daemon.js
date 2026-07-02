@@ -210,7 +210,31 @@ function handleStatus () {
   setTimeout(() => process.exit(0), 3000) // timeout
 }
 
+// Probe whether a persisted PID is actually alive (matches what `ps` sees).
+// signal 0 doesn't deliver a signal — it just checks the process exists.
+// ESRCH = gone; EPERM = alive but owned by another user (still "running").
+function isPidAlive (pid) {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err.code === 'EPERM'
+  }
+}
+
 function printStatusBox (status, live) {
+  // Reconcile liveness into ONE truthful state (#157542).
+  // A reachable control socket proves the daemon is up. When the socket is
+  // unreachable (stale/removed) but the status file carries a PID that is
+  // still alive, the daemon is ALSO running — the old code gated PID + footer
+  // solely on the `live` socket flag and falsely reported "not running",
+  // regressing #109541. Now we fall back to the persisted PID.
+  const pid = status.pid
+  const pidAlive = isPidAlive(pid)
+  const running = live || pidAlive
+  const via = live ? 'live socket' : `pid ${pid} alive`
+
   console.log('┌─────────────────────────────────────────┐')
   console.log('│   IRIS Daemon Status                     │')
   console.log('├─────────────────────────────────────────┤')
@@ -231,9 +255,9 @@ function printStatusBox (status, live) {
     console.log(`│  Reason:  ${status.reason.padEnd(30)}│`)
   }
   console.log(`│  Updated: ${(status.last_updated || '').substring(11, 19).padEnd(30)}│`)
-  console.log(`│  PID:     ${String(live ? status.pid || process.pid : 'n/a').padEnd(30)}│`)
+  console.log(`│  PID:     ${String(running ? (pid || process.pid) : 'n/a').padEnd(30)}│`)
   console.log('└─────────────────────────────────────────┘')
-  console.log(`Daemon process: ${live ? 'running (live socket)' : 'not running (stale status file)'}`)
+  console.log(`Daemon process: ${running ? `running (${via})` : 'not running (stale status file)'}`)
 }
 
 // ─── Share command (standalone or via running daemon) ────────────
