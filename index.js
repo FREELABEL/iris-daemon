@@ -1916,6 +1916,42 @@ app.get('/api/imessage/resolve', async (req, res) => {
 })
 
 /**
+ * Preflight for any Mail.app AppleScript call.
+ *
+ * Deliberately NOT part of GET /health: Mail.app being closed says nothing about
+ * the bridge's health, a health poll must not launch apps as a side effect, and a
+ * check that isn't adjacent to the call is stale the moment the user quits Mail.
+ * Callers still handle -609 — this reduces how often it happens, it does not
+ * guarantee it cannot. See bug #177253.
+ */
+async function ensureMailRunning(timeoutMs = 10000) {
+  const { execFile } = require('child_process')
+  const osa = (script) =>
+    new Promise((resolve) => {
+      execFile('/usr/bin/osascript', ['-e', script], { timeout: 5000 }, (err, stdout) => {
+        resolve(err ? null : (stdout || '').trim())
+      })
+    })
+
+  const isRunning = async () =>
+    (await osa('tell application "System Events" to return (name of processes) contains "Mail"')) === 'true'
+
+  if (await isRunning()) return true
+
+  // `open -a Mail` returns before Mail is scriptable, so poll rather than sleep.
+  await new Promise((resolve) => {
+    execFile('/usr/bin/open', ['-a', 'Mail'], { timeout: 5000 }, () => resolve())
+  })
+
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await isRunning()) return true
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  return false
+}
+
+/**
  * POST /api/mail/send
  * Send an email via Apple Mail.app using AppleScript.
  * Body: { to_email: string, to_name?: string, subject: string, body_text: string }
@@ -1930,6 +1966,10 @@ app.post('/api/mail/send', async (req, res) => {
 
   if (!to_email || !subject || !body_text) {
     return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
+  }
+
+  if (!(await ensureMailRunning())) {
+    return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
   }
 
   // Escape for AppleScript string literals
@@ -2288,6 +2328,10 @@ app.get('/api/mail/search', async (req, res) => {
     return res.status(400).json({ error: 'from query param is required (email or name substring)' })
   }
 
+  if (!(await ensureMailRunning())) {
+    return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
+  }
+
   const escapeForAppleScript = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
   const fromEscaped = escapeForAppleScript(from)
   const subjectEscaped = subject ? escapeForAppleScript(subject) : ''
@@ -2362,6 +2406,11 @@ tell application "Mail"
       end try` : ''}
       set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\t" & theAttachments & "\\n---ROW---\\n"
     end repeat
+  on error errMsg number errNum
+    -- NEVER swallow this into an empty result: a bare "end try" here made every
+    -- failure (notably -609 "Connection is invalid" when Mail.app is not running)
+    -- look like a legitimate zero-match search. See bug #177253.
+    return "---IRIS_MAIL_ERROR---" & errNum & "\\t" & errMsg
   end try
   return output
 end tell
@@ -2383,6 +2432,16 @@ end tell
         resolve(stdout)
       })
     })
+
+    // AppleScript reports in-script failures via this sentinel rather than an empty
+    // string, so a hard error can never masquerade as "no matching emails".
+    if (stdout.includes('---IRIS_MAIL_ERROR---')) {
+      const [errNum, errMsg] = stdout.split('---IRIS_MAIL_ERROR---')[1].trim().split('\t')
+      if (errNum === '-609' || /Connection is invalid/i.test(errMsg || '')) {
+        throw new Error('Mail.app is not running or is not scriptable. Launch Mail and retry.')
+      }
+      throw new Error(`Mail.app error ${errNum}: ${(errMsg || 'unknown').slice(0, 300)}`)
+    }
 
     const messages = stdout
       .split(/\n---ROW---\n/)
