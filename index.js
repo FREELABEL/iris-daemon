@@ -1796,6 +1796,10 @@ app.post('/api/imessage/direct-send', async (req, res) => {
     return res.status(503).json({ error: 'iMessage send requires macOS' })
   }
 
+  if (!(await ensureAppRunning('Messages'))) {
+    return res.status(503).json({ error: 'Messages.app could not be launched or is not scriptable. Open Messages and retry.' })
+  }
+
   try {
     const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
     const script =
@@ -1924,7 +1928,7 @@ app.get('/api/imessage/resolve', async (req, res) => {
  * Callers still handle -609 — this reduces how often it happens, it does not
  * guarantee it cannot. See bug #177253.
  */
-async function ensureMailRunning(timeoutMs = 10000) {
+async function ensureAppRunning(appName, timeoutMs = 10000) {
   const { execFile } = require('child_process')
   const osa = (script) =>
     new Promise((resolve) => {
@@ -1934,13 +1938,13 @@ async function ensureMailRunning(timeoutMs = 10000) {
     })
 
   const isRunning = async () =>
-    (await osa('tell application "System Events" to return (name of processes) contains "Mail"')) === 'true'
+    (await osa(`tell application "System Events" to return (name of processes) contains "${appName}"`)) === 'true'
 
   if (await isRunning()) return true
 
-  // `open -a Mail` returns before Mail is scriptable, so poll rather than sleep.
+  // `open -a <App>` returns before the app is scriptable, so poll rather than sleep.
   await new Promise((resolve) => {
-    execFile('/usr/bin/open', ['-a', 'Mail'], { timeout: 5000 }, () => resolve())
+    execFile('/usr/bin/open', ['-a', appName], { timeout: 5000 }, () => resolve())
   })
 
   const deadline = Date.now() + timeoutMs
@@ -1950,6 +1954,8 @@ async function ensureMailRunning(timeoutMs = 10000) {
   }
   return false
 }
+
+const ensureMailRunning = (timeoutMs) => ensureAppRunning('Mail', timeoutMs)
 
 /**
  * POST /api/mail/send
@@ -2492,6 +2498,10 @@ app.get('/api/calendar/events', async (req, res) => {
     return res.status(503).json({ error: 'Calendar.app is only available on macOS' })
   }
 
+  if (!(await ensureAppRunning('Calendar'))) {
+    return res.status(503).json({ error: 'Calendar.app could not be launched or is not scriptable. Open Calendar and retry.' })
+  }
+
   const days = Math.max(1, Math.min(90, parseInt(req.query.days || '7', 10)))
   const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
   const calendarFilter = (req.query.calendar || '').toString().trim()
@@ -2535,6 +2545,11 @@ tell application "Calendar"
         set evtAllDay to allday event of evt
         set output to output & evtTitle & "\\t" & evtStart & "\\t" & evtEnd & "\\t" & evtLocation & "\\t" & evtNotes & "\\t" & calName & "\\t" & evtAllDay & "\\n---ROW---\\n"
       end repeat
+    on error errMsg number errNum
+      -- A bare "end try" here silently dropped this calendar's events while other
+      -- calendars still returned theirs — a PARTIAL false negative, harder to spot
+      -- than an empty one. Emit a marker row so the gap is surfaced. See bug #177253.
+      set output to output & "---IRIS_CAL_ERROR---" & calName & "\\t" & errNum & "\\t" & errMsg & "\\n---ROW---\\n"
     end try
     if eventCount >= ${limit} then exit repeat
   end repeat
@@ -2559,10 +2574,26 @@ end tell
       })
     })
 
-    const events = stdout
+    const allRows = stdout
       .split(/\n---ROW---\n/)
       .map((row) => row.trim())
       .filter((row) => row.length > 0)
+
+    // Partition out per-calendar failures so a skipped calendar can never pass as
+    // "this calendar had no events". These are reported, never silently dropped.
+    const failedCalendars = allRows
+      .filter((row) => row.startsWith('---IRIS_CAL_ERROR---'))
+      .map((row) => {
+        const [calendar, errNum, errMsg] = row.replace('---IRIS_CAL_ERROR---', '').split('\t')
+        return { calendar: calendar || 'unknown', error_number: errNum || '', error: (errMsg || '').slice(0, 300) }
+      })
+
+    for (const f of failedCalendars) {
+      console.error(`[calendar/events] Calendar "${f.calendar}" failed (${f.error_number}): ${f.error} — its events are MISSING from this response`)
+    }
+
+    const events = allRows
+      .filter((row) => !row.startsWith('---IRIS_CAL_ERROR---'))
       .map((row) => {
         const [title, start_date, end_date, location, notes, calendar, all_day] = row.split('\t')
         return {
@@ -2583,6 +2614,13 @@ end tell
       events,
       count: events.length,
       days,
+      // Present only when calendars were skipped — callers must treat the result
+      // as INCOMPLETE, not as a full picture with fewer events.
+      ...(failedCalendars.length > 0 && {
+        partial: true,
+        failed_calendars: failedCalendars,
+        warning: `${failedCalendars.length} calendar(s) could not be read; their events are missing from these results.`,
+      }),
     })
   } catch (err) {
     console.error(`[calendar/events] Failed: ${err.message}`)
@@ -2606,6 +2644,10 @@ app.post('/api/calendar/create', async (req, res) => {
 
   if (!title || !start_date) {
     return res.status(400).json({ error: 'title and start_date are required' })
+  }
+
+  if (!(await ensureAppRunning('Calendar'))) {
+    return res.status(503).json({ error: 'Calendar.app could not be launched or is not scriptable. Open Calendar and retry.' })
   }
 
   const escapeForAppleScript = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
