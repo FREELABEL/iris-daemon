@@ -1717,35 +1717,34 @@ app.delete('/api/providers/imessage', async (req, res) => {
  * Returns all conversations tracked by the native iMessage driver.
  * Requires iMessage channel to be running with the native driver.
  */
-app.get('/api/imessage/conversations', (req, res) => {
-  if (!iMessageChannel || !iMessageChannel.driver) {
-    return res.status(503).json({ error: 'iMessage channel not running. Start it first via POST /api/providers/imessage' })
-  }
-
-  const driver = iMessageChannel.driver
-  if (!driver.conversations) {
-    return res.status(503).json({ error: 'iMessage driver does not support conversation listing (use native driver)' })
-  }
-
-  const conversations = []
-  driver.conversations.forEach((conv, guid) => {
-    conversations.push({
-      guid,
-      display_name: conv.displayName || conv.groupName || guid,
-      is_group: conv.isGroup || false,
-      last_message_at: conv.lastMessageAt || null,
-      participant_count: conv.participants ? conv.participants.length : null
+app.get('/api/imessage/conversations', async (req, res) => {
+  // Reads chat.db directly instead of the live channel's in-memory map.
+  //
+  // Listing conversations is a READ, but it used to require the always-on iMessage CHANNEL
+  // to be running — the same channel that auto-replies to real contacts and must never be
+  // started casually (#137256). So the safe answer was "unavailable" and the available
+  // answer was unsafe (#178747). chat.db is the store the native driver already queries,
+  // so this needs no new permission beyond the Full Disk Access already probed for.
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10)))
+  try {
+    const store = require('./drivers/imessage-store')
+    const conversations = await store.listConversations({ limit })
+    res.json({
+      conversations: conversations.map((c) => ({
+        guid: c.guid,
+        display_name: c.display_name,
+        is_group: c.is_group,
+        participants: c.participants,
+        message_count: c.message_count,
+        last_message_at: c.last_message_at ? c.last_message_at.toISOString() : null,
+      })),
+      count: conversations.length,
+      source: 'chat-db',
     })
-  })
-
-  // Sort by most recent message
-  conversations.sort((a, b) => {
-    if (!a.last_message_at) return 1
-    if (!b.last_message_at) return -1
-    return new Date(b.last_message_at) - new Date(a.last_message_at)
-  })
-
-  res.json({ conversations, count: conversations.length })
+  } catch (err) {
+    console.error(`[imessage/conversations] ${err.message}`)
+    res.status(503).json({ error: err.message })
+  }
 })
 
 /**
@@ -2393,173 +2392,43 @@ app.get('/api/obsidian/search', (req, res) => {
 })
 
 app.get('/api/mail/search', async (req, res) => {
-  if (process.platform !== 'darwin') {
-    return res.status(503).json({ error: 'Mail search is only available on macOS' })
-  }
-
+  // Reads Mail's own Envelope Index instead of `messages of inbox whose sender contains X`.
+  //
+  // That whose-clause is the same pathology that made Calendar unusable: MEASURED at 31s
+  // here, hitting the execFile timeout and returning a truncated dump of the AppleScript
+  // rather than mail. The index answers the same question ~268x faster.
+  //
+  // SCOPE, stated plainly: the index holds ENVELOPES — sender, subject, dates, mailbox. It
+  // does NOT hold bodies (those are .emlx files on disk), so include_body is no longer
+  // honoured here rather than being silently half-implemented.
   const from = (req.query.from || '').toString().trim()
-  const days = Math.max(1, Math.min(90, parseInt(req.query.days || '14', 10)))
-  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '20', 10)))
-  const includeBody = req.query.include_body === '1' || req.query.include_body === 'true'
-  const maxBody = Math.max(100, Math.min(50000, parseInt(req.query.max_body || '4000', 10)))
   const subject = (req.query.subject || '').toString().trim()
-  const includeAttachments = req.query.include_attachments === '1' || req.query.include_attachments === 'true'
-  const saveAttachments = req.query.save_attachments === '1' || req.query.save_attachments === 'true'
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '14', 10)))
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
 
-  if (!from) {
-    return res.status(400).json({ error: 'from query param is required (email or name substring)' })
+  if (!from && !subject) {
+    return res.status(400).json({ error: 'from (or subject) query param is required' })
   }
-
-  if (!(await ensureMailRunning())) {
-    return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
-  }
-
-  const escapeForAppleScript = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  const fromEscaped = escapeForAppleScript(from)
-  const subjectEscaped = subject ? escapeForAppleScript(subject) : ''
-
-  // The script returns a delimited string we parse in JS to avoid AppleScript JSON pain.
-  // Format per row: DATE\tSENDER\tSUBJECT\tBODY (body truncated to max_body chars, default 4000)
-  const subjectFilter = subjectEscaped
-    ? ` and subject contains "${subjectEscaped}"`
-    : ''
-  const script = `
-tell application "Mail"
-  set output to ""
-  set cutoffDate to (current date) - (${days} * days)
-  set msgCount to 0
-  try
-    set msgs to (messages of inbox whose sender contains "${fromEscaped}"${subjectFilter} and date received > cutoffDate)
-    repeat with msg in msgs
-      if msgCount >= ${limit} then exit repeat
-      set msgCount to msgCount + 1
-      try
-        set theDate to (date received of msg) as string
-      on error
-        set theDate to "unknown"
-      end try
-      try
-        set theSender to sender of msg
-      on error
-        set theSender to ""
-      end try
-      try
-        set theSubject to subject of msg
-      on error
-        set theSubject to "(no subject)"
-      end try
-      set theBody to ""
-      ${includeBody ? `try
-        set theBody to content of msg
-        if length of theBody > ${maxBody} then set theBody to (text 1 thru ${maxBody} of theBody) & "..."
-      end try` : ''}
-      set theAttachments to ""
-      ${includeAttachments || saveAttachments ? `try
-        set attList to mail attachments of msg
-        set attCount to count of attList
-        if attCount > 0 then
-          repeat with att in attList
-            try
-              set attName to "unknown"
-              set attMime to "unknown"
-              set attSize to 0
-              try
-                set attName to name of att
-              end try
-              try
-                set attMime to MIME type of att
-              end try
-              try
-                set attSize to file size of att
-              end try
-              set theAttachments to theAttachments & attName & "|" & attMime & "|" & attSize
-              ${saveAttachments ? `try
-                set savePath to "${escapeForAppleScript(require('os').tmpdir())}/iris-mail-attachments/"
-                do shell script "mkdir -p " & quoted form of savePath
-                save att in POSIX file (savePath & attName)
-                set theAttachments to theAttachments & "|" & savePath & attName
-              on error saveErr
-                set theAttachments to theAttachments & "|SAVE_ERROR:" & saveErr
-              end try` : ''}
-              if att is not last item of attList then set theAttachments to theAttachments & ";;;"
-            end try
-          end repeat
-        end if
-      end try` : ''}
-      set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\t" & theAttachments & "\\n---ROW---\\n"
-    end repeat
-  on error errMsg number errNum
-    -- NEVER swallow this into an empty result: a bare "end try" here made every
-    -- failure (notably -609 "Connection is invalid" when Mail.app is not running)
-    -- look like a legitimate zero-match search. See bug #177253.
-    return "---IRIS_MAIL_ERROR---" & errNum & "\\t" & errMsg
-  end try
-  return output
-end tell
-`.trim()
 
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          const msg = (stderr || err.message || '').trim()
-          if (msg.includes('-1743') || msg.includes('not allowed')) {
-            return reject(new Error(
-              'Mail.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
-            ))
-          }
-          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
-        }
-        resolve(stdout)
-      })
-    })
-
-    // AppleScript reports in-script failures via this sentinel rather than an empty
-    // string, so a hard error can never masquerade as "no matching emails".
-    if (stdout.includes('---IRIS_MAIL_ERROR---')) {
-      const [errNum, errMsg] = stdout.split('---IRIS_MAIL_ERROR---')[1].trim().split('\t')
-      if (errNum === '-609' || /Connection is invalid/i.test(errMsg || '')) {
-        throw new Error('Mail.app is not running or is not scriptable. Launch Mail and retry.')
-      }
-      throw new Error(`Mail.app error ${errNum}: ${(errMsg || 'unknown').slice(0, 300)}`)
-    }
-
-    const messages = stdout
-      .split(/\n---ROW---\n/)
-      .map((row) => row.trim())
-      .filter((row) => row.length > 0)
-      .map((row) => {
-        const parts = row.split('\t')
-        const date = parts[0] || ''
-        const sender = parts[1] || ''
-        const subject = parts[2] || ''
-        const body = parts[3] || ''
-        const attachmentsRaw = parts[4] || ''
-        const result = { date, sender, subject, body }
-        if (attachmentsRaw) {
-          result.attachments = attachmentsRaw.split(';;;').filter(a => a).map(a => {
-            const [name, mime, size, savedPath] = a.split('|')
-            const att = { name: name || '', mime_type: mime || '', size: parseInt(size || '0', 10) }
-            if (savedPath && !savedPath.startsWith('SAVE_ERROR')) att.saved_path = savedPath
-            if (savedPath && savedPath.startsWith('SAVE_ERROR')) att.save_error = savedPath
-            return att
-          })
-        } else {
-          result.attachments = []
-        }
-        return result
-      })
-
+    const store = require('./drivers/apple-mail-store')
+    const emails = await store.searchEmails({ from, subject, days, limit })
     res.json({
-      messages,
-      count: messages.length,
-      from,
+      emails: emails.map((e) => ({
+        subject: e.subject,
+        sender: e.sender,
+        sender_name: e.sender_name,
+        date_sent: e.sent_at ? e.sent_at.toISOString() : null,
+        mailbox: e.mailbox,
+      })),
+      count: emails.length,
       days,
+      source: 'envelope-index',
+      ...(req.query.include_body ? { body_note: 'bodies are not in the envelope index; use the message id against .emlx' } : {}),
     })
   } catch (err) {
-    console.error(`[mail/search] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    console.error(`[mail/search] ${err.message}`)
+    res.status(503).json({ error: err.message })
   }
 })
 
