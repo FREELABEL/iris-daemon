@@ -2071,75 +2071,37 @@ app.get('/api/imessage/search', async (req, res) => {
   }
 
   const handle = (req.query.handle || '').toString().trim()
-  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '14', 10)))
-  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '100', 10)))
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '25', 10)))
 
   if (!handle) {
     return res.status(400).json({ error: 'handle query param is required (email or phone)' })
   }
 
-  // Normalize handle for matching (digits only for phones, lowercase for emails)
-  const digits = handle.replace(/\D/g, '')
-  const lower = handle.toLowerCase()
-
-  const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
-
-  // Apple's date column is nanoseconds since 2001-01-01
-  // Cutoff = (now - N days) - (2001-01-01) seconds, then * 1e9
-  const sql = `
-SELECT
-  datetime(m.date/1000000000 + strftime('%s','2001-01-01'), 'unixepoch', 'localtime') AS ts,
-  m.is_from_me AS from_me,
-  COALESCE(h.id, '') AS sender,
-  COALESCE(m.text, '') AS text
-FROM message m
-LEFT JOIN handle h ON h.ROWID = m.handle_id
-WHERE (
-  ${digits ? `REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', '') LIKE '%${digits}%' OR ` : ''}
-  LOWER(h.id) LIKE '%${lower.replace(/'/g, "''")}%'
-)
-  AND m.date > (strftime('%s','now','-${days} days') - strftime('%s','2001-01-01')) * 1000000000
-  AND m.text IS NOT NULL
-ORDER BY m.date DESC
-LIMIT ${limit}
-`.trim()
-
+  // Reads chat.db directly, matching /api/imessage/conversations.
+  //
+  // The previous implementation took 14.6s for three messages — caught by
+  // test/all-providers.test.js, which asserts every declared function is interactive
+  // (<10s), not merely that it eventually answers. That budget is the whole point: the
+  // calendar provider "worked" for months in the sense that it never crashed.
   try {
-    const result = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile(
-        '/usr/bin/sqlite3',
-        ['-readonly', '-json', '-bail', chatDbPath, sql],
-        { timeout: 15000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            const msg = (stderr || err.message || '').trim()
-            if (msg.includes('unable to open') || msg.includes('authorization denied')) {
-              return reject(new Error(
-                'Cannot read chat.db. Grant Full Disk Access to the bridge process ' +
-                'in System Settings > Privacy & Security > Full Disk Access.'
-              ))
-            }
-            return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
-          }
-          try {
-            resolve(stdout.trim() ? JSON.parse(stdout) : [])
-          } catch (parseErr) {
-            reject(new Error(`sqlite3 JSON parse: ${parseErr.message}`))
-          }
-        }
-      )
-    })
-
+    const store = require('./drivers/imessage-store')
+    const messages = await store.searchMessages({ handle, days, limit })
     res.json({
-      messages: result,
-      count: result.length,
+      messages: messages.map((m) => ({
+        text: m.text,
+        sent_at: m.sent_at ? m.sent_at.toISOString() : null,
+        from_me: m.from_me,
+        handle: m.handle,
+      })),
+      count: messages.length,
       handle,
       days,
+      source: 'chat-db',
     })
   } catch (err) {
-    console.error(`[imessage/search] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    console.error(`[imessage/search] ${err.message}`)
+    res.status(503).json({ error: err.message })
   }
 })
 

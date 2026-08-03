@@ -230,9 +230,24 @@ function readNote(vaultPath, relPath, { maxBody = 200000 } = {}) {
   try {
     raw = fs.readFileSync(resolved, 'utf-8')
   } catch (e) {
-    // Never echo absolute filesystem paths back over HTTP.
+    // Never echo absolute filesystem paths back over HTTP — but DO say what went wrong.
+    //
+    // This used to collapse every non-ENOENT failure into "Could not read note: X", which
+    // names the file and nothing else. Caught by the all-providers suite on a real
+    // transient: a note that listNotes had just returned failed to read, and the message
+    // gave the reader nothing to act on. Vaults commonly live in iCloud or Google Drive,
+    // where a listed file can be dataless and fail to materialise, so "it is there but I
+    // could not read it right now" is a COMMON case that deserves its own words.
     if (e.code === 'ENOENT') throw new Error(`Note not found: ${relPath}`)
-    throw new Error(`Could not read note: ${relPath}`)
+    if (e.code === 'EACCES' || e.code === 'EPERM') {
+      throw new Error(`No permission to read note: ${relPath} — check Full Disk Access`)
+    }
+    if (e.code === 'EISDIR') throw new Error(`Not a file: ${relPath}`)
+    // EIO / ENOTCONN / EDEADLK are what a stalled cloud-storage download looks like.
+    throw new Error(
+      `Could not read note: ${relPath} (${e.code || 'unknown error'}) — ` +
+      'if this vault syncs via iCloud or Google Drive the file may not be downloaded yet',
+    )
   }
   const { frontmatter, body } = parseFrontmatter(raw)
   const st = fs.statSync(resolved)
