@@ -116,9 +116,21 @@ const PROVIDERS = {
       }
       return { ok: true }
     },
+    // Function names MATCH fl-api's IntegrationRegistry, which is what the UI, the CLI and
+    // every agent prompt already advertise. They previously disagreed three ways — the UI
+    // offered search_messages/get_messages/send_message while the rail had only
+    // list_conversations/resolve_handle — so five advertised functions were uncallable
+    // (#178748). The published names win; the rail conforms.
     functions: {
       list_conversations: { method: 'GET', path: '/api/imessage/conversations' },
+      search_messages: { method: 'GET', path: '/api/imessage/search' },
       resolve_handle: { method: 'GET', path: '/api/imessage/resolve' },
+      // WRITE. Reaches a real person's phone, so it exists only on an explicit call —
+      // never on a schedule, and never from the always-on reply channel (#137256).
+      send_message: { method: 'POST', path: '/api/imessage/direct-send' },
+      // NB: fl-api also advertised `get_messages` -> /api/imessage/messages. That route
+      // does not exist on the bridge and never has, so it is deliberately NOT declared
+      // here — an honestly-absent function beats one that 404s. Drop it from fl-api too.
     },
   },
 
@@ -131,7 +143,10 @@ const PROVIDERS = {
       return { ok: true }
     },
     functions: {
-      search: { method: 'GET', path: '/api/mail/search' },
+      // `search_emails`, not `search` — matches fl-api's published name (#178748).
+      search_emails: { method: 'GET', path: '/api/mail/search' },
+      // WRITE — sends real mail from the user's account. Explicit calls only.
+      send_email: { method: 'POST', path: '/api/mail/send' },
     },
   },
 
@@ -144,9 +159,16 @@ const PROVIDERS = {
       return { ok: true }
     },
     functions: {
-      // Read only for now. `create` exists on the bridge but writing to someone's real
-      // calendar is not something to enable by inference — it needs its own decision.
-      list_events: { method: 'GET', path: '/api/calendar/events' },
+      // `get_events`, not `list_events` — matches fl-api's published name (#178748).
+      //
+      // WARNING: this currently CANNOT succeed. The AppleScript behind it iterates every
+      // calendar with a `whose` clause and takes 4m37s on a 28-calendar machine, against a
+      // 30s execFile timeout (#178745). Declared because the UI already advertises it and
+      // an honest named failure beats a phantom function — but it will time out until the
+      // script is rewritten.
+      get_events: { method: 'GET', path: '/api/calendar/events' },
+      // WRITE — creates a real calendar event. Explicit calls only.
+      create_event: { method: 'POST', path: '/api/calendar/create' },
     },
   },
 }
