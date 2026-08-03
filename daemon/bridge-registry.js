@@ -74,6 +74,14 @@ const appExists = (name) =>
  * "bridge is offline" for a bridge that was running fine — the health answer has to
  * carry why, or the UI invents one.
  */
+/**
+ * Vault discovery is expensive (a filesystem walk) and its answer is nearly static, so the
+ * heartbeat probe caches it. 5 minutes: long enough that the 30s heartbeat stops paying for
+ * it, short enough that creating a vault shows up without a restart.
+ */
+let vaultProbeCache = null
+const VAULT_PROBE_TTL_MS = 5 * 60 * 1000
+
 const PROVIDERS = {
   obsidian: {
     name: 'Obsidian',
@@ -81,14 +89,28 @@ const PROVIDERS = {
     available () {
       if (process.platform === 'win32') return { ok: false, reason: 'Windows is not supported yet' }
       // A vault is the resource; without one the provider is present but useless.
+      //
+      // MEMOISED: this runs on EVERY heartbeat — every 30s, permanently, on every node —
+      // and discoverVaults() walks 7 candidate roots to depth 3. Measured at 130-306ms a
+      // call, so ~0.5s of filesystem walking per minute per machine forever, to answer a
+      // question whose answer changes about twice a year. It also made GET /api/obsidian/
+      // vaults slower for real callers, since they queue behind it (#178757).
       try {
+        const now = Date.now()
+        if (vaultProbeCache && now - vaultProbeCache.at < VAULT_PROBE_TTL_MS) {
+          return vaultProbeCache.result
+        }
         const { discoverVaults } = require('../drivers/obsidian')
         const vaults = discoverVaults()
-        if (!vaults.length) {
-          return { ok: false, reason: 'No Obsidian vault found on this machine' }
-        }
-        return { ok: true, detail: `${vaults.length} vault(s)` }
+        const result = vaults.length
+          ? { ok: true, detail: `${vaults.length} vault(s)` }
+          : { ok: false, reason: 'No Obsidian vault found on this machine' }
+        vaultProbeCache = { at: now, result }
+        return result
       } catch (e) {
+        // Never cache a failure: a transient permission blip would otherwise pin the
+        // provider "unavailable" for the whole TTL, which is the silent-wrong-answer
+        // shape this whole effort exists to avoid.
         return { ok: false, reason: `Obsidian driver unavailable: ${e.message}` }
       }
     },
