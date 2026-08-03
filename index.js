@@ -2351,7 +2351,11 @@ app.get('/api/obsidian/notes', (req, res) => {
     })
     res.json({ vault, notes, count: notes.length })
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    // A rejected folder is a CALLER error (400), not a server fault (500) — same status
+    // /api/obsidian/note already returns for the identical guard. A 500 tells a client to
+    // retry; retrying a traversal attempt forever is exactly wrong.
+    const bad = /escapes the vault/i.test(e.message)
+    res.status(bad ? 400 : 500).json({ error: e.message })
   }
 })
 
@@ -2567,136 +2571,54 @@ end tell
  */
 app.get('/api/calendar/events', async (req, res) => {
   if (process.platform !== 'darwin') {
-    return res.status(503).json({ error: 'Calendar.app is only available on macOS' })
-  }
-
-  if (!(await ensureAppRunning('Calendar'))) {
-    return res.status(503).json({ error: 'Calendar.app could not be launched or is not scriptable. Open Calendar and retry.' })
+    return res.status(503).json({ error: 'Calendar is only available on macOS' })
   }
 
   const days = Math.max(1, Math.min(90, parseInt(req.query.days || '7', 10)))
   const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
-  const calendarFilter = (req.query.calendar || '').toString().trim()
+  const calendarFilter = (req.query.calendar || '').toString().trim().toLowerCase()
 
-  const escapeForAppleScript = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-
-  // Build calendar filter clause
-  const calFilter = calendarFilter
-    ? `whose name is "${escapeForAppleScript(calendarFilter)}"`
-    : ''
-
-  const script = `
-tell application "Calendar"
-  set output to ""
-  set startDate to (current date)
-  set hours of startDate to 0
-  set minutes of startDate to 0
-  set seconds of startDate to 0
-  set endDate to startDate + (${days} * days)
-  set eventCount to 0
-  set cals to (calendars ${calFilter})
-  repeat with cal in cals
-    set calName to name of cal
-    try
-      set evts to (every event of cal whose start date >= startDate and start date <= endDate)
-      repeat with evt in evts
-        if eventCount >= ${limit} then exit repeat
-        set eventCount to eventCount + 1
-        set evtTitle to summary of evt
-        set evtStart to (start date of evt) as string
-        set evtEnd to (end date of evt) as string
-        set evtLocation to ""
-        try
-          set evtLocation to location of evt
-        end try
-        set evtNotes to ""
-        try
-          set evtNotes to description of evt
-          if length of evtNotes > 500 then set evtNotes to (text 1 thru 500 of evtNotes) & "..."
-        end try
-        set evtAllDay to allday event of evt
-        set output to output & evtTitle & "\\t" & evtStart & "\\t" & evtEnd & "\\t" & evtLocation & "\\t" & evtNotes & "\\t" & calName & "\\t" & evtAllDay & "\\n---ROW---\\n"
-      end repeat
-    on error errMsg number errNum
-      -- A bare "end try" here silently dropped this calendar's events while other
-      -- calendars still returned theirs — a PARTIAL false negative, harder to spot
-      -- than an empty one. Emit a marker row so the gap is surfaced. See bug #177253.
-      set output to output & "---IRIS_CAL_ERROR---" & calName & "\\t" & errNum & "\\t" & errMsg & "\\n---ROW---\\n"
-    end try
-    if eventCount >= ${limit} then exit repeat
-  end repeat
-  return output
-end tell
-`.trim()
-
+  // Reads Calendar.sqlitedb directly instead of driving Calendar.app over AppleScript.
+  //
+  // The AppleScript version used `every event of cal whose start date >= X`, which is
+  // O(all events ever) PER CALENDAR. Measured on a 28-calendar machine: 72 SECONDS for one
+  // calendar, ~4m37s for all of them, against a 30s execFile timeout — so this endpoint
+  // had never returned a single event through any surface (#178745). It also no longer
+  // needs Calendar.app to be running, and no longer leaves osascript orphans behind when
+  // the caller gives up.
+  //
+  // EventKit via JXA was measured too and REJECTED: fast, but TCC is scoped to the calling
+  // process, so from the daemon it saw 1 of 28 calendars and returned ZERO events while
+  // reporting fullAccess. Silent and partial is the worst failure mode available here.
+  // Full A/B in test/apple-calendar.matrix.js.
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          const msg = (stderr || err.message || '').trim()
-          if (msg.includes('-1743') || msg.includes('not allowed')) {
-            return reject(new Error(
-              'Calendar.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
-            ))
-          }
-          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
-        }
-        resolve(stdout)
-      })
-    })
+    const cal = require('./drivers/apple-calendar-sqlite')
+    // Over-fetch when filtering so the filter does not eat the limit.
+    const events = await cal.getEvents({ days, limit: calendarFilter ? Math.min(500, limit * 10) : limit })
 
-    const allRows = stdout
-      .split(/\n---ROW---\n/)
-      .map((row) => row.trim())
-      .filter((row) => row.length > 0)
-
-    // Partition out per-calendar failures so a skipped calendar can never pass as
-    // "this calendar had no events". These are reported, never silently dropped.
-    const failedCalendars = allRows
-      .filter((row) => row.startsWith('---IRIS_CAL_ERROR---'))
-      .map((row) => {
-        const [calendar, errNum, errMsg] = row.replace('---IRIS_CAL_ERROR---', '').split('\t')
-        return { calendar: calendar || 'unknown', error_number: errNum || '', error: (errMsg || '').slice(0, 300) }
-      })
-
-    for (const f of failedCalendars) {
-      console.error(`[calendar/events] Calendar "${f.calendar}" failed (${f.error_number}): ${f.error} — its events are MISSING from this response`)
-    }
-
-    const events = allRows
-      .filter((row) => !row.startsWith('---IRIS_CAL_ERROR---'))
-      .map((row) => {
-        const [title, start_date, end_date, location, notes, calendar, all_day] = row.split('\t')
-        return {
-          title: title || '',
-          start_date: start_date || '',
-          end_date: end_date || '',
-          location: location || '',
-          notes: notes || '',
-          calendar: calendar || '',
-          all_day: all_day === 'true',
-        }
-      })
-
-    // Sort by start_date
-    events.sort((a, b) => new Date(a.start_date).getTime() - new Date(b.start_date).getTime())
+    const filtered = calendarFilter
+      ? events.filter((e) => String(e.calendar).toLowerCase().includes(calendarFilter))
+      : events
 
     res.json({
-      events,
-      count: events.length,
+      events: filtered.slice(0, limit).map((e) => ({
+        title: e.title,
+        start_date: e.start.toISOString(),
+        end_date: e.end.toISOString(),
+        all_day: e.allDay,
+        location: '',
+        notes: e.notes,
+        calendar: e.calendar,
+      })),
+      count: Math.min(filtered.length, limit),
       days,
-      // Present only when calendars were skipped — callers must treat the result
-      // as INCOMPLETE, not as a full picture with fewer events.
-      ...(failedCalendars.length > 0 && {
-        partial: true,
-        failed_calendars: failedCalendars,
-        warning: `${failedCalendars.length} calendar(s) could not be read; their events are missing from these results.`,
-      }),
+      source: 'calendar-store',
     })
   } catch (err) {
+    // A NAMED reason, never an empty list. "You have no meetings" and "I cannot read your
+    // calendar" must never look the same to the caller.
     console.error(`[calendar/events] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    res.status(503).json({ error: err.message })
   }
 })
 

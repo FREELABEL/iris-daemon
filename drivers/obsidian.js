@@ -140,9 +140,42 @@ function extractTags(body, frontmatter) {
 }
 
 /** Walk every .md file in a vault. */
+/**
+ * Confine a caller-supplied relative path to the vault.
+ *
+ * readNote() had this guard; listNotes() did not, so `folder=../../..` walked straight out
+ * of the vault. Verified in production: it returned .md files from a DIFFERENT macOS user's
+ * home directory (/Users/Treyton/...), reachable from the cloud through bridge-call. Reads
+ * of those paths were still blocked, so it leaked directory structure and filenames rather
+ * than contents — and it scanned 1000 files in 9.7s, which measurably starved concurrent
+ * requests. #178744.
+ *
+ * Shared by both callers now, because the lesson from that bug is that ONE of two sibling
+ * entry points having the check is the same as neither having it.
+ */
+function resolveInsideVault(vaultPath, relPath) {
+  if (path.isAbsolute(relPath)) {
+    throw new Error('Path escapes the vault')
+  }
+  const base = path.resolve(vaultPath)
+  const resolved = path.resolve(path.join(base, relPath))
+  // Allow the vault root itself, and anything genuinely beneath it.
+  if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+    throw new Error('Path escapes the vault')
+  }
+
+  return resolved
+}
+
+/**
+ * @param {number} limit  clamped to [1, 5000]. A negative limit used to return one
+ *   arbitrary note and a zero limit one result — silently answering a caller's bug with
+ *   plausible-looking data, which is worse for pagination code than an error (#178751).
+ */
 function listNotes(vaultPath, { limit = 1000, folder = null } = {}) {
   const notes = []
-  const root = folder ? path.join(vaultPath, folder) : vaultPath
+  limit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(5000, Math.floor(Number(limit)))) : 1000
+  const root = folder ? resolveInsideVault(vaultPath, folder) : path.resolve(vaultPath)
 
   const walk = (dir) => {
     if (notes.length >= limit) return
@@ -191,14 +224,7 @@ function readNote(vaultPath, relPath, { maxBody = 200000 } = {}) {
   // yield '/vault/etc/passwd' — contained, but only by accident of how join treats a
   // leading slash. Relying on that is one refactor away from a traversal bug, and the
   // resulting ENOENT also leaked the absolute vault path back to the caller.
-  if (path.isAbsolute(relPath)) {
-    throw new Error('Path escapes the vault')
-  }
-
-  const resolved = path.resolve(path.join(vaultPath, relPath))
-  if (!resolved.startsWith(path.resolve(vaultPath) + path.sep)) {
-    throw new Error('Path escapes the vault')
-  }
+  const resolved = resolveInsideVault(vaultPath, relPath)
 
   let raw
   try {
@@ -229,6 +255,9 @@ function readNote(vaultPath, relPath, { maxBody = 200000 } = {}) {
 function searchNotes(vaultPath, query, { limit = 50, includeBody = false } = {}) {
   const needle = String(query || '').toLowerCase()
   if (!needle) return []
+  // Clamp: limit=0 returned one result and limit=-1 returned one note, so a caller bug
+  // came back as plausible data instead of an error (#178751).
+  limit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Math.floor(Number(limit)))) : 50
 
   const results = []
   for (const note of listNotes(vaultPath, { limit: 5000 })) {
@@ -257,4 +286,4 @@ function searchNotes(vaultPath, query, { limit = 50, includeBody = false } = {})
   return results
 }
 
-module.exports = { discoverVaults, isVault, listNotes, readNote, searchNotes, parseFrontmatter, extractLinks, extractTags }
+module.exports = { discoverVaults, isVault, listNotes, readNote, searchNotes, parseFrontmatter, extractLinks, extractTags, resolveInsideVault }
