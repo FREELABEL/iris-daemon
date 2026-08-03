@@ -25,6 +25,30 @@
  */
 
 const assert = require('assert')
+const { execFileSync } = require('child_process')
+const os = require('os')
+const path = require('path')
+
+/**
+ * How many calendars ACTUALLY have events in the window, straight from the store.
+ * Ground truth for the "did we drop calendars" assertion — so the test measures the code
+ * rather than whatever happens to be scheduled today. Returns null if it cannot be read,
+ * and the assertion is then skipped rather than guessed at.
+ */
+function expectedCalendars(days) {
+  try {
+    const db = path.join(os.homedir(), 'Library', 'Group Containers', 'group.com.apple.calendar', 'Calendar.sqlitedb')
+    const out = execFileSync('/usr/bin/sqlite3', [`file:${db}?immutable=1`,
+      `SELECT COUNT(DISTINCT ci.calendar_id) FROM CalendarItem ci
+        WHERE ci.start_date >= (strftime('%s','now')-978307200)
+          AND ci.start_date <  (strftime('%s','now')-978307200+${days}*86400)
+          AND (ci.status IS NULL OR ci.status != 3);`],
+      { encoding: 'utf-8', timeout: 10000 }).trim()
+    return out ? Number(out) : null
+  } catch {
+    return null
+  }
+}
 
 let pass = 0, fail = 0
 const failures = []
@@ -106,13 +130,28 @@ async function runContract(label, impl, { budgetMs }) {
     assert.ok(Array.isArray(none), 'expected an array')
   })
 
-  await t('spans MULTIPLE calendars (the 28-calendar case)', () => {
-    // A sees one calendar per 72s, so a naive fix that caps calendars would pass timing
-    // and silently drop most of the user's schedule. Pin the property that matters.
+  await t('does not silently drop calendars (the 28-calendar case)', async () => {
+    // A saw one calendar per 72s, so a naive "fix" that caps how many calendars are
+    // scanned would pass the timing test while silently dropping most of the schedule.
+    //
+    // The first version of this asserted ">= 2 distinct calendars", which was a snapshot
+    // of what happened to be scheduled that day — it went red a week later purely because
+    // every event in the window belonged to one calendar. An assertion about the USER'S
+    // DATA masquerading as an assertion about the CODE.
+    //
+    // Compare against ground truth instead: whatever calendars genuinely have events in
+    // the window must all be represented, unless `limit` truncated the result.
     const cals = new Set(events.map((e) => e.calendar))
-    assert.ok(cals.size >= 1, 'no calendars represented')
-    if (events.length >= 5) {
-      assert.ok(cals.size >= 2, `only ${cals.size} calendar(s) across ${events.length} events — suspicious`)
+    assert.ok(cals.size >= 1, 'no calendars represented at all')
+
+    const expected = expectedCalendars(7)
+    if (expected !== null && events.length < 20) {
+      // Only meaningful when the limit did not truncate — otherwise a single busy
+      // calendar can legitimately fill the whole page.
+      assert.strictEqual(
+        cals.size, expected,
+        `driver returned ${cals.size} calendar(s) but ${expected} have events in the window`,
+      )
     }
   })
 
