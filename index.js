@@ -1,4 +1,5 @@
 const express = require('express')
+const obsidian = require('./drivers/obsidian')
 const { spawn } = require('child_process')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -2316,6 +2317,77 @@ app.get('/api/whatsapp/search', async (req, res) => {
  * Uses AppleScript via osascript. Requires Mail.app to be running and
  * accessible to automation (System Settings > Privacy > Automation).
  */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Obsidian vault — local markdown, read-only.
+ *
+ * Obsidian is local-first: no cloud API, no OAuth, so it can never be a Composio
+ * integration. It CAN be a bridge driver, because a vault is just files on disk —
+ * the same shape as the iMessage and Apple Mail drivers.
+ *
+ * Read-only on purpose. A vault is someone's thinking; we index it, we do not edit it.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** GET /api/obsidian/vaults — discover vaults. Query: ?roots=/a,/b */
+app.get('/api/obsidian/vaults', (req, res) => {
+  try {
+    const roots = req.query.roots ? String(req.query.roots).split(',').map((r) => r.trim()).filter(Boolean) : null
+    const vaults = obsidian.discoverVaults(roots).map((p) => ({ path: p, name: require('path').basename(p) }))
+    res.json({ vaults, count: vaults.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+/** GET /api/obsidian/notes — list notes. Query: ?vault=<path>&folder=&limit= */
+app.get('/api/obsidian/notes', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  if (!vault) return res.status(400).json({ error: 'vault query param is required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
+
+  try {
+    const notes = obsidian.listNotes(vault, {
+      limit: Math.max(1, Math.min(5000, parseInt(req.query.limit || '1000', 10))),
+      folder: req.query.folder ? String(req.query.folder) : null,
+    })
+    res.json({ vault, notes, count: notes.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+/** GET /api/obsidian/note — one note, parsed. Query: ?vault=<path>&path=<rel> */
+app.get('/api/obsidian/note', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  const rel = (req.query.path || '').toString()
+  if (!vault || !rel) return res.status(400).json({ error: 'vault and path query params are required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
+
+  try {
+    res.json(obsidian.readNote(vault, rel))
+  } catch (e) {
+    // Path-escape attempts and missing files both land here; neither should 500.
+    res.status(400).json({ error: e.message })
+  }
+})
+
+/** GET /api/obsidian/search — substring search. Query: ?vault=&q=&limit=&body=1 */
+app.get('/api/obsidian/search', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  const q = (req.query.q || '').toString()
+  if (!vault || !q) return res.status(400).json({ error: 'vault and q query params are required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
+
+  try {
+    const results = obsidian.searchNotes(vault, q, {
+      limit: Math.max(1, Math.min(200, parseInt(req.query.limit || '50', 10))),
+      includeBody: req.query.body === '1' || req.query.body === 'true',
+    })
+    res.json({ vault, query: q, results, count: results.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.get('/api/mail/search', async (req, res) => {
   if (process.platform !== 'darwin') {
     return res.status(503).json({ error: 'Mail search is only available on macOS' })
