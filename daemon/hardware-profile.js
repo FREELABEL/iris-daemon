@@ -17,20 +17,40 @@ const http = require('http')
 const CACHE_PATH = path.join(os.homedir(), '.iris', 'hardware-profile.json')
 
 /**
+ * Bump when detection LOGIC changes so already-cached profiles re-detect.
+ *
+ * Without this, a detection bug is permanent: the profile is written once at install
+ * and read back forever, so fixing the detector fixes nothing on any existing machine.
+ * That is exactly what happened with apple_apps — see detectAppleApps().
+ *
+ * 2 — apple_apps: look under /System/Applications (macOS 10.15+), not just /Applications.
+ */
+const PROFILE_SCHEMA_VERSION = 2
+
+/** Re-detect if the cache is older than this, so capability changes propagate. */
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+/**
  * Detect full hardware profile.
  * @param {Object} options
  * @param {boolean} options.forceRefresh - Skip cache and re-detect
  * @returns {Object} hardware profile
  */
 async function detectProfile (options = {}) {
-  // Return cached if exists and not forcing refresh
+  // Return cached only if it is FRESH and produced by the current detection logic.
+  // A cache that never expires turns a one-line detector bug into a permanent
+  // wrong answer on every machine that ever installed the daemon.
   if (!options.forceRefresh && fs.existsSync(CACHE_PATH)) {
     try {
-      return JSON.parse(fs.readFileSync(CACHE_PATH, 'utf-8'))
+      const cached = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf-8'))
+      const sameSchema = (cached.schema_version || 1) === PROFILE_SCHEMA_VERSION
+      const age = Date.now() - new Date(cached.detected_at || 0).getTime()
+      if (sameSchema && age < CACHE_MAX_AGE_MS) return cached
     } catch { /* corrupted cache, re-detect */ }
   }
 
   const profile = {
+    schema_version: PROFILE_SCHEMA_VERSION,
     detected_at: new Date().toISOString(),
     os: {
       platform: os.platform(),
@@ -247,14 +267,20 @@ function detectAppleApps () {
   }
 
   const chatDbPath = path.join(os.homedir(), 'Library', 'Messages', 'chat.db')
-  const mailAppPath = '/Applications/Mail.app'
-  const messagesAppPath = '/Applications/Messages.app'
+
+  // macOS 10.15 (Catalina, 2019) moved the bundled apps out of /Applications into
+  // the read-only system volume at /System/Applications. Checking only /Applications
+  // therefore reported apple_mail:false and messages_app:false on EVERY modern Mac —
+  // and because the profile was cached forever, that false answer stuck permanently.
+  // Measured on macOS 15.1.1: /Applications/Mail.app missing, /System/Applications/Mail.app present.
+  const appExists = (name) =>
+    fs.existsSync(`/System/Applications/${name}`) || fs.existsSync(`/Applications/${name}`)
 
   return {
     platform: 'darwin',
     imessage: fs.existsSync(chatDbPath),
-    apple_mail: fs.existsSync(mailAppPath),
-    messages_app: fs.existsSync(messagesAppPath),
+    apple_mail: appExists('Mail.app'),
+    messages_app: appExists('Messages.app'),
     chat_db: fs.existsSync(chatDbPath) ? chatDbPath : null
   }
 }

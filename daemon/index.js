@@ -221,6 +221,22 @@ class Daemon {
       pause_reason: this.pauseReason,
       active_sessions: this._getLocalSessions(),
       session_capabilities: this._getSessionCapabilities(),
+      // Which LOCAL DATA SOURCES this machine can actually serve right now, with a
+      // reason for every one it cannot. Reported on every heartbeat (30s) rather than
+      // baked into the install-time hardware_profile, because the answer changes:
+      // a vault gets created, Full Disk Access gets granted, Mail gets uninstalled.
+      // The old profile was cached forever, which is how `apple_mail: false` — a
+      // detection bug fixed in schema v2 — stayed wrong on every Mac for months.
+      bridge_capabilities: (() => {
+        try {
+          return require('./bridge-registry').capabilities()
+        } catch (e) {
+          // Never let a capability probe take the heartbeat down; a node that stops
+          // heartbeating looks OFFLINE, which is a far worse lie than an absent field.
+          console.error(`[heartbeat] bridge capability probe failed: ${e.message}`)
+          return null
+        }
+      })(),
       // Power/load truth so the cloud can SEE which nodes are on battery / hibernating and
       // route heavy (browser) work to AC-powered nodes. The daemon already computes this for
       // its own battery-aware throttling; we just surface it. Additive — no behavior change.

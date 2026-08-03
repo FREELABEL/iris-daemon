@@ -809,6 +809,56 @@ class TaskExecutor {
         return
       }
 
+      // ── Short-circuit: bridge_call — the declarative local-data-source rail ──
+      //
+      // ONE case for EVERY local source. A new source (Obsidian, Notion export, a
+      // local SQLite app) is a block in daemon/bridge-registry.js plus a bridge
+      // route — it never touches this switch again. That is the whole point: this
+      // file is 4,000+ lines because every capability historically bought itself a
+      // `case`, and each new one raised the cost of the next.
+      //
+      // task.config = { provider: 'obsidian', function: 'search_notes', args: {...} }
+      if (task.type === 'bridge_call') {
+        const bridgeRegistry = require('./bridge-registry')
+        const bc = task.config || {}
+        const provider = bc.provider
+        const fnName = bc.function
+        const callArgs = bc.args || {}
+
+        console.log(`[bridge-call] ${provider}.${fnName}(${Object.keys(callArgs).join(', ')})`)
+
+        try {
+          if (!provider || !fnName) {
+            throw new Error('bridge_call requires config.provider and config.function')
+          }
+          const data = await bridgeRegistry.call(provider, fnName, callArgs)
+          clearInterval(progressInterval)
+          await this.cloud.submitResult(taskId, {
+            status: 'completed',
+            // `data` is the structured return; `output` stays populated so anything
+            // still reading the legacy string field keeps working.
+            data,
+            output: JSON.stringify(data),
+            duration_ms: Date.now() - startTime,
+            metadata: { bridge_provider: provider, bridge_function: fnName },
+          })
+        } catch (err) {
+          // Report the REAL reason. The registry already distinguishes unknown
+          // provider / unavailable provider / unknown function / server not
+          // listening / route error, and flattening those into one message is how
+          // "bridge is offline" came to mean five different things.
+          clearInterval(progressInterval)
+          console.error(`[bridge-call] ${provider}.${fnName} failed: ${err.message}`)
+          await this.cloud.submitResult(taskId, {
+            status: 'failed',
+            error: err.message,
+            duration_ms: Date.now() - startTime,
+            metadata: { bridge_provider: provider, bridge_function: fnName },
+          })
+        }
+        return
+      }
+
       // ── Short-circuit: hive_search — local search across inbox + iMessage ──
       if (task.type === 'hive_search') {
         const searchQuery = (task.prompt || '').trim().toLowerCase()
@@ -1755,6 +1805,56 @@ class TaskExecutor {
             task.config.env_vars = { ...(task.config.env_vars || {}), ...somEnvVars }
           }
           workspace.projectDir = freelabelRoot || bundledSomDir
+          break
+        }
+
+        case 'som_reply': {
+          // Reply Responder execution primitive (#166707): send ONE approved DM reply
+          // to ONE lead and log it outbound to lead_comms. Runs the bundled
+          // som/send-reply.spec.ts (needs the som/ helpers + instagram-auth-*.json
+          // session files), mirroring `case 'som'`. Dry-run defaults OFF here because
+          // the operator already approved the message in the Web UI reply pane.
+          const replyCfg = task.config || {}
+          const replyHandle = String(replyCfg.handle || replyCfg.target_handle || '').replace(/^@/, '').trim()
+          const replyMessage = String(replyCfg.message || task.prompt || '').trim()
+          const replyIgAccount = replyCfg.ig_account || replyCfg.igAccount || 'heyiris.io'
+          const replyLeadId = replyCfg.lead_id || replyCfg.leadId || ''
+          if (!replyHandle || !replyMessage) {
+            reject(new Error('som_reply requires config.handle and config.message'))
+            return
+          }
+
+          const replySomDir = path.join(__dirname, '..', 'som')
+          const replySpec = path.join(replySomDir, 'send-reply.spec.ts')
+          if (!fs.existsSync(replySpec)) {
+            reject(new Error(`send-reply spec missing: ${replySpec} — run bridge update`))
+            return
+          }
+          const replySessionFile = path.join(replySomDir, `instagram-auth-${replyIgAccount}.json`)
+          if (!fs.existsSync(replySessionFile)) {
+            reject(new Error(`IG session missing for @${replyIgAccount} (${replySessionFile}) — re-auth this account before replying.`))
+            return
+          }
+
+          cmd = 'npx'
+          args = ['playwright', 'test', replySpec, playwrightHeadedFlag(), '--timeout=180000'].filter(Boolean)
+
+          const replyEnv = {
+            HANDLE: replyHandle,
+            MESSAGE: replyMessage,
+            IG_ACCOUNT: replyIgAccount,
+            LEAD_ID: String(replyLeadId || ''),
+            // Board id so the outbound reply is logged with bloq_id (board-scoped inbox).
+            BOARD_ID: String(replyCfg.bloq_id || replyCfg.board_id || ''),
+            // Operator-approved send → real by default; pass config.dry_run to preview.
+            DRY_RUN: replyCfg.dry_run ? '1' : '0',
+            IRIS_FL_API_URL: process.env.IRIS_FL_API_URL || process.env.FL_API_URL || 'https://raichu.heyiris.io',
+          }
+          const replyToken = process.env.HEYIRIS_TOKEN || process.env.IRIS_API_KEY || process.env.FL_API_TOKEN
+          if (replyToken) replyEnv.HEYIRIS_TOKEN = replyToken
+          task.config = task.config || {}
+          task.config.env_vars = { ...(task.config.env_vars || {}), ...replyEnv }
+          workspace.projectDir = replySomDir
           break
         }
 
