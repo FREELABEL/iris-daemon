@@ -40,6 +40,19 @@ try {
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
 
+/**
+ * Task types whose `prompt` is NOT a shell command.
+ *
+ * The switch's `default` runs `/bin/bash -c task.prompt`, which is right for free-form
+ * work and catastrophic for a structured type this daemon happens not to implement: it
+ * executes the function name as a command and reports "exited with code 127", which the
+ * cloud cannot distinguish from a real failure. Anything listed here fails LOUDLY as
+ * unsupported instead, so the cloud can route to a node that does implement it.
+ *
+ * Add a type here whenever you add one that carries structured config.
+ */
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call'])
+
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
   const nvmDir = path.join(os.homedir(), '.nvm', 'versions', 'node')
@@ -3564,7 +3577,26 @@ exit 1
         }
 
         default:
-          // Default: treat prompt as a shell command
+          // Treating an UNRECOGNISED type as a shell command is a footgun, and it fired:
+          // a daemon predating `bridge_call` received one, fell through to here, ran
+          // "obsidian.search_notes" as a shell command and reported
+          // "Process exited with code 127" — a command-not-found dressed up as a task
+          // failure. The server had no way to tell that apart from a genuine failure, so
+          // it never re-routed to a node that DID support the type.
+          //
+          // A structured task type is a contract, not prose. If this daemon does not
+          // implement it, say so plainly so the cloud can route elsewhere.
+          if (KNOWN_STRUCTURED_TYPES.has(task.type)) {
+            clearInterval(progressInterval)
+            await this.cloud.submitResult(taskId, {
+              status: 'failed',
+              error: `This node does not support task type "${task.type}" — its daemon is out of date. Update the IRIS bridge on this machine.`,
+              duration_ms: Date.now() - startTime,
+              metadata: { unsupported_task_type: task.type },
+            })
+            return
+          }
+          // Free-form types keep the legacy behaviour: the prompt IS a shell command.
           cmd = '/bin/bash'
           args = ['-c', task.prompt]
       }
