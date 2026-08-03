@@ -227,6 +227,23 @@ class Daemon {
       // a vault gets created, Full Disk Access gets granted, Mail gets uninstalled.
       // The old profile was cached forever, which is how `apple_mail: false` — a
       // detection bug fixed in schema v2 — stayed wrong on every Mac for months.
+      // WHICH BUILD is this node running.
+      //
+      // Nothing reported it, so there was no way to see that 10 of 11 nodes were running
+      // daemons that predate `bridge_call` — they were correctly excluded from routing and
+      // completely invisible in the fleet view, so local data sources silently worked on
+      // exactly one machine (#178758). A fleet you cannot inventory cannot be rolled out to.
+      daemon_version: (() => {
+        try {
+          return require('../package.json').version || 'unknown'
+        } catch {
+          return 'unknown'
+        }
+      })(),
+      // Separate from the package version on purpose: this is the CONTRACT version for what
+      // the daemon can serve. Bump it when capabilities change, so the cloud can answer "is
+      // this node new enough for X" without string-comparing release numbers.
+      capability_schema: 2,
       bridge_capabilities: (() => {
         try {
           return require('./bridge-registry').capabilities()
