@@ -1723,6 +1723,27 @@ LIMIT ${limit}
       return
     }
 
+    // Stage timing for the dispatch→pickup leg.
+    //
+    // NodeTask's DB timestamps are second-granularity, so they can only say "about a
+    // second" — useless for deciding whether the cost is the network, the preamble, or
+    // the work. These marks are millisecond and are emitted for every task, because the
+    // question "where did the latency go" has now been asked three times this sprint and
+    // each time the answer had to be re-derived from scratch.
+    const _t = { evt: Date.now() }
+
+    // Start the accept round trip NOW, in parallel with the fetch below.
+    //
+    // These were serial, and each is a full HTTPS round trip from this laptop to
+    // Railway. Measured: fetch 160-222ms, accept 148-161ms — ~320ms of dispatch cost
+    // before any work begins, which on an interactive read exceeds the read itself
+    // (6ms warm). Nothing in accept depends on the fetched payload; both are keyed only
+    // on task_id, so overlapping them is free.
+    //
+    // Kicked off before the try so a rejection can never escape as an unhandled
+    // rejection; it is awaited (and its errors interpreted) at the original point below.
+    const acceptPromise = this.cloud.acceptTask(event.task_id).catch((e) => e)
+
     try {
       // Fetch full task details (retry with backoff — Pusher event can arrive before DB commit)
       let task
@@ -1746,23 +1767,37 @@ LIMIT ${limit}
       // here flows straight through to the gate, which runs / queues / dedups / rejects it.
       // No duplicate daemon-side singleton check (that was the leaky, divergent copy).
 
-      // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
-      try {
-        await this.cloud.acceptTask(event.task_id)
-        console.log(`[daemon] Accepted task: ${event.task_id}`)
-      } catch (acceptErr) {
+      _t.fetched = Date.now()
+
+      // Accept was started in parallel above; collect it here. Same semantics as before
+      // — "already running" is tolerated, anything else still aborts the task.
+      const acceptErr = await acceptPromise
+      if (acceptErr instanceof Error) {
         if (acceptErr.message?.includes('running') || acceptErr.message?.includes('422')) {
-          console.log(`[daemon] Task already running — proceeding with execution`)
+          console.log('[daemon] Task already running — proceeding with execution')
         } else {
           throw acceptErr
         }
+      } else {
+        console.log(`[daemon] Accepted task: ${event.task_id}`)
       }
 
       // Tag source for tmux ledger tracking
       task._source = 'pusher'
+      _t.accepted = Date.now()
 
       // Execute (executor.runningTasks will track it from here)
       await this.executor.execute(task)
+
+      _t.done = Date.now()
+      // Two SERIAL round trips to the cloud (fetchTask, acceptTask) run before any work
+      // starts. On an interactive read they can cost more than the read itself, so print
+      // the split rather than a single total that hides which leg is expensive.
+      console.log(
+        `[timing] ${task.type} ${String(event.task_id).substring(0, 8)}  ` +
+        `fetch=${_t.fetched - _t.evt}ms  accept=${_t.accepted - _t.fetched}ms  ` +
+        `exec=${_t.done - _t.accepted}ms  total=${_t.done - _t.evt}ms`,
+      )
 
       // A2A: Forward result to peer if configured
       if (task.config?.destination === 'peer' && task.config?.peer_endpoint) {

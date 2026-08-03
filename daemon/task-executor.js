@@ -844,7 +844,14 @@ class TaskExecutor {
           if (!provider || !fnName) {
             throw new Error('bridge_call requires config.provider and config.function')
           }
+          // Split the executor's own preamble (workspace, gate, progress timer) from the
+          // actual local work. Measured: the disk read is single-digit ms, so anything
+          // above that in `duration_ms` is overhead and belongs to a named stage, not to
+          // an unexplained remainder.
+          const _callStart = Date.now()
           const data = await bridgeRegistry.call(provider, fnName, callArgs)
+          const _callMs = Date.now() - _callStart
+          console.log(`[timing] bridge_call ${provider}.${fnName}  preamble=${_callStart - startTime}ms  call=${_callMs}ms`)
           clearInterval(progressInterval)
           await this.cloud.submitResult(taskId, {
             status: 'completed',
