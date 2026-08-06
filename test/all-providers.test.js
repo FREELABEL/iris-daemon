@@ -28,9 +28,15 @@
 
 const assert = require('assert')
 const registry = require('../daemon/bridge-registry')
+const os = require('os')
+const path = require('path')
+const { execFileSync } = require('child_process')
 
 let pass = 0, fail = 0, skip = 0
 const failures = []
+// Ground-truth checks that could not run here. Reported explicitly at the end: "we did not
+// check" must never render the same as "we checked and it passed".
+const unverified = []
 
 async function t(name, fn) {
   try {
@@ -67,6 +73,72 @@ const ARGS = {
   'imessage.resolve_handle': { handle: '+15551234567' },
   'apple_mail.search_emails': { from: 'a', days: 7, limit: 3 },
   'apple_calendar.get_events': { days: 7, limit: 3 },
+}
+
+/**
+ * GROUND TRUTH — does the backing store say there SHOULD be rows?
+ *
+ * THE HOLE THIS CLOSES (#179041). The contract below is "succeeds, or fails with a NAMED
+ * reason", and a SUCCESSFUL EMPTY satisfies it. So this suite passed 12/12 while
+ * `iris mail search` returned zero rows for every sender against a mailbox holding
+ * 274,414 messages — the exact failure the suite was written to catch, invisible to it.
+ *
+ * A silent empty is indistinguishable from an honest one unless something independent
+ * knows the answer. These functions ask the store directly, the same way the calendar A/B
+ * suite already does via expectedCalendars().
+ *
+ * Deliberately a WEAK assertion: "if the store has rows, the driver must return some".
+ * Exact parity would be brittle (dedup, mailbox scope, limit interactions) and a brittle
+ * check gets deleted. Zero-vs-nonzero is where the real bugs live.
+ *
+ * Returns null when it cannot establish ground truth — then the assertion is SKIPPED and
+ * said so, never silently assumed to pass.
+ */
+const GROUND_TRUTH = {
+  'apple_mail.search_emails': () => {
+    const db = path.join(os.homedir(), 'Library', 'Mail')
+    try {
+      const v = require('fs').readdirSync(db).filter((d) => /^V\d+$/.test(d))
+        .sort((a, b) => Number(b.slice(1)) - Number(a.slice(1)))[0]
+      if (!v) return null
+      const p = path.join(db, v, 'MailData', 'Envelope Index')
+      const out = execFileSync('/usr/bin/sqlite3', [`file:${p}?immutable=1`,
+        `SELECT COUNT(*) FROM messages m LEFT JOIN addresses a ON a.ROWID = m.sender
+          WHERE m.date_sent > strftime('%s','now') - 7*86400 AND a.address LIKE '%a%';`],
+        { encoding: 'utf-8', timeout: 15000 }).trim()
+      return out ? Number(out) : null
+    } catch { return null }
+  },
+  'apple_calendar.get_events': () => {
+    try {
+      const p = path.join(os.homedir(), 'Library', 'Group Containers',
+        'group.com.apple.calendar', 'Calendar.sqlitedb')
+      const out = execFileSync('/usr/bin/sqlite3', [`file:${p}?immutable=1`,
+        `SELECT COUNT(*) FROM CalendarItem
+          WHERE start_date >= (strftime('%s','now')-978307200)
+            AND start_date <  (strftime('%s','now')-978307200+7*86400)
+            AND (status IS NULL OR status != 3);`],
+        { encoding: 'utf-8', timeout: 15000 }).trim()
+      return out ? Number(out) : null
+    } catch { return null }
+  },
+  'imessage.list_conversations': () => {
+    try {
+      const p = path.join(os.homedir(), 'Library', 'Messages', 'chat.db')
+      const out = execFileSync('/usr/bin/sqlite3', [`file:${p}?immutable=1`,
+        'SELECT COUNT(*) FROM chat;'], { encoding: 'utf-8', timeout: 15000 }).trim()
+      return out ? Number(out) : null
+    } catch { return null }
+  },
+}
+
+/** How many rows did the driver actually return, whatever it calls its array? */
+function rowCount(out) {
+  if (Array.isArray(out)) return out.length
+  for (const k of ['emails', 'messages', 'events', 'conversations', 'notes', 'vaults', 'results']) {
+    if (Array.isArray(out?.[k])) return out[k].length
+  }
+  return null
 }
 
 /** Functions that MUTATE. Reachability is asserted; the call is never made. */
@@ -167,11 +239,34 @@ function assertActionable(providerFn, message) {
         assert.ok(out && typeof out === 'object', `${key} returned ${typeof out}`)
         // Interactive budget. A "successful" 30s read is the calendar bug wearing a hat.
         assert.ok(ms < 10000, `${key} succeeded but took ${ms}ms — too slow to be interactive`)
+
+        // SILENT EMPTY. Success is not enough: a driver that returns zero rows while the
+        // store holds thousands passes every check above, and that is precisely the bug
+        // that shipped (#179041). Ask the store.
+        const truth = GROUND_TRUTH[key]?.()
+        if (truth === null || truth === undefined) {
+          unverified.push(`${key} (no ground truth available on this machine)`)
+        } else if (truth > 0) {
+          const got = rowCount(out)
+          assert.ok(
+            got !== null,
+            `${key} succeeded but returned no recognisable array — the store has ${truth} matching rows`,
+          )
+          assert.ok(
+            got > 0,
+            `SILENT EMPTY: ${key} returned 0 rows, but the store has ${truth} matching. ` +
+            `An empty result and a broken reader must not look the same.`,
+          )
+        }
       })
     }
   }
 
   console.log(`\n  ${declared} declared functions · ${pass} passed · ${skip} skipped (no fixture on this machine) · ${fail} failed`)
+  if (unverified.length) {
+    console.log(`\n  ${unverified.length} function(s) ran WITHOUT a silent-empty check:`)
+    for (const u of unverified) console.log(`   - ${u}`)
+  }
   if (fail) {
     console.log('\n  FAILURES:')
     for (const f of failures) console.log(`   - ${f.name}: ${f.error}`)
