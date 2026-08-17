@@ -169,6 +169,11 @@ const PROVIDERS = {
       search_emails: { method: 'GET', path: '/api/mail/search' },
       // WRITE — sends real mail from the user's account. Explicit calls only.
       send_email: { method: 'POST', path: '/api/mail/send' },
+      // READ — which addresses this Mac can send AS. Must be routable from the CLOUD, not just
+      // from a local BRIDGE_URL: it is what makes a sender's apple_mail binding checkable, and a
+      // check that only runs on the developer's laptop is the "works here, dead in production"
+      // failure this rail exists to remove.
+      list_accounts: { method: 'GET', path: '/api/mail/accounts' },
     },
   },
 

@@ -1958,6 +1958,81 @@ async function ensureAppRunning(appName, timeoutMs = 10000) {
 const ensureMailRunning = (timeoutMs) => ensureAppRunning('Mail', timeoutMs)
 
 /**
+ * Enumerate the Mail.app accounts and the addresses each can send from.
+ *
+ * WHY THIS HAS TO EXIST. Everything upstream — a Sender's apple_mail binding, the `local_mailbox`
+ * verification method — asserted "this address is a Mail.app account" with nothing able to check
+ * it. Verification could only confirm the BRIDGE ANSWERED, which is a different claim, so a
+ * binding stayed an unfalsifiable assertion right up to the moment a message went out with the
+ * wrong From header.
+ *
+ * DICTIONARY GOTCHA, learned by watching it fail. `email addresses of acct` is a list of TEXT, so
+ * `address of addr` (what /api/mail/send used to do) throws -1700, and iterating it directly with
+ * `repeat with addr in …` yields an un-coercible reference that ALSO throws -1700. The list has to
+ * be materialised with `get` and indexed. Verified on a real machine with positive AND negative
+ * controls before being written down.
+ *
+ * @returns {Promise<Array<{name: string, addresses: string[]}>>}
+ */
+async function listMailAccounts() {
+  const script = `tell application "Mail"
+  set out to ""
+  repeat with acct in accounts
+    set addrs to (get email addresses of acct)
+    if addrs is not missing value then
+      repeat with i from 1 to (count of addrs)
+        set out to out & (name of acct) & tab & (item i of addrs) & linefeed
+      end repeat
+    end if
+  end repeat
+  return out
+end tell`
+
+  const stdout = await new Promise((resolve, reject) => {
+    const { execFile } = require('child_process')
+    execFile('/usr/bin/osascript', ['-e', script], { timeout: 20000 }, (err, out, stderr) => {
+      if (err) {
+        const msg = (stderr || err.message || '').trim()
+        if (msg.includes('-1743') || msg.includes('not allowed')) {
+          return reject(new Error('Mail.app automation not authorized. Grant access in System Settings > Privacy & Security > Automation.'))
+        }
+        return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
+      }
+      resolve(out)
+    })
+  })
+
+  const byName = new Map()
+  for (const line of String(stdout).split('\n')) {
+    const [name, address] = line.split('\t')
+    if (!name || !address) continue
+    const key = name.trim()
+    if (!byName.has(key)) byName.set(key, { name: key, addresses: [] })
+    byName.get(key).addresses.push(address.trim())
+  }
+
+  return [...byName.values()]
+}
+
+/**
+ * GET /api/mail/accounts
+ * Which addresses can this machine actually send Apple Mail from?
+ * Returns: { ok, accounts: [{name, addresses}], addresses: [flat list] }
+ */
+app.get('/api/mail/accounts', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+  }
+
+  try {
+    const accounts = await listMailAccounts()
+    res.json({ ok: true, accounts, addresses: accounts.flatMap((a) => a.addresses) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/mail/send
  * Send an email via Apple Mail.app using AppleScript.
  * Body: { to_email: string, to_name?: string, subject: string, body_text: string }
@@ -2003,21 +2078,47 @@ app.post('/api/mail/send', async (req, res) => {
     ).join('\n')
   }
 
-  // Resolve sender account if from_email specified
+  // ── Resolve the sending account BEFORE composing anything ──────────────────
+  //
+  // This block used to live inside the compose script and was broken two ways at once:
+  //
+  //   1. `address of addr` throws -1700 — `email addresses` is a list of TEXT, not objects. The
+  //      throw happened AFTER `make new outgoing message` and BEFORE `send msg`, so every Apple
+  //      Mail send that named a from_email failed with an opaque AppleScript error and left an
+  //      invisible outgoing message behind. The whole apple_mail sender-binding path had never
+  //      worked; nothing noticed because sends without a from_email take the other branch.
+  //
+  //   2. Had it worked, the guard was `if senderAccount is not null then set sender` — so an
+  //      address matching NO account would silently fall through and Mail.app would send from its
+  //      DEFAULT while reporting ok:true. A message signed by one identity and delivered from
+  //      another is what spoofing looks like to a recipient and to a spam filter, and reporting it
+  //      as success is worse than failing.
+  //
+  // Resolving first means an unknown address is a 422 naming the addresses that DO work, and no
+  // half-composed draft is left behind in Mail.app.
   let senderLine = ''
   if (from_email) {
-    const escapedFrom = escapeForAppleScript(from_email)
-    senderLine = `  set senderAccount to null
-  repeat with acct in accounts
-    repeat with addr in email addresses of acct
-      if address of addr is "${escapedFrom}" then
-        set senderAccount to acct
-        exit repeat
-      end if
-    end repeat
-    if senderAccount is not null then exit repeat
-  end repeat
-  if senderAccount is not null then set sender of msg to "${escapedFrom}"`
+    let accounts
+    try {
+      accounts = await listMailAccounts()
+    } catch (err) {
+      return res.status(500).json({ error: `Could not read Mail.app accounts: ${err.message}` })
+    }
+
+    const wanted = String(from_email).trim().toLowerCase()
+    const known = accounts.flatMap((a) => a.addresses)
+    const match = known.find((a) => a.toLowerCase() === wanted)
+
+    if (!match) {
+      return res.status(422).json({
+        error: `Mail.app has no account for "${from_email}", so this message would be sent from the default account instead — refusing.`,
+        requested_from: from_email,
+        available_addresses: known,
+      })
+    }
+
+    // Use the address as Mail.app spells it, not as the caller typed it.
+    senderLine = `  set sender of msg to "${escapeForAppleScript(match)}"`
   }
 
   // draft=true opens compose window without sending; default sends immediately
