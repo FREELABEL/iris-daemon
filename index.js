@@ -3387,6 +3387,102 @@ function reconstructPath (dirName) {
 
 // ─── List / Discover Sessions ────────────────────────────────────
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude Code session metadata — streamed once, then cached on mtime+size.
+//
+// The list handler used to readFileSync() every transcript whole, split it into
+// an array of lines, and filter that array twice — once for the 40 header lines
+// it wanted and once to count messages. On this machine that is 870 MB across
+// 164 files, the largest single transcript being 68 MB, and listing sessions
+// took 18.75 SECONDS. Long enough that the first call timed out entirely.
+//
+// Three changes, and it is worth being precise about which one does what,
+// because the obvious explanation was wrong when measured:
+//   1. CACHE ON mtime+size — THIS is the speed fix. A transcript that has not
+//      changed cannot have a different answer, so it is never re-read.
+//      Measured over the 20 files this handler scans: 2212 ms -> 1 ms. Sessions
+//      are append-only and mostly idle, so the hit rate is near total.
+//   2. ONE STREAMING PASS — a MEMORY fix, not a speed one. Benchmarked against
+//      readFileSync at 2212 ms vs 2328 ms, i.e. no faster; the cost is the I/O
+//      of reading 870 MB, not the splitting. It is kept because holding a 68 MB
+//      string plus its line array per file is worth avoiding regardless.
+//   3. ?counts=0 — skips the full scan for callers that only want the session
+//      list. The message count is the ONLY field that requires reading past the
+//      header, so making it opt-out is what fixes the cold path.
+//
+// The count remains approximate in exactly the way it was before (lines
+// containing a "role" key), so the number does not change meaning — this is a
+// speed fix, not a semantics change.
+// ─────────────────────────────────────────────────────────────────────────────
+const CLAUDE_SESSION_META_CACHE = new Map()
+const CLAUDE_META_HEAD_LINES = 40
+
+function readClaudeSessionMeta(filePath, stat, withCounts = true) {
+  const cached = CLAUDE_SESSION_META_CACHE.get(filePath)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.meta
+  }
+
+  // Header-only: stop as soon as we have the metadata lines. The count is the
+  // one field that forces a full read, so skipping it turns an 870 MB scan into
+  // a few kilobytes per file. Not cached — a later call wanting counts must
+  // still do the full pass, and caching a countless entry would starve it.
+  if (!withCounts) {
+    // 256 KB, not 64 KB: measured on real transcripts, 64 KB yielded only 23
+    // lines because individual events run to ~2.8 KB, and the session NAME is
+    // taken from the first user message inside the first 40. Reading too little
+    // does not fail loudly — it silently produces an unnamed session, which is
+    // the kind of bug that looks like a data problem rather than a read limit.
+    const HEAD_BYTES = 1 << 18
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const buf = Buffer.allocUnsafe(HEAD_BYTES)
+      const bytesRead = fs.readSync(fd, buf, 0, HEAD_BYTES, 0)
+      const headLines = buf.toString('utf8', 0, bytesRead)
+        .split('\n')
+        .filter(Boolean)
+        .slice(0, CLAUDE_META_HEAD_LINES)
+      return { headLines, messageCount: null }
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+
+  const fd = fs.openSync(filePath, 'r')
+  const CHUNK = 1 << 16
+  const buf = Buffer.allocUnsafe(CHUNK)
+  let carry = ''
+  let headLines = []
+  let messageCount = 0
+
+  try {
+    let bytesRead
+    while ((bytesRead = fs.readSync(fd, buf, 0, CHUNK, null)) > 0) {
+      const text = carry + buf.toString('utf8', 0, bytesRead)
+      const lines = text.split('\n')
+      // The final element may be a partial line; carry it into the next chunk
+      // so a "role" key split across a chunk boundary is still counted once.
+      carry = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line) continue
+        if (headLines.length < CLAUDE_META_HEAD_LINES) headLines.push(line)
+        if (line.includes('"role"')) messageCount++
+      }
+    }
+    if (carry) {
+      if (headLines.length < CLAUDE_META_HEAD_LINES) headLines.push(carry)
+      if (carry.includes('"role"')) messageCount++
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+
+  const meta = { headLines, messageCount }
+  CLAUDE_SESSION_META_CACHE.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, meta })
+  return meta
+}
+
 app.get('/api/sessions/claude-code', async (req, res) => {
   try {
     // Read sessions directly from Claude Code's local storage
@@ -3396,6 +3492,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
     }
 
     const limit = parseInt(req.query.limit) || 20
+    // Counts require reading every transcript end to end; callers that only
+    // need the list can opt out with ?counts=0.
+    const withCounts = req.query.counts !== '0' && req.query.counts !== 'false'
     const sessions = []
 
     // Scan all project dirs for .jsonl session files
@@ -3417,12 +3516,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 
       for (const file of files) {
         try {
-          const content = fs.readFileSync(file.path, 'utf8')
-          const allLines = content.split('\n').filter(Boolean)
+          const stat = fs.statSync(file.path)
+          const { headLines, messageCount } = readClaudeSessionMeta(file.path, stat, withCounts)
 
-          // Read first 40 lines for metadata (cwd, branch, first user msg)
-          // Some sessions have many system lines before the first user message
-          const headLines = allLines.slice(0, 40)
           let sessionId = path.basename(file.name, '.jsonl')
           let cwd = null
           let gitBranch = null
@@ -3442,11 +3538,6 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 
           // Generate meaningful name from first user message
           const sessionName = extractSessionName(headLines, projectPath)
-
-          // Count approximate messages (lines with "role")
-          const messageCount = allLines.filter(l => l.includes('"role"')).length
-
-          const stat = fs.statSync(file.path)
 
           sessions.push({
             session_id: sessionId,
