@@ -2425,43 +2425,80 @@ LIMIT ${limit}
   }
 
   // Called periodically to refresh the session cache (async-safe)
+  /**
+   * Refresh the AI-session cache reported to the fleet on every heartbeat.
+   *
+   * This used to GET /api/discover and then parse the response as though it were
+   * { claude_code: [...], opencode: [...], ollama: [...] }. It is not — that is
+   * the Discover/social endpoint and returns nothing of that shape — so the loop
+   * below always found zero providers and `active_sessions` shipped as [] on
+   * every heartbeat since it was written. The server only persists the field
+   * when it is non-empty, so `sessions_updated_at` was never set either, and the
+   * fleet had no idea what was running on any machine.
+   *
+   * Two bugs, not one: even pointed at the right path it would have failed,
+   * because the session endpoints require X-Bridge-Key and no header was sent.
+   * A 401 parsed as JSON yields {error: ...}, which has no provider keys, which
+   * produces an empty array — the same silent zero. Nothing anywhere said
+   * "unauthorized".
+   *
+   * Now: one call per provider against the endpoints that actually serve this,
+   * with counts=0. message_count is the only field requiring a full transcript
+   * read (870 MB across 164 files on a working machine), and a fleet inventory
+   * does not need it — see iris-daemon 49130dd.
+   */
   async _refreshSessionCache () {
     try {
       const a2aPort = parseInt(process.env.A2A_PORT || '3200', 10)
       const http = require('http')
+      let token = null
+      try { token = require('../lib/bridge-auth').getToken() } catch { token = null }
 
-      const data = await new Promise((resolve) => {
-        const req = http.get(`http://localhost:${a2aPort}/api/discover?limit=10`, (res) => {
+      const getJson = (path) => new Promise((resolve) => {
+        const req = http.get({
+          host: 'localhost',
+          port: a2aPort,
+          path,
+          headers: token ? { 'X-Bridge-Key': token, Accept: 'application/json' } : { Accept: 'application/json' }
+        }, (res) => {
           let body = ''
           res.on('data', chunk => { body += chunk })
           res.on('end', () => {
-            try {
-              resolve(JSON.parse(body))
-            } catch {
+            // Report the status rather than swallowing it — a 401 and an empty
+            // fleet look identical from the outside, which is how this stayed
+            // broken.
+            if (res.statusCode !== 200) {
+              console.log(`[sessions] ${path} -> HTTP ${res.statusCode}`)
               resolve(null)
+              return
             }
+            try { resolve(JSON.parse(body)) } catch { resolve(null) }
           })
         })
         req.on('error', () => resolve(null))
-        req.setTimeout(3000, () => { req.destroy(); resolve(null) })
+        req.setTimeout(5000, () => { req.destroy(); resolve(null) })
       })
 
-      if (!data) {
-        this._cachedSessions = []
-        return
-      }
+      // Provider slugs on the wire differ from the names reported upward:
+      // the endpoints are claude-code / opencode / ollama, the fleet field uses
+      // claude_code so it matches the task_type vocabulary.
+      const providers = [
+        { slug: 'claude-code', name: 'claude_code' },
+        { slug: 'opencode', name: 'opencode' },
+        { slug: 'ollama', name: 'ollama' }
+      ]
 
-      // Flatten all providers into a compact array
       const sessions = []
-      for (const provider of ['claude_code', 'opencode', 'ollama']) {
-        const providerSessions = data[provider] || []
-        for (const s of providerSessions) {
+      for (const { slug, name } of providers) {
+        const data = await getJson(`/api/sessions/${slug}?limit=10&counts=0`)
+        for (const s of (data && data.sessions) || []) {
           sessions.push({
             session_id: s.session_id,
-            provider: s.provider || provider,
+            provider: s.provider || name,
             name: s.name || 'Session',
             status: s.status || 'active',
             project_path: s.project_path || null,
+            git_branch: s.git_branch || null,
             model: s.model || null,
             updated_at: s.updated_at || null
           })
