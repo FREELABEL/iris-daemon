@@ -559,6 +559,74 @@ class IMessageChannel extends EventEmitter {
     } catch (err) {
       console.warn(`[imessage] Local log failed: ${err.message}`)
     }
+
+    // #182118 — additive, cloud-side copy so the mention survives being read from a
+    // different machine (or this one being asleep). Fire-and-forget: must never slow
+    // down or fail the local write above, which stays the fallback of record.
+    this._pushMentionToAtlas(event).catch(err =>
+      console.warn(`[imessage] Atlas mention push failed (local log still has it): ${err.message}`)
+    )
+  }
+
+  /**
+   * Push a detected mention to the cross-machine Atlas 'mentions' dataset (#182118).
+   *
+   * Local ~/.iris/mentions/*.jsonl is per-machine — a mention typed into Messages.app
+   * on a DIFFERENT registered node, or one that arrives while this node is asleep, is
+   * invisible to `iris imessage mentions` run anywhere else. This makes the record
+   * reachable regardless of which node captured it, without needing a live node online
+   * to ask.
+   *
+   * node_id/node_name come from THIS daemon's own /daemon/health (loopback, no network
+   * hop) rather than being threaded through the constructor — cached after first
+   * success since a node's identity doesn't change mid-process.
+   */
+  async _pushMentionToAtlas(event) {
+    if (!this._nodeIdentity) {
+      this._nodeIdentity = await this._getLocalNodeIdentity()
+    }
+    if (!this._nodeIdentity) return // no daemon health endpoint reachable — skip, local log still has it
+
+    const apiUrl = this.config.flApiUrl || process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
+    const sentAt = event.timestamp ? new Date(event.timestamp) : new Date()
+    const when = isNaN(sentAt.getTime()) ? new Date() : sentAt
+
+    await this._postJSON(`${apiUrl}/api/v1/atlas/datasets/mentions`, {
+      data: {
+        ts: when.toISOString(),
+        sender: event.sender_id || null,
+        sender_name: event.sender_name || null,
+        lead_id: event.lead_id || null,
+        lead_name: event.lead_name || null,
+        chat: event.conversation_id || null,
+        is_group: !!event.is_group,
+        is_from_me: !!event.is_from_me,
+        text: (event.text || '').slice(0, 500),
+        node_id: this._nodeIdentity.nodeId,
+        node_name: this._nodeIdentity.nodeName,
+      },
+    })
+  }
+
+  /** Loopback read of this daemon's own node identity. Cached by the caller. */
+  _getLocalNodeIdentity() {
+    return new Promise((resolve) => {
+      const req = http.request({
+        hostname: '127.0.0.1', port: 3200, path: '/daemon/health', method: 'GET', timeout: 3000,
+      }, (res) => {
+        let data = ''
+        res.on('data', (c) => { data += c })
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(data)
+            resolve(body.node_id ? { nodeId: body.node_id, nodeName: body.node_name || os.hostname() } : null)
+          } catch { resolve(null) }
+        })
+      })
+      req.on('error', () => resolve(null))
+      req.on('timeout', () => { req.destroy(); resolve(null) })
+      req.end()
+    })
   }
 
   /**
