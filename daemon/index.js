@@ -221,6 +221,39 @@ class Daemon {
       pause_reason: this.pauseReason,
       active_sessions: this._getLocalSessions(),
       session_capabilities: this._getSessionCapabilities(),
+      // Which LOCAL DATA SOURCES this machine can actually serve right now, with a
+      // reason for every one it cannot. Reported on every heartbeat (30s) rather than
+      // baked into the install-time hardware_profile, because the answer changes:
+      // a vault gets created, Full Disk Access gets granted, Mail gets uninstalled.
+      // The old profile was cached forever, which is how `apple_mail: false` — a
+      // detection bug fixed in schema v2 — stayed wrong on every Mac for months.
+      // WHICH BUILD is this node running.
+      //
+      // Nothing reported it, so there was no way to see that 10 of 11 nodes were running
+      // daemons that predate `bridge_call` — they were correctly excluded from routing and
+      // completely invisible in the fleet view, so local data sources silently worked on
+      // exactly one machine (#178758). A fleet you cannot inventory cannot be rolled out to.
+      daemon_version: (() => {
+        try {
+          return require('../package.json').version || 'unknown'
+        } catch {
+          return 'unknown'
+        }
+      })(),
+      // Separate from the package version on purpose: this is the CONTRACT version for what
+      // the daemon can serve. Bump it when capabilities change, so the cloud can answer "is
+      // this node new enough for X" without string-comparing release numbers.
+      capability_schema: 2,
+      bridge_capabilities: (() => {
+        try {
+          return require('./bridge-registry').capabilities()
+        } catch (e) {
+          // Never let a capability probe take the heartbeat down; a node that stops
+          // heartbeating looks OFFLINE, which is a far worse lie than an absent field.
+          console.error(`[heartbeat] bridge capability probe failed: ${e.message}`)
+          return null
+        }
+      })(),
       // Power/load truth so the cloud can SEE which nodes are on battery / hibernating and
       // route heavy (browser) work to AC-powered nodes. The daemon already computes this for
       // its own battery-aware throttling; we just surface it. Additive — no behavior change.
@@ -1398,10 +1431,174 @@ end tell`
       }
     })
 
+    // ── Mail accounts + send (daemon-only parity) ──────────────────
+    //
+    // WHY THESE ARE DUPLICATED FROM index.js. `bridgectl` runs index.js and `daemonctl` runs
+    // daemon.js; they are ALTERNATIVES on the same port, and `iris daemon restart` — which
+    // `iris upgrade` calls — starts the daemon. So in the topology users actually run,
+    // /api/mail/send returned 404 and /api/mail/accounts did not exist: the comms router's
+    // apple_mail channel worked only if somebody had manually started the full bridge.
+    //
+    // Measured, not assumed: after an `iris upgrade`, /api/mail/search answered 400 (present,
+    // needs params) while /api/mail/send answered 404 (absent) on the same port.
+    //
+    // Better long-term is one route table shared by both entry points; duplicating a WRITE
+    // endpoint is a real cost. But leaving the default process unable to send is a bigger one,
+    // and the sender-resolution logic below is the CORRECTED version, so the two copies do not
+    // disagree about the thing that was broken.
+
+    /**
+     * List Mail.app accounts and the addresses each can send from.
+     *
+     * DICTIONARY GOTCHA: `email addresses of acct` is a list of TEXT. `address of addr` throws
+     * -1700, and iterating the list directly yields an un-coercible reference that also throws.
+     * It must be materialised with `get` and indexed.
+     */
+    const listMailAccounts = async () => {
+      const script = `tell application "Mail"
+  set out to ""
+  repeat with acct in accounts
+    set addrs to (get email addresses of acct)
+    if addrs is not missing value then
+      repeat with i from 1 to (count of addrs)
+        set out to out & (name of acct) & tab & (item i of addrs) & linefeed
+      end repeat
+    end if
+  end repeat
+  return out
+end tell`
+
+      const stdout = await new Promise((resolve, reject) => {
+        const { execFile } = require('child_process')
+        execFile('/usr/bin/osascript', ['-e', script], { timeout: 20000 }, (err, out, stderr) => {
+          if (err) {
+            const msg = (stderr || err.message || '').trim()
+            if (msg.includes('-1743') || msg.includes('not allowed')) {
+              return reject(new Error('Mail.app automation not authorized. Grant access in System Settings > Privacy & Security > Automation.'))
+            }
+            return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
+          }
+          resolve(out)
+        })
+      })
+
+      const byName = new Map()
+      for (const line of String(stdout).split('\n')) {
+        const [name, address] = line.split('\t')
+        if (!name || !address) continue
+        const key = name.trim()
+        if (!byName.has(key)) byName.set(key, { name: key, addresses: [] })
+        byName.get(key).addresses.push(address.trim())
+      }
+
+      return [...byName.values()]
+    }
+
+    app.get(`${prefix}/api/mail/accounts`, async (req, res) => {
+      if (process.platform !== 'darwin') {
+        return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+      }
+      try {
+        const accounts = await listMailAccounts()
+        res.json({ ok: true, accounts, addresses: accounts.flatMap((a) => a.addresses) })
+      } catch (err) {
+        res.status(500).json({ error: err.message })
+      }
+    })
+
+    /**
+     * POST /api/mail/send — WRITE. Sends real mail from the user's account.
+     *
+     * The sending account is resolved BEFORE anything is composed: an address Mail.app does not
+     * have is a 422 naming the ones it does, never a silent send from the DEFAULT mailbox. A
+     * message signed by one identity and delivered from another is what spoofing looks like to a
+     * recipient and to a spam filter.
+     */
+    app.post(`${prefix}/api/mail/send`, async (req, res) => {
+      if (process.platform !== 'darwin') {
+        return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+      }
+
+      const { to_email, to_name, cc_email, from_email, subject, body_text, attachments, draft } = req.body || {}
+
+      if (!to_email || !subject || !body_text) {
+        return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
+      }
+
+      const esc = (str) => (str || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+
+      let senderLine = ''
+      if (from_email) {
+        let accounts
+        try {
+          accounts = await listMailAccounts()
+        } catch (err) {
+          return res.status(500).json({ error: `Could not read Mail.app accounts: ${err.message}` })
+        }
+
+        const wanted = String(from_email).trim().toLowerCase()
+        const known = accounts.flatMap((a) => a.addresses)
+        const match = known.find((a) => a.toLowerCase() === wanted)
+
+        if (!match) {
+          return res.status(422).json({
+            error: `Mail.app has no account for "${from_email}", so this message would be sent from the default account instead — refusing.`,
+            requested_from: from_email,
+            available_addresses: known,
+          })
+        }
+
+        senderLine = `  set sender of msg to "${esc(match)}"`
+      }
+
+      let ccLine = ''
+      if (cc_email) {
+        const ccAddresses = Array.isArray(cc_email) ? cc_email : [cc_email]
+        ccLine = ccAddresses.map((addr) =>
+          `  make new cc recipient at beginning of cc recipients of msg with properties {address:"${esc(addr)}"}`
+        ).join('\n')
+      }
+
+      let attachmentLines = ''
+      if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+        attachmentLines = attachments.map((fp) =>
+          `  make new attachment with properties {file name:POSIX file "${esc(fp)}"} at after the last paragraph of content of msg`
+        ).join('\n')
+      }
+
+      const isDraft = draft === true || draft === 'true'
+      const sendOrShow = isDraft ? `  set visible of msg to true\n  activate` : `  delay 1\n  send msg`
+
+      const script = `tell application "Mail"
+  set msg to make new outgoing message with properties {subject:"${esc(subject)}", content:"${esc(body_text)}", visible:false}
+  make new to recipient at beginning of to recipients of msg with properties {name:"${esc(to_name || to_email)}", address:"${esc(to_email)}"}
+${senderLine}
+${ccLine}
+${attachmentLines}
+${sendOrShow}
+end tell`
+
+      try {
+        await new Promise((resolve, reject) => {
+          const { execFile } = require('child_process')
+          execFile('/usr/bin/osascript', ['-e', script], { timeout: 45000 }, (err, stdout, stderr) => {
+            if (err) return reject(new Error((stderr || err.message || '').trim().slice(0, 300)))
+            resolve(stdout)
+          })
+        })
+
+        console.log(`[apple-mail] ${isDraft ? 'Drafted' : 'Sent'} to ${to_email}: ${subject}`)
+        res.json({ ok: true, provider: 'apple-mail', mode: isDraft ? 'draft' : 'sent', to_email, subject })
+      } catch (err) {
+        console.error(`[apple-mail] Send failed: ${err.message}`)
+        res.status(500).json({ error: `Apple Mail send failed: ${err.message}` })
+      }
+    })
+
     // ── Mail + iMessage Search (READ) ──────────────────────────────
     // These endpoints provide read-only access to Apple Mail and iMessage
     // for the macOS integration. Available in daemon-only mode (no full
-    // bridge required). SEND endpoints still live in bridge index.js.
+    // bridge required). SEND now lives here too — see the block above.
 
     /**
      * GET /api/imessage/search?handle=<email_or_phone>&days=14&limit=100
@@ -1707,6 +1904,27 @@ LIMIT ${limit}
       return
     }
 
+    // Stage timing for the dispatch→pickup leg.
+    //
+    // NodeTask's DB timestamps are second-granularity, so they can only say "about a
+    // second" — useless for deciding whether the cost is the network, the preamble, or
+    // the work. These marks are millisecond and are emitted for every task, because the
+    // question "where did the latency go" has now been asked three times this sprint and
+    // each time the answer had to be re-derived from scratch.
+    const _t = { evt: Date.now() }
+
+    // Start the accept round trip NOW, in parallel with the fetch below.
+    //
+    // These were serial, and each is a full HTTPS round trip from this laptop to
+    // Railway. Measured: fetch 160-222ms, accept 148-161ms — ~320ms of dispatch cost
+    // before any work begins, which on an interactive read exceeds the read itself
+    // (6ms warm). Nothing in accept depends on the fetched payload; both are keyed only
+    // on task_id, so overlapping them is free.
+    //
+    // Kicked off before the try so a rejection can never escape as an unhandled
+    // rejection; it is awaited (and its errors interpreted) at the original point below.
+    const acceptPromise = this.cloud.acceptTask(event.task_id).catch((e) => e)
+
     try {
       // Fetch full task details (retry with backoff — Pusher event can arrive before DB commit)
       let task
@@ -1730,23 +1948,37 @@ LIMIT ${limit}
       // here flows straight through to the gate, which runs / queues / dedups / rejects it.
       // No duplicate daemon-side singleton check (that was the leaky, divergent copy).
 
-      // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
-      try {
-        await this.cloud.acceptTask(event.task_id)
-        console.log(`[daemon] Accepted task: ${event.task_id}`)
-      } catch (acceptErr) {
+      _t.fetched = Date.now()
+
+      // Accept was started in parallel above; collect it here. Same semantics as before
+      // — "already running" is tolerated, anything else still aborts the task.
+      const acceptErr = await acceptPromise
+      if (acceptErr instanceof Error) {
         if (acceptErr.message?.includes('running') || acceptErr.message?.includes('422')) {
-          console.log(`[daemon] Task already running — proceeding with execution`)
+          console.log('[daemon] Task already running — proceeding with execution')
         } else {
           throw acceptErr
         }
+      } else {
+        console.log(`[daemon] Accepted task: ${event.task_id}`)
       }
 
       // Tag source for tmux ledger tracking
       task._source = 'pusher'
+      _t.accepted = Date.now()
 
       // Execute (executor.runningTasks will track it from here)
       await this.executor.execute(task)
+
+      _t.done = Date.now()
+      // Two SERIAL round trips to the cloud (fetchTask, acceptTask) run before any work
+      // starts. On an interactive read they can cost more than the read itself, so print
+      // the split rather than a single total that hides which leg is expensive.
+      console.log(
+        `[timing] ${task.type} ${String(event.task_id).substring(0, 8)}  ` +
+        `fetch=${_t.fetched - _t.evt}ms  accept=${_t.accepted - _t.fetched}ms  ` +
+        `exec=${_t.done - _t.accepted}ms  total=${_t.done - _t.evt}ms`,
+      )
 
       // A2A: Forward result to peer if configured
       if (task.config?.destination === 'peer' && task.config?.peer_endpoint) {
@@ -2193,43 +2425,80 @@ LIMIT ${limit}
   }
 
   // Called periodically to refresh the session cache (async-safe)
+  /**
+   * Refresh the AI-session cache reported to the fleet on every heartbeat.
+   *
+   * This used to GET /api/discover and then parse the response as though it were
+   * { claude_code: [...], opencode: [...], ollama: [...] }. It is not — that is
+   * the Discover/social endpoint and returns nothing of that shape — so the loop
+   * below always found zero providers and `active_sessions` shipped as [] on
+   * every heartbeat since it was written. The server only persists the field
+   * when it is non-empty, so `sessions_updated_at` was never set either, and the
+   * fleet had no idea what was running on any machine.
+   *
+   * Two bugs, not one: even pointed at the right path it would have failed,
+   * because the session endpoints require X-Bridge-Key and no header was sent.
+   * A 401 parsed as JSON yields {error: ...}, which has no provider keys, which
+   * produces an empty array — the same silent zero. Nothing anywhere said
+   * "unauthorized".
+   *
+   * Now: one call per provider against the endpoints that actually serve this,
+   * with counts=0. message_count is the only field requiring a full transcript
+   * read (870 MB across 164 files on a working machine), and a fleet inventory
+   * does not need it — see iris-daemon 49130dd.
+   */
   async _refreshSessionCache () {
     try {
       const a2aPort = parseInt(process.env.A2A_PORT || '3200', 10)
       const http = require('http')
+      let token = null
+      try { token = require('../lib/bridge-auth').getToken() } catch { token = null }
 
-      const data = await new Promise((resolve) => {
-        const req = http.get(`http://localhost:${a2aPort}/api/discover?limit=10`, (res) => {
+      const getJson = (path) => new Promise((resolve) => {
+        const req = http.get({
+          host: 'localhost',
+          port: a2aPort,
+          path,
+          headers: token ? { 'X-Bridge-Key': token, Accept: 'application/json' } : { Accept: 'application/json' }
+        }, (res) => {
           let body = ''
           res.on('data', chunk => { body += chunk })
           res.on('end', () => {
-            try {
-              resolve(JSON.parse(body))
-            } catch {
+            // Report the status rather than swallowing it — a 401 and an empty
+            // fleet look identical from the outside, which is how this stayed
+            // broken.
+            if (res.statusCode !== 200) {
+              console.log(`[sessions] ${path} -> HTTP ${res.statusCode}`)
               resolve(null)
+              return
             }
+            try { resolve(JSON.parse(body)) } catch { resolve(null) }
           })
         })
         req.on('error', () => resolve(null))
-        req.setTimeout(3000, () => { req.destroy(); resolve(null) })
+        req.setTimeout(5000, () => { req.destroy(); resolve(null) })
       })
 
-      if (!data) {
-        this._cachedSessions = []
-        return
-      }
+      // Provider slugs on the wire differ from the names reported upward:
+      // the endpoints are claude-code / opencode / ollama, the fleet field uses
+      // claude_code so it matches the task_type vocabulary.
+      const providers = [
+        { slug: 'claude-code', name: 'claude_code' },
+        { slug: 'opencode', name: 'opencode' },
+        { slug: 'ollama', name: 'ollama' }
+      ]
 
-      // Flatten all providers into a compact array
       const sessions = []
-      for (const provider of ['claude_code', 'opencode', 'ollama']) {
-        const providerSessions = data[provider] || []
-        for (const s of providerSessions) {
+      for (const { slug, name } of providers) {
+        const data = await getJson(`/api/sessions/${slug}?limit=10&counts=0`)
+        for (const s of (data && data.sessions) || []) {
           sessions.push({
             session_id: s.session_id,
-            provider: s.provider || provider,
+            provider: s.provider || name,
             name: s.name || 'Session',
             status: s.status || 'active',
             project_path: s.project_path || null,
+            git_branch: s.git_branch || null,
             model: s.model || null,
             updated_at: s.updated_at || null
           })

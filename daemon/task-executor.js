@@ -40,6 +40,19 @@ try {
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
 
+/**
+ * Task types whose `prompt` is NOT a shell command.
+ *
+ * The switch's `default` runs `/bin/bash -c task.prompt`, which is right for free-form
+ * work and catastrophic for a structured type this daemon happens not to implement: it
+ * executes the function name as a command and reports "exited with code 127", which the
+ * cloud cannot distinguish from a real failure. Anything listed here fails LOUDLY as
+ * unsupported instead, so the cloud can route to a node that does implement it.
+ *
+ * Add a type here whenever you add one that carries structured config.
+ */
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call'])
+
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
   const nvmDir = path.join(os.homedir(), '.nvm', 'versions', 'node')
@@ -806,6 +819,63 @@ class TaskExecutor {
           duration_ms: Date.now() - startTime,
         })
         this.notifyDiscord(task, 'completed', Date.now() - startTime, [`Message from ${senderName}: ${msgText}`]).catch(() => {})
+        return
+      }
+
+      // ── Short-circuit: bridge_call — the declarative local-data-source rail ──
+      //
+      // ONE case for EVERY local source. A new source (Obsidian, Notion export, a
+      // local SQLite app) is a block in daemon/bridge-registry.js plus a bridge
+      // route — it never touches this switch again. That is the whole point: this
+      // file is 4,000+ lines because every capability historically bought itself a
+      // `case`, and each new one raised the cost of the next.
+      //
+      // task.config = { provider: 'obsidian', function: 'search_notes', args: {...} }
+      if (task.type === 'bridge_call') {
+        const bridgeRegistry = require('./bridge-registry')
+        const bc = task.config || {}
+        const provider = bc.provider
+        const fnName = bc.function
+        const callArgs = bc.args || {}
+
+        console.log(`[bridge-call] ${provider}.${fnName}(${Object.keys(callArgs).join(', ')})`)
+
+        try {
+          if (!provider || !fnName) {
+            throw new Error('bridge_call requires config.provider and config.function')
+          }
+          // Split the executor's own preamble (workspace, gate, progress timer) from the
+          // actual local work. Measured: the disk read is single-digit ms, so anything
+          // above that in `duration_ms` is overhead and belongs to a named stage, not to
+          // an unexplained remainder.
+          const _callStart = Date.now()
+          const data = await bridgeRegistry.call(provider, fnName, callArgs)
+          const _callMs = Date.now() - _callStart
+          console.log(`[timing] bridge_call ${provider}.${fnName}  preamble=${_callStart - startTime}ms  call=${_callMs}ms`)
+          clearInterval(progressInterval)
+          await this.cloud.submitResult(taskId, {
+            status: 'completed',
+            // `data` is the structured return; `output` stays populated so anything
+            // still reading the legacy string field keeps working.
+            data,
+            output: JSON.stringify(data),
+            duration_ms: Date.now() - startTime,
+            metadata: { bridge_provider: provider, bridge_function: fnName },
+          })
+        } catch (err) {
+          // Report the REAL reason. The registry already distinguishes unknown
+          // provider / unavailable provider / unknown function / server not
+          // listening / route error, and flattening those into one message is how
+          // "bridge is offline" came to mean five different things.
+          clearInterval(progressInterval)
+          console.error(`[bridge-call] ${provider}.${fnName} failed: ${err.message}`)
+          await this.cloud.submitResult(taskId, {
+            status: 'failed',
+            error: err.message,
+            duration_ms: Date.now() - startTime,
+            metadata: { bridge_provider: provider, bridge_function: fnName },
+          })
+        }
         return
       }
 
@@ -1769,6 +1839,56 @@ class TaskExecutor {
             task.config.env_vars = { ...(task.config.env_vars || {}), ...somEnvVars }
           }
           workspace.projectDir = freelabelRoot || bundledSomDir
+          break
+        }
+
+        case 'som_reply': {
+          // Reply Responder execution primitive (#166707): send ONE approved DM reply
+          // to ONE lead and log it outbound to lead_comms. Runs the bundled
+          // som/send-reply.spec.ts (needs the som/ helpers + instagram-auth-*.json
+          // session files), mirroring `case 'som'`. Dry-run defaults OFF here because
+          // the operator already approved the message in the Web UI reply pane.
+          const replyCfg = task.config || {}
+          const replyHandle = String(replyCfg.handle || replyCfg.target_handle || '').replace(/^@/, '').trim()
+          const replyMessage = String(replyCfg.message || task.prompt || '').trim()
+          const replyIgAccount = replyCfg.ig_account || replyCfg.igAccount || 'heyiris.io'
+          const replyLeadId = replyCfg.lead_id || replyCfg.leadId || ''
+          if (!replyHandle || !replyMessage) {
+            reject(new Error('som_reply requires config.handle and config.message'))
+            return
+          }
+
+          const replySomDir = path.join(__dirname, '..', 'som')
+          const replySpec = path.join(replySomDir, 'send-reply.spec.ts')
+          if (!fs.existsSync(replySpec)) {
+            reject(new Error(`send-reply spec missing: ${replySpec} — run bridge update`))
+            return
+          }
+          const replySessionFile = path.join(replySomDir, `instagram-auth-${replyIgAccount}.json`)
+          if (!fs.existsSync(replySessionFile)) {
+            reject(new Error(`IG session missing for @${replyIgAccount} (${replySessionFile}) — re-auth this account before replying.`))
+            return
+          }
+
+          cmd = 'npx'
+          args = ['playwright', 'test', replySpec, playwrightHeadedFlag(), '--timeout=180000'].filter(Boolean)
+
+          const replyEnv = {
+            HANDLE: replyHandle,
+            MESSAGE: replyMessage,
+            IG_ACCOUNT: replyIgAccount,
+            LEAD_ID: String(replyLeadId || ''),
+            // Board id so the outbound reply is logged with bloq_id (board-scoped inbox).
+            BOARD_ID: String(replyCfg.bloq_id || replyCfg.board_id || ''),
+            // Operator-approved send → real by default; pass config.dry_run to preview.
+            DRY_RUN: replyCfg.dry_run ? '1' : '0',
+            IRIS_FL_API_URL: process.env.IRIS_FL_API_URL || process.env.FL_API_URL || 'https://raichu.heyiris.io',
+          }
+          const replyToken = process.env.HEYIRIS_TOKEN || process.env.IRIS_API_KEY || process.env.FL_API_TOKEN
+          if (replyToken) replyEnv.HEYIRIS_TOKEN = replyToken
+          task.config = task.config || {}
+          task.config.env_vars = { ...(task.config.env_vars || {}), ...replyEnv }
+          workspace.projectDir = replySomDir
           break
         }
 
@@ -3478,7 +3598,26 @@ exit 1
         }
 
         default:
-          // Default: treat prompt as a shell command
+          // Treating an UNRECOGNISED type as a shell command is a footgun, and it fired:
+          // a daemon predating `bridge_call` received one, fell through to here, ran
+          // "obsidian.search_notes" as a shell command and reported
+          // "Process exited with code 127" — a command-not-found dressed up as a task
+          // failure. The server had no way to tell that apart from a genuine failure, so
+          // it never re-routed to a node that DID support the type.
+          //
+          // A structured task type is a contract, not prose. If this daemon does not
+          // implement it, say so plainly so the cloud can route elsewhere.
+          if (KNOWN_STRUCTURED_TYPES.has(task.type)) {
+            clearInterval(progressInterval)
+            await this.cloud.submitResult(taskId, {
+              status: 'failed',
+              error: `This node does not support task type "${task.type}" — its daemon is out of date. Update the IRIS bridge on this machine.`,
+              duration_ms: Date.now() - startTime,
+              metadata: { unsupported_task_type: task.type },
+            })
+            return
+          }
+          // Free-form types keep the legacy behaviour: the prompt IS a shell command.
           cmd = '/bin/bash'
           args = ['-c', task.prompt]
       }
