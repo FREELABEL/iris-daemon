@@ -136,7 +136,17 @@ class IMessageChannel extends EventEmitter {
       // reply-policy gate (cooldown, unknown-group-sender). Logging fidelity must
       // never depend on whether we choose to auto-reply — otherwise mentions from
       // unknown group senders, or rapid bursts caught up after downtime, are lost.
-      if (hasMention && !normalized.is_from_me) {
+      //
+      // is_from_me is INCLUDED here on purpose (it used to be excluded). A user
+      // dictating an instruction to themselves — "@heyiris ingest this" — is a real
+      // mention, not noise: it silently vanished for a month (measured: no entries
+      // in ~/.iris/mentions/ between 2026-07-26 and 2026-08-23, despite several
+      // self-mentions sent in that window) because this condition dropped it before
+      // it ever reached _logMentionLocally. This is NOT the same thing as replying to
+      // IRIS's own auto-sent replies — those never contain @heyiris (see the loop-safety
+      // note in shouldProcess below), so hasMention is already false for them and this
+      // branch can't create a reply loop.
+      if (hasMention) {
         this._logMentionLocally({
           ...normalized,
           lead_id: contact?.id || null,
