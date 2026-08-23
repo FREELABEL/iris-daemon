@@ -139,6 +139,7 @@ class TmuxManager {
     const outputFile = path.join(LOG_DIR, `${sessionName}.log`)
     const exitFile = path.join(EXIT_DIR, `${sessionName}.exit`)
     const channel = `${sessionName}-done`
+    const startChannel = `${sessionName}-start`
 
     // Clean up any stale session with same name
     this._execSafe(['kill-session', '-t', sessionName])
@@ -152,38 +153,43 @@ class TmuxManager {
 
     // Build the full command string for tmux
     // Wrap in bash to capture exit code + signal wait-for channel
-    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel)
+    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel, startChannel)
 
-    // Build env string for tmux (export key=value pairs)
-    const envPairs = Object.entries(env || {})
-      .filter(([k, v]) => v !== undefined && v !== null)
-      .map(([k, v]) => `${k}=${this._shellEscape(String(v))}`)
-      .join(' ')
+    // Build -e flags so env vars land in the process's environment at spawn
+    // time (see below for why this can't use set-environment after the fact).
+    const envArgs = []
+    for (const [k, v] of Object.entries(env || {})) {
+      if (v !== undefined && v !== null) {
+        envArgs.push('-e', `${k}=${String(v)}`)
+      }
+    }
 
-    // Create detached session
+    // Create detached session, running the wrapped command directly as the
+    // pane's process instead of spawning the user's interactive login shell
+    // and typing the command in via send-keys. The old approach raced the
+    // shell's startup (oh-my-zsh sourcing plugins/theme) — keystrokes sent
+    // while it was still initializing could be swallowed or interleaved with
+    // the prompt, so the trailing `tmux wait-for -S` in the wrapped command
+    // sometimes never actually ran, and wait-for blocked forever (#182004).
+    // Running the command directly also means the captured log is the
+    // command's own output, not a PTY transcript mixed with prompt/theme
+    // rendering.
     const newSessionArgs = [
       'new-session', '-d',
       '-s', sessionName,
       '-c', cwd || process.cwd(),
-      '-x', '200', '-y', '50' // generous pane size for output
+      '-x', '200', '-y', '50', // generous pane size for output
+      ...envArgs,
+      fullCmd
     ]
     this._exec(newSessionArgs)
-
-    // Set environment variables in the session
-    if (envPairs) {
-      // Use tmux set-environment for each var (safer than inline export)
-      for (const [k, v] of Object.entries(env || {})) {
-        if (v !== undefined && v !== null) {
-          this._execSafe(['set-environment', '-t', sessionName, k, String(v)])
-        }
-      }
-    }
 
     // Set up pipe-pane to stream output to log file
     this._exec(['pipe-pane', '-t', sessionName, '-o', `cat >> ${this._shellEscape(outputFile)}`])
 
-    // Send the wrapped command to the pane
-    this._exec(['send-keys', '-t', sessionName, fullCmd, 'Enter'])
+    // Release the command now that pipe-pane is attached, so nothing it
+    // prints can be produced (and lost) before the log capture is listening.
+    this._exec(['wait-for', '-S', startChannel])
 
     // Track session (in-memory + persistent ledger)
     const source = task._source || 'unknown'
@@ -211,18 +217,25 @@ class TmuxManager {
   /**
    * Build a bash wrapper that runs the command, captures exit code,
    * and signals the tmux wait-for channel.
+   *
+   * @param {string} [startChannel] - If given, the wrapper blocks on this
+   *   wait-for channel before running the command. The caller signals it
+   *   once pipe-pane is attached, so no output can be produced (and lost)
+   *   before the log capture is listening (#182004).
    */
-  _buildWrappedCommand (cmd, args, exitFile, channel) {
+  _buildWrappedCommand (cmd, args, exitFile, channel, startChannel) {
     const escapedCmd = this._shellEscape(cmd)
     const escapedArgs = (args || []).map(a => this._shellEscape(a)).join(' ')
     const escapedExitFile = this._shellEscape(exitFile)
+    const waitForStart = startChannel ? `tmux -L ${SOCKET} wait-for ${startChannel}; ` : ''
 
     // The wrapper:
+    // 0. Blocks until the caller signals startChannel (see above)
     // 1. Runs the command
     // 2. Captures $? to exit file
     // 3. Signals the wait-for channel
     // 4. Exits the pane (which kills the session if it's the only pane)
-    return `${escapedCmd} ${escapedArgs}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
+    return `${waitForStart}${escapedCmd} ${escapedArgs}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
   }
 
   /**
@@ -293,37 +306,60 @@ class TmuxManager {
 
     const panes = []
 
-    // Create session with first role
+    // Create session with first role. As in createForTask, the wrapped
+    // command runs directly as the pane's process (via -e for env + a
+    // trailing shell-command) rather than being typed into an interactive
+    // login shell with send-keys, which could race the shell's own startup
+    // and swallow the command (#182004).
     const firstRole = roles[0]
     const firstExitFile = path.join(EXIT_DIR, `${sessionName}-0.exit`)
     const firstChannel = `${sessionName}-0-done`
+    const firstStartChannel = `${sessionName}-0-start`
     try { fs.unlinkSync(firstExitFile) } catch {}
+
+    const firstCmd = this._buildWrappedCommand(firstRole.cmd, firstRole.args, firstExitFile, firstChannel, firstStartChannel)
+    const firstEnvArgs = []
+    for (const [k, v] of Object.entries(firstRole.env || {})) {
+      if (v !== undefined && v !== null) {
+        firstEnvArgs.push('-e', `${k}=${String(v)}`)
+      }
+    }
 
     this._exec([
       'new-session', '-d',
       '-s', sessionName,
       '-c', firstRole.cwd || process.cwd(),
-      '-x', '200', '-y', '50'
+      '-x', '200', '-y', '50',
+      ...firstEnvArgs,
+      firstCmd
     ])
 
-    // Set env for first pane
-    for (const [k, v] of Object.entries(firstRole.env || {})) {
-      if (v !== undefined && v !== null) {
-        this._execSafe(['set-environment', '-t', sessionName, k, String(v)])
-      }
-    }
+    // Keep exited panes around (dead, not destroyed) until we explicitly
+    // kill the session in cleanup(). Without this, a fast first-role command
+    // (it's already running, unlike the old send-keys version) can finish
+    // and tear down its pane — and the whole session, since it was the only
+    // pane — before split-window adds the next role, so the next pane
+    // either never appears or lands at an unexpected index ("can't find
+    // pane" from the following pipe-pane call).
+    this._exec(['set-option', '-t', sessionName, 'remain-on-exit', 'on'])
 
-    // Pipe pane 0 output to shared log + per-pane log
+    // Pipe pane 0 output to shared log + per-pane log. A pane can only be
+    // connected to one pipe-pane command at a time — calling pipe-pane a
+    // second time on the same target doesn't add a second pipe, it TOGGLES
+    // the first one closed (tmux(1): "-o only opens a new pipe if no
+    // previous pipe exists"). The old code called pipe-pane twice against
+    // the same pane (once by `:0.0`, once by bare `sessionName`, which
+    // resolves to the same active pane), so the second call silently killed
+    // the first and pane 0's dedicated log was always empty. One `tee` pipe
+    // writes both files instead.
     const pane0Log = path.join(LOG_DIR, `${sessionName}-0.log`)
     try { fs.unlinkSync(pane0Log) } catch {}
     fs.writeFileSync(pane0Log, '')
-    this._exec(['pipe-pane', '-t', `${sessionName}:0.0`, '-o', `cat >> ${this._shellEscape(pane0Log)}`])
-    // Also pipe to the shared log
-    this._execSafe(['pipe-pane', '-t', sessionName, '-o', `cat >> ${this._shellEscape(outputFile)}`])
+    this._exec(['pipe-pane', '-t', `${sessionName}:0.0`, '-o',
+      `tee -a ${this._shellEscape(pane0Log)} >> ${this._shellEscape(outputFile)}`])
 
-    // Send first role command
-    const firstCmd = this._buildWrappedCommand(firstRole.cmd, firstRole.args, firstExitFile, firstChannel)
-    this._exec(['send-keys', '-t', `${sessionName}:0.0`, firstCmd, 'Enter'])
+    // Release pane 0's command now that both pipe-panes are attached
+    this._exec(['wait-for', '-S', firstStartChannel])
     panes.push({ index: 0, role: firstRole.name, exitFile: firstExitFile, channel: firstChannel, logFile: pane0Log })
 
     // Split panes for remaining roles
@@ -331,27 +367,28 @@ class TmuxManager {
       const role = roles[i]
       const exitFile = path.join(EXIT_DIR, `${sessionName}-${i}.exit`)
       const channel = `${sessionName}-${i}-done`
+      const startChannel = `${sessionName}-${i}-start`
       const paneLog = path.join(LOG_DIR, `${sessionName}-${i}.log`)
       try { fs.unlinkSync(exitFile) } catch {}
       try { fs.unlinkSync(paneLog) } catch {}
       fs.writeFileSync(paneLog, '')
 
-      // Split horizontally (stacked)
-      this._exec(['split-window', '-t', sessionName, '-c', role.cwd || process.cwd()])
+      const roleCmd = this._buildWrappedCommand(role.cmd, role.args, exitFile, channel, startChannel)
+      const roleEnvArgs = []
+      for (const [k, v] of Object.entries(role.env || {})) {
+        if (v !== undefined && v !== null) {
+          roleEnvArgs.push('-e', `${k}=${String(v)}`)
+        }
+      }
+
+      // Split horizontally (stacked), running the role's command directly
+      this._exec(['split-window', '-t', sessionName, '-c', role.cwd || process.cwd(), ...roleEnvArgs, roleCmd])
 
       // Pipe this pane's output to its own log
       this._execSafe(['pipe-pane', '-t', `${sessionName}:0.${i}`, '-o', `cat >> ${this._shellEscape(paneLog)}`])
 
-      // Set env for this pane
-      for (const [k, v] of Object.entries(role.env || {})) {
-        if (v !== undefined && v !== null) {
-          this._execSafe(['set-environment', '-t', sessionName, k, String(v)])
-        }
-      }
-
-      // Send command
-      const roleCmd = this._buildWrappedCommand(role.cmd, role.args, exitFile, channel)
-      this._exec(['send-keys', '-t', `${sessionName}:0.${i}`, roleCmd, 'Enter'])
+      // Release this pane's command now that its pipe-pane is attached
+      this._exec(['wait-for', '-S', startChannel])
       panes.push({ index: i, role: role.name, exitFile, channel, logFile: paneLog })
     }
 

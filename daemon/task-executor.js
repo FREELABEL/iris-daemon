@@ -1122,6 +1122,10 @@ class TaskExecutor {
         output: truncatedOutput,
         files,
         duration_ms: Date.now() - startTime,
+        // Top-level exit_code, not just nested under metadata: the CLI reads
+        // `final.result.exit_code`, sitting alongside output/duration_ms —
+        // metadata.exit_code alone was invisible to it (#181633).
+        exit_code: result.exitCode,
         metadata: {
           exit_code: result.exitCode,
           ...(taskStatus !== wireStatus ? { internal_status: taskStatus } : {}),
@@ -1291,11 +1295,21 @@ class TaskExecutor {
     } catch (err) {
       clearInterval(progressInterval)
 
+      // The tmux path's promise rejects on a non-zero, non-graceful exit
+      // (see runProcess) — that exit code was recorded on runningTasks
+      // before the rejection, but this handler used to drop it entirely,
+      // losing exactly the exit code a failed run needs (#181633). Read it
+      // back here, before `finally` deletes the entry.
+      const runningEntry = this.runningTasks.get(taskId)
+      const exitCode = runningEntry?._exitCode ?? null
+
       await this.cloud.submitResult(taskId, {
         status: 'failed',
         error: err.message,
         output: outputLines.join('\n'),
-        duration_ms: Date.now() - startTime
+        duration_ms: Date.now() - startTime,
+        exit_code: exitCode,
+        metadata: { exit_code: exitCode }
       })
 
       console.error(`[executor] [${ts()}] Task ${taskId} failed: ${err.message}`)
@@ -3532,6 +3546,11 @@ exit 1
           // Timeout
           const timer = setTimeout(() => {
             clearInterval(outputPoll)
+            // Final output read — mirrors the success path below (#182004);
+            // without this, anything printed between the last poll tick and
+            // the timeout firing was silently dropped.
+            const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
+            if (finalLines.length > 0) outputLines.push(...finalLines)
             this.tmux.cleanup(sessionName)
             if (isGraceful) {
               resolve({ exitCode: 124, timedOut: true })
