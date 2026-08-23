@@ -13,7 +13,7 @@ done
 BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 case "${1:-status}" in
     start)
-        PID=$(lsof -ti :3200 2>/dev/null || true)
+        PID=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
         if [ -n "$PID" ]; then echo "Bridge already running (PID: $PID)"; exit 0; fi
         nohup node "$BRIDGE_DIR/index.js" > "$BRIDGE_DIR/bridge.log" 2>&1 &
         sleep 2
@@ -23,10 +23,33 @@ case "${1:-status}" in
             echo "Failed to start. Check: cat $BRIDGE_DIR/bridge.log"; exit 1
         fi ;;
     stop)
-        PID=$(lsof -ti :3200 2>/dev/null || true)
-        if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; echo "Stopped (PID: $PID)"
-        else echo "Not running"; fi ;;
-    restart) "$0" stop; sleep 1; "$0" start ;;
+        # `kill "$PID"` was WRONG whenever more than one process held the port:
+        # lsof prints one PID per line, the quotes made that a single argument
+        # like "1874\n1875\n84450", kill could not parse it, the failure went to
+        # /dev/null, and the script printed "Stopped" having killed nothing. A
+        # restart then reported success while the old code kept serving — which
+        # is how a fixed mail endpoint sat on disk for hours still returning 400.
+        PIDS=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -z "$PIDS" ]; then echo "Not running"; exit 0; fi
+        echo "$PIDS" | xargs kill 2>/dev/null || true
+        # Verify rather than assume: wait for the port to actually free, then
+        # escalate. Reporting "Stopped" is a claim about the world, not a wish.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 0.3
+            [ -z "$(lsof -ti :3200 2>/dev/null || true)" ] && break
+        done
+        LEFT=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -n "$LEFT" ]; then
+            echo "$LEFT" | xargs kill -9 2>/dev/null || true
+            sleep 0.5
+            LEFT=$(lsof -ti :3200 2>/dev/null || true)
+        fi
+        if [ -n "$LEFT" ]; then
+            echo "FAILED to stop — still holding :3200: $(echo "$LEFT" | tr '\n' ' ')" >&2
+            exit 1
+        fi
+        echo "Stopped (PID: $(echo "$PIDS" | tr '\n' ' '))" ;;
+    restart) "$0" stop || exit 1; sleep 1; "$0" start ;;
     status)
         if curl -s "http://localhost:3200/health" > /dev/null 2>&1; then
             echo "Running (PID: $(lsof -ti :3200 2>/dev/null || true))"
