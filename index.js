@@ -1,4 +1,5 @@
 const express = require('express')
+const obsidian = require('./drivers/obsidian')
 const { spawn } = require('child_process')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -1716,35 +1717,34 @@ app.delete('/api/providers/imessage', async (req, res) => {
  * Returns all conversations tracked by the native iMessage driver.
  * Requires iMessage channel to be running with the native driver.
  */
-app.get('/api/imessage/conversations', (req, res) => {
-  if (!iMessageChannel || !iMessageChannel.driver) {
-    return res.status(503).json({ error: 'iMessage channel not running. Start it first via POST /api/providers/imessage' })
-  }
-
-  const driver = iMessageChannel.driver
-  if (!driver.conversations) {
-    return res.status(503).json({ error: 'iMessage driver does not support conversation listing (use native driver)' })
-  }
-
-  const conversations = []
-  driver.conversations.forEach((conv, guid) => {
-    conversations.push({
-      guid,
-      display_name: conv.displayName || conv.groupName || guid,
-      is_group: conv.isGroup || false,
-      last_message_at: conv.lastMessageAt || null,
-      participant_count: conv.participants ? conv.participants.length : null
+app.get('/api/imessage/conversations', async (req, res) => {
+  // Reads chat.db directly instead of the live channel's in-memory map.
+  //
+  // Listing conversations is a READ, but it used to require the always-on iMessage CHANNEL
+  // to be running — the same channel that auto-replies to real contacts and must never be
+  // started casually (#137256). So the safe answer was "unavailable" and the available
+  // answer was unsafe (#178747). chat.db is the store the native driver already queries,
+  // so this needs no new permission beyond the Full Disk Access already probed for.
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10)))
+  try {
+    const store = require('./drivers/imessage-store')
+    const conversations = await store.listConversations({ limit })
+    res.json({
+      conversations: conversations.map((c) => ({
+        guid: c.guid,
+        display_name: c.display_name,
+        is_group: c.is_group,
+        participants: c.participants,
+        message_count: c.message_count,
+        last_message_at: c.last_message_at ? c.last_message_at.toISOString() : null,
+      })),
+      count: conversations.length,
+      source: 'chat-db',
     })
-  })
-
-  // Sort by most recent message
-  conversations.sort((a, b) => {
-    if (!a.last_message_at) return 1
-    if (!b.last_message_at) return -1
-    return new Date(b.last_message_at) - new Date(a.last_message_at)
-  })
-
-  res.json({ conversations, count: conversations.length })
+  } catch (err) {
+    console.error(`[imessage/conversations] ${err.message}`)
+    res.status(503).json({ error: err.message })
+  }
 })
 
 /**
@@ -1958,6 +1958,81 @@ async function ensureAppRunning(appName, timeoutMs = 10000) {
 const ensureMailRunning = (timeoutMs) => ensureAppRunning('Mail', timeoutMs)
 
 /**
+ * Enumerate the Mail.app accounts and the addresses each can send from.
+ *
+ * WHY THIS HAS TO EXIST. Everything upstream — a Sender's apple_mail binding, the `local_mailbox`
+ * verification method — asserted "this address is a Mail.app account" with nothing able to check
+ * it. Verification could only confirm the BRIDGE ANSWERED, which is a different claim, so a
+ * binding stayed an unfalsifiable assertion right up to the moment a message went out with the
+ * wrong From header.
+ *
+ * DICTIONARY GOTCHA, learned by watching it fail. `email addresses of acct` is a list of TEXT, so
+ * `address of addr` (what /api/mail/send used to do) throws -1700, and iterating it directly with
+ * `repeat with addr in …` yields an un-coercible reference that ALSO throws -1700. The list has to
+ * be materialised with `get` and indexed. Verified on a real machine with positive AND negative
+ * controls before being written down.
+ *
+ * @returns {Promise<Array<{name: string, addresses: string[]}>>}
+ */
+async function listMailAccounts() {
+  const script = `tell application "Mail"
+  set out to ""
+  repeat with acct in accounts
+    set addrs to (get email addresses of acct)
+    if addrs is not missing value then
+      repeat with i from 1 to (count of addrs)
+        set out to out & (name of acct) & tab & (item i of addrs) & linefeed
+      end repeat
+    end if
+  end repeat
+  return out
+end tell`
+
+  const stdout = await new Promise((resolve, reject) => {
+    const { execFile } = require('child_process')
+    execFile('/usr/bin/osascript', ['-e', script], { timeout: 20000 }, (err, out, stderr) => {
+      if (err) {
+        const msg = (stderr || err.message || '').trim()
+        if (msg.includes('-1743') || msg.includes('not allowed')) {
+          return reject(new Error('Mail.app automation not authorized. Grant access in System Settings > Privacy & Security > Automation.'))
+        }
+        return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
+      }
+      resolve(out)
+    })
+  })
+
+  const byName = new Map()
+  for (const line of String(stdout).split('\n')) {
+    const [name, address] = line.split('\t')
+    if (!name || !address) continue
+    const key = name.trim()
+    if (!byName.has(key)) byName.set(key, { name: key, addresses: [] })
+    byName.get(key).addresses.push(address.trim())
+  }
+
+  return [...byName.values()]
+}
+
+/**
+ * GET /api/mail/accounts
+ * Which addresses can this machine actually send Apple Mail from?
+ * Returns: { ok, accounts: [{name, addresses}], addresses: [flat list] }
+ */
+app.get('/api/mail/accounts', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+  }
+
+  try {
+    const accounts = await listMailAccounts()
+    res.json({ ok: true, accounts, addresses: accounts.flatMap((a) => a.addresses) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/mail/send
  * Send an email via Apple Mail.app using AppleScript.
  * Body: { to_email: string, to_name?: string, subject: string, body_text: string }
@@ -2003,21 +2078,47 @@ app.post('/api/mail/send', async (req, res) => {
     ).join('\n')
   }
 
-  // Resolve sender account if from_email specified
+  // ── Resolve the sending account BEFORE composing anything ──────────────────
+  //
+  // This block used to live inside the compose script and was broken two ways at once:
+  //
+  //   1. `address of addr` throws -1700 — `email addresses` is a list of TEXT, not objects. The
+  //      throw happened AFTER `make new outgoing message` and BEFORE `send msg`, so every Apple
+  //      Mail send that named a from_email failed with an opaque AppleScript error and left an
+  //      invisible outgoing message behind. The whole apple_mail sender-binding path had never
+  //      worked; nothing noticed because sends without a from_email take the other branch.
+  //
+  //   2. Had it worked, the guard was `if senderAccount is not null then set sender` — so an
+  //      address matching NO account would silently fall through and Mail.app would send from its
+  //      DEFAULT while reporting ok:true. A message signed by one identity and delivered from
+  //      another is what spoofing looks like to a recipient and to a spam filter, and reporting it
+  //      as success is worse than failing.
+  //
+  // Resolving first means an unknown address is a 422 naming the addresses that DO work, and no
+  // half-composed draft is left behind in Mail.app.
   let senderLine = ''
   if (from_email) {
-    const escapedFrom = escapeForAppleScript(from_email)
-    senderLine = `  set senderAccount to null
-  repeat with acct in accounts
-    repeat with addr in email addresses of acct
-      if address of addr is "${escapedFrom}" then
-        set senderAccount to acct
-        exit repeat
-      end if
-    end repeat
-    if senderAccount is not null then exit repeat
-  end repeat
-  if senderAccount is not null then set sender of msg to "${escapedFrom}"`
+    let accounts
+    try {
+      accounts = await listMailAccounts()
+    } catch (err) {
+      return res.status(500).json({ error: `Could not read Mail.app accounts: ${err.message}` })
+    }
+
+    const wanted = String(from_email).trim().toLowerCase()
+    const known = accounts.flatMap((a) => a.addresses)
+    const match = known.find((a) => a.toLowerCase() === wanted)
+
+    if (!match) {
+      return res.status(422).json({
+        error: `Mail.app has no account for "${from_email}", so this message would be sent from the default account instead — refusing.`,
+        requested_from: from_email,
+        available_addresses: known,
+      })
+    }
+
+    // Use the address as Mail.app spells it, not as the caller typed it.
+    senderLine = `  set sender of msg to "${escapeForAppleScript(match)}"`
   }
 
   // draft=true opens compose window without sending; default sends immediately
@@ -2071,75 +2172,37 @@ app.get('/api/imessage/search', async (req, res) => {
   }
 
   const handle = (req.query.handle || '').toString().trim()
-  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '14', 10)))
-  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '100', 10)))
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '25', 10)))
 
   if (!handle) {
     return res.status(400).json({ error: 'handle query param is required (email or phone)' })
   }
 
-  // Normalize handle for matching (digits only for phones, lowercase for emails)
-  const digits = handle.replace(/\D/g, '')
-  const lower = handle.toLowerCase()
-
-  const chatDbPath = path.join(process.env.HOME, 'Library', 'Messages', 'chat.db')
-
-  // Apple's date column is nanoseconds since 2001-01-01
-  // Cutoff = (now - N days) - (2001-01-01) seconds, then * 1e9
-  const sql = `
-SELECT
-  datetime(m.date/1000000000 + strftime('%s','2001-01-01'), 'unixepoch', 'localtime') AS ts,
-  m.is_from_me AS from_me,
-  COALESCE(h.id, '') AS sender,
-  COALESCE(m.text, '') AS text
-FROM message m
-LEFT JOIN handle h ON h.ROWID = m.handle_id
-WHERE (
-  ${digits ? `REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', '') LIKE '%${digits}%' OR ` : ''}
-  LOWER(h.id) LIKE '%${lower.replace(/'/g, "''")}%'
-)
-  AND m.date > (strftime('%s','now','-${days} days') - strftime('%s','2001-01-01')) * 1000000000
-  AND m.text IS NOT NULL
-ORDER BY m.date DESC
-LIMIT ${limit}
-`.trim()
-
+  // Reads chat.db directly, matching /api/imessage/conversations.
+  //
+  // The previous implementation took 14.6s for three messages — caught by
+  // test/all-providers.test.js, which asserts every declared function is interactive
+  // (<10s), not merely that it eventually answers. That budget is the whole point: the
+  // calendar provider "worked" for months in the sense that it never crashed.
   try {
-    const result = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile(
-        '/usr/bin/sqlite3',
-        ['-readonly', '-json', '-bail', chatDbPath, sql],
-        { timeout: 15000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            const msg = (stderr || err.message || '').trim()
-            if (msg.includes('unable to open') || msg.includes('authorization denied')) {
-              return reject(new Error(
-                'Cannot read chat.db. Grant Full Disk Access to the bridge process ' +
-                'in System Settings > Privacy & Security > Full Disk Access.'
-              ))
-            }
-            return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
-          }
-          try {
-            resolve(stdout.trim() ? JSON.parse(stdout) : [])
-          } catch (parseErr) {
-            reject(new Error(`sqlite3 JSON parse: ${parseErr.message}`))
-          }
-        }
-      )
-    })
-
+    const store = require('./drivers/imessage-store')
+    const messages = await store.searchMessages({ handle, days, limit })
     res.json({
-      messages: result,
-      count: result.length,
+      messages: messages.map((m) => ({
+        text: m.text,
+        sent_at: m.sent_at ? m.sent_at.toISOString() : null,
+        from_me: m.from_me,
+        handle: m.handle,
+      })),
+      count: messages.length,
       handle,
       days,
+      source: 'chat-db',
     })
   } catch (err) {
-    console.error(`[imessage/search] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    console.error(`[imessage/search] ${err.message}`)
+    res.status(503).json({ error: err.message })
   }
 })
 
@@ -2316,174 +2379,119 @@ app.get('/api/whatsapp/search', async (req, res) => {
  * Uses AppleScript via osascript. Requires Mail.app to be running and
  * accessible to automation (System Settings > Privacy > Automation).
  */
-app.get('/api/mail/search', async (req, res) => {
-  if (process.platform !== 'darwin') {
-    return res.status(503).json({ error: 'Mail search is only available on macOS' })
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Obsidian vault — local markdown, read-only.
+ *
+ * Obsidian is local-first: no cloud API, no OAuth, so it can never be a Composio
+ * integration. It CAN be a bridge driver, because a vault is just files on disk —
+ * the same shape as the iMessage and Apple Mail drivers.
+ *
+ * Read-only on purpose. A vault is someone's thinking; we index it, we do not edit it.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** GET /api/obsidian/vaults — discover vaults. Query: ?roots=/a,/b */
+app.get('/api/obsidian/vaults', (req, res) => {
+  try {
+    const roots = req.query.roots ? String(req.query.roots).split(',').map((r) => r.trim()).filter(Boolean) : null
+    const vaults = obsidian.discoverVaults(roots).map((p) => ({ path: p, name: require('path').basename(p) }))
+    res.json({ vaults, count: vaults.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
   }
+})
 
-  const from = (req.query.from || '').toString().trim()
-  const days = Math.max(1, Math.min(90, parseInt(req.query.days || '14', 10)))
-  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '20', 10)))
-  const includeBody = req.query.include_body === '1' || req.query.include_body === 'true'
-  const maxBody = Math.max(100, Math.min(50000, parseInt(req.query.max_body || '4000', 10)))
-  const subject = (req.query.subject || '').toString().trim()
-  const includeAttachments = req.query.include_attachments === '1' || req.query.include_attachments === 'true'
-  const saveAttachments = req.query.save_attachments === '1' || req.query.save_attachments === 'true'
-
-  if (!from) {
-    return res.status(400).json({ error: 'from query param is required (email or name substring)' })
-  }
-
-  if (!(await ensureMailRunning())) {
-    return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
-  }
-
-  const escapeForAppleScript = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  const fromEscaped = escapeForAppleScript(from)
-  const subjectEscaped = subject ? escapeForAppleScript(subject) : ''
-
-  // The script returns a delimited string we parse in JS to avoid AppleScript JSON pain.
-  // Format per row: DATE\tSENDER\tSUBJECT\tBODY (body truncated to max_body chars, default 4000)
-  const subjectFilter = subjectEscaped
-    ? ` and subject contains "${subjectEscaped}"`
-    : ''
-  const script = `
-tell application "Mail"
-  set output to ""
-  set cutoffDate to (current date) - (${days} * days)
-  set msgCount to 0
-  try
-    set msgs to (messages of inbox whose sender contains "${fromEscaped}"${subjectFilter} and date received > cutoffDate)
-    repeat with msg in msgs
-      if msgCount >= ${limit} then exit repeat
-      set msgCount to msgCount + 1
-      try
-        set theDate to (date received of msg) as string
-      on error
-        set theDate to "unknown"
-      end try
-      try
-        set theSender to sender of msg
-      on error
-        set theSender to ""
-      end try
-      try
-        set theSubject to subject of msg
-      on error
-        set theSubject to "(no subject)"
-      end try
-      set theBody to ""
-      ${includeBody ? `try
-        set theBody to content of msg
-        if length of theBody > ${maxBody} then set theBody to (text 1 thru ${maxBody} of theBody) & "..."
-      end try` : ''}
-      set theAttachments to ""
-      ${includeAttachments || saveAttachments ? `try
-        set attList to mail attachments of msg
-        set attCount to count of attList
-        if attCount > 0 then
-          repeat with att in attList
-            try
-              set attName to "unknown"
-              set attMime to "unknown"
-              set attSize to 0
-              try
-                set attName to name of att
-              end try
-              try
-                set attMime to MIME type of att
-              end try
-              try
-                set attSize to file size of att
-              end try
-              set theAttachments to theAttachments & attName & "|" & attMime & "|" & attSize
-              ${saveAttachments ? `try
-                set savePath to "${escapeForAppleScript(require('os').tmpdir())}/iris-mail-attachments/"
-                do shell script "mkdir -p " & quoted form of savePath
-                save att in POSIX file (savePath & attName)
-                set theAttachments to theAttachments & "|" & savePath & attName
-              on error saveErr
-                set theAttachments to theAttachments & "|SAVE_ERROR:" & saveErr
-              end try` : ''}
-              if att is not last item of attList then set theAttachments to theAttachments & ";;;"
-            end try
-          end repeat
-        end if
-      end try` : ''}
-      set output to output & theDate & "\\t" & theSender & "\\t" & theSubject & "\\t" & theBody & "\\t" & theAttachments & "\\n---ROW---\\n"
-    end repeat
-  on error errMsg number errNum
-    -- NEVER swallow this into an empty result: a bare "end try" here made every
-    -- failure (notably -609 "Connection is invalid" when Mail.app is not running)
-    -- look like a legitimate zero-match search. See bug #177253.
-    return "---IRIS_MAIL_ERROR---" & errNum & "\\t" & errMsg
-  end try
-  return output
-end tell
-`.trim()
+/** GET /api/obsidian/notes — list notes. Query: ?vault=<path>&folder=&limit= */
+app.get('/api/obsidian/notes', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  if (!vault) return res.status(400).json({ error: 'vault query param is required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
 
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          const msg = (stderr || err.message || '').trim()
-          if (msg.includes('-1743') || msg.includes('not allowed')) {
-            return reject(new Error(
-              'Mail.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
-            ))
-          }
-          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
-        }
-        resolve(stdout)
-      })
+    const notes = obsidian.listNotes(vault, {
+      limit: Math.max(1, Math.min(5000, parseInt(req.query.limit || '1000', 10))),
+      folder: req.query.folder ? String(req.query.folder) : null,
     })
+    res.json({ vault, notes, count: notes.length })
+  } catch (e) {
+    // A rejected folder is a CALLER error (400), not a server fault (500) — same status
+    // /api/obsidian/note already returns for the identical guard. A 500 tells a client to
+    // retry; retrying a traversal attempt forever is exactly wrong.
+    const bad = /escapes the vault/i.test(e.message)
+    res.status(bad ? 400 : 500).json({ error: e.message })
+  }
+})
 
-    // AppleScript reports in-script failures via this sentinel rather than an empty
-    // string, so a hard error can never masquerade as "no matching emails".
-    if (stdout.includes('---IRIS_MAIL_ERROR---')) {
-      const [errNum, errMsg] = stdout.split('---IRIS_MAIL_ERROR---')[1].trim().split('\t')
-      if (errNum === '-609' || /Connection is invalid/i.test(errMsg || '')) {
-        throw new Error('Mail.app is not running or is not scriptable. Launch Mail and retry.')
-      }
-      throw new Error(`Mail.app error ${errNum}: ${(errMsg || 'unknown').slice(0, 300)}`)
-    }
+/** GET /api/obsidian/note — one note, parsed. Query: ?vault=<path>&path=<rel> */
+app.get('/api/obsidian/note', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  const rel = (req.query.path || '').toString()
+  if (!vault || !rel) return res.status(400).json({ error: 'vault and path query params are required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
 
-    const messages = stdout
-      .split(/\n---ROW---\n/)
-      .map((row) => row.trim())
-      .filter((row) => row.length > 0)
-      .map((row) => {
-        const parts = row.split('\t')
-        const date = parts[0] || ''
-        const sender = parts[1] || ''
-        const subject = parts[2] || ''
-        const body = parts[3] || ''
-        const attachmentsRaw = parts[4] || ''
-        const result = { date, sender, subject, body }
-        if (attachmentsRaw) {
-          result.attachments = attachmentsRaw.split(';;;').filter(a => a).map(a => {
-            const [name, mime, size, savedPath] = a.split('|')
-            const att = { name: name || '', mime_type: mime || '', size: parseInt(size || '0', 10) }
-            if (savedPath && !savedPath.startsWith('SAVE_ERROR')) att.saved_path = savedPath
-            if (savedPath && savedPath.startsWith('SAVE_ERROR')) att.save_error = savedPath
-            return att
-          })
-        } else {
-          result.attachments = []
-        }
-        return result
-      })
+  try {
+    res.json(obsidian.readNote(vault, rel))
+  } catch (e) {
+    // Path-escape attempts and missing files both land here; neither should 500.
+    res.status(400).json({ error: e.message })
+  }
+})
 
+/** GET /api/obsidian/search — substring search. Query: ?vault=&q=&limit=&body=1 */
+app.get('/api/obsidian/search', (req, res) => {
+  const vault = (req.query.vault || '').toString()
+  const q = (req.query.q || '').toString()
+  if (!vault || !q) return res.status(400).json({ error: 'vault and q query params are required' })
+  if (!obsidian.isVault(vault)) return res.status(404).json({ error: `Not an Obsidian vault: ${vault}` })
+
+  try {
+    const results = obsidian.searchNotes(vault, q, {
+      limit: Math.max(1, Math.min(200, parseInt(req.query.limit || '50', 10))),
+      includeBody: req.query.body === '1' || req.query.body === 'true',
+    })
+    res.json({ vault, query: q, results, count: results.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/mail/search', async (req, res) => {
+  // Reads Mail's own Envelope Index instead of `messages of inbox whose sender contains X`.
+  //
+  // That whose-clause is the same pathology that made Calendar unusable: MEASURED at 31s
+  // here, hitting the execFile timeout and returning a truncated dump of the AppleScript
+  // rather than mail. The index answers the same question ~268x faster.
+  //
+  // SCOPE, stated plainly: the index holds ENVELOPES — sender, subject, dates, mailbox. It
+  // does NOT hold bodies (those are .emlx files on disk), so include_body is no longer
+  // honoured here rather than being silently half-implemented.
+  const from = (req.query.from || '').toString().trim()
+  const subject = (req.query.subject || '').toString().trim()
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '14', 10)))
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
+
+  if (!from && !subject) {
+    return res.status(400).json({ error: 'from (or subject) query param is required' })
+  }
+
+  try {
+    const store = require('./drivers/apple-mail-store')
+    const emails = await store.searchEmails({ from, subject, days, limit })
     res.json({
-      messages,
-      count: messages.length,
-      from,
+      emails: emails.map((e) => ({
+        subject: e.subject,
+        sender: e.sender,
+        sender_name: e.sender_name,
+        date_sent: e.sent_at ? e.sent_at.toISOString() : null,
+        mailbox: e.mailbox,
+      })),
+      count: emails.length,
       days,
+      source: 'envelope-index',
+      ...(req.query.include_body ? { body_note: 'bodies are not in the envelope index; use the message id against .emlx' } : {}),
     })
   } catch (err) {
-    console.error(`[mail/search] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    console.error(`[mail/search] ${err.message}`)
+    res.status(503).json({ error: err.message })
   }
 })
 
@@ -2495,136 +2503,54 @@ end tell
  */
 app.get('/api/calendar/events', async (req, res) => {
   if (process.platform !== 'darwin') {
-    return res.status(503).json({ error: 'Calendar.app is only available on macOS' })
-  }
-
-  if (!(await ensureAppRunning('Calendar'))) {
-    return res.status(503).json({ error: 'Calendar.app could not be launched or is not scriptable. Open Calendar and retry.' })
+    return res.status(503).json({ error: 'Calendar is only available on macOS' })
   }
 
   const days = Math.max(1, Math.min(90, parseInt(req.query.days || '7', 10)))
   const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
-  const calendarFilter = (req.query.calendar || '').toString().trim()
+  const calendarFilter = (req.query.calendar || '').toString().trim().toLowerCase()
 
-  const escapeForAppleScript = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-
-  // Build calendar filter clause
-  const calFilter = calendarFilter
-    ? `whose name is "${escapeForAppleScript(calendarFilter)}"`
-    : ''
-
-  const script = `
-tell application "Calendar"
-  set output to ""
-  set startDate to (current date)
-  set hours of startDate to 0
-  set minutes of startDate to 0
-  set seconds of startDate to 0
-  set endDate to startDate + (${days} * days)
-  set eventCount to 0
-  set cals to (calendars ${calFilter})
-  repeat with cal in cals
-    set calName to name of cal
-    try
-      set evts to (every event of cal whose start date >= startDate and start date <= endDate)
-      repeat with evt in evts
-        if eventCount >= ${limit} then exit repeat
-        set eventCount to eventCount + 1
-        set evtTitle to summary of evt
-        set evtStart to (start date of evt) as string
-        set evtEnd to (end date of evt) as string
-        set evtLocation to ""
-        try
-          set evtLocation to location of evt
-        end try
-        set evtNotes to ""
-        try
-          set evtNotes to description of evt
-          if length of evtNotes > 500 then set evtNotes to (text 1 thru 500 of evtNotes) & "..."
-        end try
-        set evtAllDay to allday event of evt
-        set output to output & evtTitle & "\\t" & evtStart & "\\t" & evtEnd & "\\t" & evtLocation & "\\t" & evtNotes & "\\t" & calName & "\\t" & evtAllDay & "\\n---ROW---\\n"
-      end repeat
-    on error errMsg number errNum
-      -- A bare "end try" here silently dropped this calendar's events while other
-      -- calendars still returned theirs — a PARTIAL false negative, harder to spot
-      -- than an empty one. Emit a marker row so the gap is surfaced. See bug #177253.
-      set output to output & "---IRIS_CAL_ERROR---" & calName & "\\t" & errNum & "\\t" & errMsg & "\\n---ROW---\\n"
-    end try
-    if eventCount >= ${limit} then exit repeat
-  end repeat
-  return output
-end tell
-`.trim()
-
+  // Reads Calendar.sqlitedb directly instead of driving Calendar.app over AppleScript.
+  //
+  // The AppleScript version used `every event of cal whose start date >= X`, which is
+  // O(all events ever) PER CALENDAR. Measured on a 28-calendar machine: 72 SECONDS for one
+  // calendar, ~4m37s for all of them, against a 30s execFile timeout — so this endpoint
+  // had never returned a single event through any surface (#178745). It also no longer
+  // needs Calendar.app to be running, and no longer leaves osascript orphans behind when
+  // the caller gives up.
+  //
+  // EventKit via JXA was measured too and REJECTED: fast, but TCC is scoped to the calling
+  // process, so from the daemon it saw 1 of 28 calendars and returned ZERO events while
+  // reporting fullAccess. Silent and partial is the worst failure mode available here.
+  // Full A/B in test/apple-calendar.matrix.js.
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      const { execFile } = require('child_process')
-      execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          const msg = (stderr || err.message || '').trim()
-          if (msg.includes('-1743') || msg.includes('not allowed')) {
-            return reject(new Error(
-              'Calendar.app automation not authorized. Grant access in System Settings > Privacy > Automation.'
-            ))
-          }
-          return reject(new Error(`osascript: ${msg.slice(0, 300)}`))
-        }
-        resolve(stdout)
-      })
-    })
+    const cal = require('./drivers/apple-calendar-sqlite')
+    // Over-fetch when filtering so the filter does not eat the limit.
+    const events = await cal.getEvents({ days, limit: calendarFilter ? Math.min(500, limit * 10) : limit })
 
-    const allRows = stdout
-      .split(/\n---ROW---\n/)
-      .map((row) => row.trim())
-      .filter((row) => row.length > 0)
-
-    // Partition out per-calendar failures so a skipped calendar can never pass as
-    // "this calendar had no events". These are reported, never silently dropped.
-    const failedCalendars = allRows
-      .filter((row) => row.startsWith('---IRIS_CAL_ERROR---'))
-      .map((row) => {
-        const [calendar, errNum, errMsg] = row.replace('---IRIS_CAL_ERROR---', '').split('\t')
-        return { calendar: calendar || 'unknown', error_number: errNum || '', error: (errMsg || '').slice(0, 300) }
-      })
-
-    for (const f of failedCalendars) {
-      console.error(`[calendar/events] Calendar "${f.calendar}" failed (${f.error_number}): ${f.error} — its events are MISSING from this response`)
-    }
-
-    const events = allRows
-      .filter((row) => !row.startsWith('---IRIS_CAL_ERROR---'))
-      .map((row) => {
-        const [title, start_date, end_date, location, notes, calendar, all_day] = row.split('\t')
-        return {
-          title: title || '',
-          start_date: start_date || '',
-          end_date: end_date || '',
-          location: location || '',
-          notes: notes || '',
-          calendar: calendar || '',
-          all_day: all_day === 'true',
-        }
-      })
-
-    // Sort by start_date
-    events.sort((a, b) => new Date(a.start_date).getTime() - new Date(b.start_date).getTime())
+    const filtered = calendarFilter
+      ? events.filter((e) => String(e.calendar).toLowerCase().includes(calendarFilter))
+      : events
 
     res.json({
-      events,
-      count: events.length,
+      events: filtered.slice(0, limit).map((e) => ({
+        title: e.title,
+        start_date: e.start.toISOString(),
+        end_date: e.end.toISOString(),
+        all_day: e.allDay,
+        location: '',
+        notes: e.notes,
+        calendar: e.calendar,
+      })),
+      count: Math.min(filtered.length, limit),
       days,
-      // Present only when calendars were skipped — callers must treat the result
-      // as INCOMPLETE, not as a full picture with fewer events.
-      ...(failedCalendars.length > 0 && {
-        partial: true,
-        failed_calendars: failedCalendars,
-        warning: `${failedCalendars.length} calendar(s) could not be read; their events are missing from these results.`,
-      }),
+      source: 'calendar-store',
     })
   } catch (err) {
+    // A NAMED reason, never an empty list. "You have no meetings" and "I cannot read your
+    // calendar" must never look the same to the caller.
     console.error(`[calendar/events] Failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    res.status(503).json({ error: err.message })
   }
 })
 
@@ -3461,6 +3387,102 @@ function reconstructPath (dirName) {
 
 // ─── List / Discover Sessions ────────────────────────────────────
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude Code session metadata — streamed once, then cached on mtime+size.
+//
+// The list handler used to readFileSync() every transcript whole, split it into
+// an array of lines, and filter that array twice — once for the 40 header lines
+// it wanted and once to count messages. On this machine that is 870 MB across
+// 164 files, the largest single transcript being 68 MB, and listing sessions
+// took 18.75 SECONDS. Long enough that the first call timed out entirely.
+//
+// Three changes, and it is worth being precise about which one does what,
+// because the obvious explanation was wrong when measured:
+//   1. CACHE ON mtime+size — THIS is the speed fix. A transcript that has not
+//      changed cannot have a different answer, so it is never re-read.
+//      Measured over the 20 files this handler scans: 2212 ms -> 1 ms. Sessions
+//      are append-only and mostly idle, so the hit rate is near total.
+//   2. ONE STREAMING PASS — a MEMORY fix, not a speed one. Benchmarked against
+//      readFileSync at 2212 ms vs 2328 ms, i.e. no faster; the cost is the I/O
+//      of reading 870 MB, not the splitting. It is kept because holding a 68 MB
+//      string plus its line array per file is worth avoiding regardless.
+//   3. ?counts=0 — skips the full scan for callers that only want the session
+//      list. The message count is the ONLY field that requires reading past the
+//      header, so making it opt-out is what fixes the cold path.
+//
+// The count remains approximate in exactly the way it was before (lines
+// containing a "role" key), so the number does not change meaning — this is a
+// speed fix, not a semantics change.
+// ─────────────────────────────────────────────────────────────────────────────
+const CLAUDE_SESSION_META_CACHE = new Map()
+const CLAUDE_META_HEAD_LINES = 40
+
+function readClaudeSessionMeta(filePath, stat, withCounts = true) {
+  const cached = CLAUDE_SESSION_META_CACHE.get(filePath)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.meta
+  }
+
+  // Header-only: stop as soon as we have the metadata lines. The count is the
+  // one field that forces a full read, so skipping it turns an 870 MB scan into
+  // a few kilobytes per file. Not cached — a later call wanting counts must
+  // still do the full pass, and caching a countless entry would starve it.
+  if (!withCounts) {
+    // 256 KB, not 64 KB: measured on real transcripts, 64 KB yielded only 23
+    // lines because individual events run to ~2.8 KB, and the session NAME is
+    // taken from the first user message inside the first 40. Reading too little
+    // does not fail loudly — it silently produces an unnamed session, which is
+    // the kind of bug that looks like a data problem rather than a read limit.
+    const HEAD_BYTES = 1 << 18
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const buf = Buffer.allocUnsafe(HEAD_BYTES)
+      const bytesRead = fs.readSync(fd, buf, 0, HEAD_BYTES, 0)
+      const headLines = buf.toString('utf8', 0, bytesRead)
+        .split('\n')
+        .filter(Boolean)
+        .slice(0, CLAUDE_META_HEAD_LINES)
+      return { headLines, messageCount: null }
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+
+  const fd = fs.openSync(filePath, 'r')
+  const CHUNK = 1 << 16
+  const buf = Buffer.allocUnsafe(CHUNK)
+  let carry = ''
+  let headLines = []
+  let messageCount = 0
+
+  try {
+    let bytesRead
+    while ((bytesRead = fs.readSync(fd, buf, 0, CHUNK, null)) > 0) {
+      const text = carry + buf.toString('utf8', 0, bytesRead)
+      const lines = text.split('\n')
+      // The final element may be a partial line; carry it into the next chunk
+      // so a "role" key split across a chunk boundary is still counted once.
+      carry = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line) continue
+        if (headLines.length < CLAUDE_META_HEAD_LINES) headLines.push(line)
+        if (line.includes('"role"')) messageCount++
+      }
+    }
+    if (carry) {
+      if (headLines.length < CLAUDE_META_HEAD_LINES) headLines.push(carry)
+      if (carry.includes('"role"')) messageCount++
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+
+  const meta = { headLines, messageCount }
+  CLAUDE_SESSION_META_CACHE.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, meta })
+  return meta
+}
+
 app.get('/api/sessions/claude-code', async (req, res) => {
   try {
     // Read sessions directly from Claude Code's local storage
@@ -3470,6 +3492,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
     }
 
     const limit = parseInt(req.query.limit) || 20
+    // Counts require reading every transcript end to end; callers that only
+    // need the list can opt out with ?counts=0.
+    const withCounts = req.query.counts !== '0' && req.query.counts !== 'false'
     const sessions = []
 
     // Scan all project dirs for .jsonl session files
@@ -3491,12 +3516,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 
       for (const file of files) {
         try {
-          const content = fs.readFileSync(file.path, 'utf8')
-          const allLines = content.split('\n').filter(Boolean)
+          const stat = fs.statSync(file.path)
+          const { headLines, messageCount } = readClaudeSessionMeta(file.path, stat, withCounts)
 
-          // Read first 40 lines for metadata (cwd, branch, first user msg)
-          // Some sessions have many system lines before the first user message
-          const headLines = allLines.slice(0, 40)
           let sessionId = path.basename(file.name, '.jsonl')
           let cwd = null
           let gitBranch = null
@@ -3516,11 +3538,6 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 
           // Generate meaningful name from first user message
           const sessionName = extractSessionName(headLines, projectPath)
-
-          // Count approximate messages (lines with "role")
-          const messageCount = allLines.filter(l => l.includes('"role"')).length
-
-          const stat = fs.statSync(file.path)
 
           sessions.push({
             session_id: sessionId,
