@@ -520,6 +520,16 @@ class TaskExecutor {
     this.flApiPath = findFlApiPath()
     this.dockerMode = null // lazily detected
     this._executedTaskIds = new Map() // taskId -> timestamp (idempotency for duplicate Pusher events)
+
+    // ── HIVE remote/cloud node dispatch (bug #157523) ──────────────────────
+    // Identity + transport handles, wired by index.js once known. Used by the
+    // remote-routing gate in execute() to forward a targeted task to another
+    // node instead of always running it in local tmux. OFF by default — see
+    // _maybeRouteRemote() and the HIVE_REMOTE_DISPATCH* env flags.
+    this.nodeName = null      // this node's mesh/hub name (set by index.js)
+    this.nodeId = null        // this node's hub-assigned id (set after heartbeat)
+    this.meshDispatch = null  // MeshDispatch instance for LAN peer routing (set by index.js)
+
     // If the tmux module failed to load, use a null-object so every `this.tmux.available`
     // gate falls through to direct spawn and cleanup calls are safe no-ops.
     this.tmux = TmuxManager
@@ -551,8 +561,26 @@ class TaskExecutor {
 
     // Check session health on startup
     this.checkSessionHealth()
-    // Re-check every 6 hours
-    setInterval(() => this.checkSessionHealth(), 6 * 60 * 60 * 1000)
+    // Re-check every 6 hours.
+    //
+    // unref() matters: an un-unref'd 6-hour interval keeps the Node event loop alive forever, so
+    // ANY short-lived process that constructs a TaskExecutor can never exit. That is why
+    // `node --test tests/` hung indefinitely — every test passed, both suites reported done, and
+    // the runner then sat there holding this timer. The daemon itself is unaffected; it is kept
+    // alive by its HTTP server, which is what should be deciding the process lifetime anyway.
+    // .unref() so this never holds the process open. A six-hourly background health poll is
+    // not a reason for Node to stay alive: the daemon has plenty of other handles keeping it
+    // running, and anything SHORTER-lived that constructs a TaskExecutor — a test, a one-shot
+    // CLI path — would otherwise hang at exit for six hours with all its work already done.
+    //
+    // Measured 2026-08-23: tests/execute-script.test.js reported all 21 subtests passing and
+    // then never emitted a summary. `node --test tests/` inherits that stall, so the ENTIRE
+    // bridge suite became unrunnable — which is worse than a failing test, because a suite
+    // nobody can finish is a suite nobody runs, and nothing in the output says that is what
+    // happened. It just sits there looking busy.
+    this.sessionHealthTimer = setInterval(() => this.checkSessionHealth(), 6 * 60 * 60 * 1000)
+    if (typeof this.sessionHealthTimer.unref === 'function') this.sessionHealthTimer.unref()
+    if (this.sessionHealthTimer.unref) this.sessionHealthTimer.unref()
   }
 
   /**
@@ -604,6 +632,168 @@ class TaskExecutor {
     return null
   }
 
+  /**
+   * HIVE remote/cloud node dispatch (bug #157523).
+   *
+   * Decides whether the incoming task should run locally (default) or be
+   * forwarded to another node. A task opts into remote routing by setting one
+   * of `config.target_node` / `config.dispatch_to_node` / `config.remote_node`
+   * to a peer name or hub node_id. This is the "rent a box, run agents on it"
+   * leg: an orchestrator/director node fans work out to LAN peers or rented
+   * cloud droplets.
+   *
+   * Called from execute() BEFORE AdmissionGate.admit(), so a task routed away
+   * never consumes a local browser slot / per-account session lock. There is no
+   * local workspace or reservation to unwind at this point — `cleanupRunning`
+   * is accepted for signature compatibility and only invoked when provided.
+   *
+   * Transports are REUSED, never reinvented:
+   *   1. LAN mesh peer  → MeshDispatch.dispatchToPeer() (PSK-authed HTTP)
+   *   2. Cloud / WAN    → CloudClient.submitTask() (hub re-dispatch over Pusher)
+   *
+   * ── SECURITY GATE (critical) ────────────────────────────────────────────
+   * This whole leg is OFF by default. Two independent env flags gate it so
+   * that enabling LAN routing never silently enables public droplet routing:
+   *
+   *   HIVE_REMOTE_DISPATCH=1      → enables routing to *already-paired* LAN
+   *                                 mesh peers only.
+   *   HIVE_REMOTE_DISPATCH_WAN=1  → additionally enables hub re-dispatch to
+   *                                 cloud / WAN droplet nodes.
+   *
+   * Cloud/WAN dispatch is BLOCKED on the Phase-0 security floor and must NOT
+   * be enabled for public/WAN nodes until both land:
+   *   - #157524: HMAC task-signature enforcement (unsigned tasks are currently
+   *              accepted with only a warning).
+   *   - #157525: mesh / A2A transport is unencrypted, no mTLS.
+   * Until then, even HIVE_REMOTE_DISPATCH_WAN=1 is only safe on a trusted,
+   * private network. Do not weaken these gates.
+   *
+   * @returns {Promise<boolean>} true if the task was handled (routed or
+   *   rejected) and the local executor should stop; false to run locally.
+   */
+  async _maybeRouteRemote (task, cleanupRunning, ts) {
+    const cfg = task.config || {}
+    const target = cfg.target_node || cfg.dispatch_to_node || cfg.remote_node
+    if (!target) return false // No target → run locally (default path, unchanged)
+
+    // Never route a task back to ourselves — run it locally.
+    const selfIds = [this.nodeName, this.nodeId].filter(Boolean).map(String)
+    if (selfIds.includes(String(target))) return false
+
+    const label = (typeof ts === 'function') ? `[${ts()}] ` : ''
+
+    // ── GATE 1: master switch (OFF by default) ──
+    const enabled = /^(1|true|yes|on)$/i.test(process.env.HIVE_REMOTE_DISPATCH || '')
+    if (!enabled) {
+      return this._failRoutedTask(task, cleanupRunning,
+        `Remote node dispatch is disabled. Task targets node "${target}" but ` +
+        'HIVE_REMOTE_DISPATCH is not set. Enable it to route to paired LAN mesh ' +
+        'peers. Cloud/droplet routing remains blocked on security floor ' +
+        '#157524 (HMAC task signatures) + #157525 (mesh mTLS).')
+    }
+
+    // ── Transport 1: LAN mesh peer (paired, PSK-authed) ──
+    // A paired mesh peer is a node we have explicitly exchanged keys with, so
+    // it is trusted even before the WAN security floor lands.
+    if (this.meshDispatch && this.meshDispatch.registry) {
+      const registry = this.meshDispatch.registry
+      const peer = registry.getPeer(String(target)) ||
+        registry.getAllPeers().find(p => p.node_id && String(p.node_id) === String(target))
+      if (peer) {
+        if (peer.status !== 'online') {
+          return this._failRoutedTask(task, cleanupRunning,
+            `Mesh peer "${peer.name}" is ${peer.status} — cannot route task.`)
+        }
+        try {
+          console.log(`[executor] ${label}↗ Routing task ${String(task.id).substring(0, 12)} to LAN mesh peer ${peer.name}`)
+          const res = await this.meshDispatch.dispatchToPeer(peer.name, {
+            id: task.id,
+            type: task.type,
+            title: task.title,
+            prompt: task.prompt,
+            config: cfg
+          })
+          // Close out the original hub task as delegated. NOTE: the peer reports
+          // its own result for the mesh task id (res.taskId); end-to-end result
+          // correlation back onto this hub task is a remaining piece (see #157523).
+          await this.cloud.submitResult(task.id, {
+            status: 'completed',
+            output: `Delegated to LAN mesh peer ${peer.name} (mesh task ${res.taskId})`,
+            remote_node: peer.name,
+            remote_task_id: res.taskId,
+            delegated: true,
+            duration_ms: 0
+          }).catch(() => {})
+          if (typeof cleanupRunning === 'function') cleanupRunning()
+          return true
+        } catch (err) {
+          return this._failRoutedTask(task, cleanupRunning,
+            `Mesh dispatch to ${peer.name} failed: ${err.message}`)
+        }
+      }
+    }
+
+    // ── Transport 2: Cloud / WAN node via hub control-plane ──
+    // SECURITY: this leaves the LAN. Hub re-dispatch to a public droplet is the
+    // exact path blocked on #157524/#157525. Hard-gate behind a second flag.
+    const wanEnabled = /^(1|true|yes|on)$/i.test(process.env.HIVE_REMOTE_DISPATCH_WAN || '')
+    if (!wanEnabled) {
+      return this._failRoutedTask(task, cleanupRunning,
+        `Target node "${target}" is not an online paired LAN mesh peer. ` +
+        'Cloud / WAN droplet dispatch via the hub is BLOCKED pending the ' +
+        'security floor: #157524 (HMAC task signatures) + #157525 (mesh mTLS). ' +
+        'Set HIVE_REMOTE_DISPATCH_WAN=1 only on a trusted private network.')
+    }
+
+    try {
+      console.log(`[executor] ${label}↗ Re-dispatching task ${String(task.id).substring(0, 12)} to cloud node ${target} via hub`)
+      // Strip routing keys so the cloud node doesn't bounce it again.
+      const fwdConfig = { ...cfg, origin_node: this.nodeName || null }
+      delete fwdConfig.target_node
+      delete fwdConfig.dispatch_to_node
+      delete fwdConfig.remote_node
+      const submit = await this.cloud.submitTask({
+        node_id: target,
+        type: task.type,
+        title: task.title || `Routed from ${this.nodeName || 'node'}`,
+        prompt: task.prompt,
+        config: fwdConfig
+      })
+      const newId = submit?.task?.id || submit?.id || 'pending'
+      await this.cloud.submitResult(task.id, {
+        status: 'completed',
+        output: `Delegated to cloud node ${target} via hub (task ${newId})`,
+        remote_node: target,
+        remote_task_id: newId,
+        delegated: true,
+        duration_ms: 0
+      }).catch(() => {})
+      if (typeof cleanupRunning === 'function') cleanupRunning()
+      return true
+    } catch (err) {
+      return this._failRoutedTask(task, cleanupRunning,
+        `Hub re-dispatch to cloud node ${target} failed: ${err.message}`)
+    }
+  }
+
+  /**
+   * Mark a remote-routed task as failed with a clear reason and stop local
+   * execution. Returns true so callers can `return true` directly.
+   */
+  async _failRoutedTask (task, cleanupRunning, message) {
+    console.warn(`[executor] [remote-dispatch] ${message}`)
+    try {
+      await this.cloud.submitResult(task.id, {
+        status: 'failed',
+        error: message,
+        output: '',
+        duration_ms: 0
+      })
+    } catch { /* non-critical */ }
+    if (typeof cleanupRunning === 'function') cleanupRunning()
+    return true
+  }
+
   async execute (task, opts = {}) {
     const taskId = task.id
     const runtime = task.runtime || task.config?.runtime || process.env.RUNTIME || 'iris_agent'
@@ -627,6 +817,22 @@ class TaskExecutor {
       }
       if (this._executedTaskIds.has(taskId)) {
         console.log(`[executor] [${ts()}] Duplicate task ${taskId.substring(0, 12)} — already executed. Ignoring.`)
+        return
+      }
+
+      // ── Remote / cloud node dispatch gate (HIVE droplet routing, bug #157523) ──
+      // If this task is explicitly targeted at a *different* node, forward it
+      // there instead of running it in local tmux. This runs BEFORE admission
+      // on purpose: a task routed away must NOT consume a local browser slot or
+      // per-account session lock. Reuses existing transports — LAN mesh
+      // (mesh-dispatch, PSK over HTTP) or the hub control-plane
+      // (cloud.submitTask → Pusher re-dispatch to a cloud/droplet node). OFF by
+      // default; cloud/WAN is additionally blocked on the Phase-0 security floor
+      // (#157524 HMAC task sigs, #157525 mesh mTLS). See _maybeRouteRemote().
+      const routedRemotely = await this._maybeRouteRemote(task, null, ts)
+      if (routedRemotely) {
+        // Record idempotency so a duplicate Pusher event doesn't re-route it.
+        this._executedTaskIds.set(taskId, now)
         return
       }
 
@@ -1562,6 +1768,20 @@ class TaskExecutor {
             resolve({ success: true, skipped: true, output: 'comms_sync disabled on this node' })
             return
           }
+          // Rate limit (#171288): even when enabled, never run more often than the cooldown.
+          // This is what makes re-enabling SAFE — the original problem was pulse:tick
+          // dispatching comms_sync repeatedly and relaunching WhatsApp Web over and over.
+          // A cooldown caps it to at most one run per window regardless of how many the
+          // server queues. Default 15 min; tune with IRIS_COMMS_SYNC_COOLDOWN_MS.
+          const cooldownMs = parseInt(process.env.IRIS_COMMS_SYNC_COOLDOWN_MS || '900000', 10)
+          const sinceLast = this._lastCommsSyncAt ? (Date.now() - this._lastCommsSyncAt) : Infinity
+          if (sinceLast < cooldownMs) {
+            const waitS = Math.round((cooldownMs - sinceLast) / 1000)
+            console.log(`[executor] comms_sync rate-limited — ${waitS}s until next allowed run; skipping ${task.id?.substring(0, 8)}`)
+            resolve({ success: true, skipped: true, output: `comms_sync rate-limited (cooldown ${cooldownMs}ms, ${waitS}s remaining)` })
+            return
+          }
+          this._lastCommsSyncAt = Date.now()
           // Pulse-dispatched silent comms sync. Server queues these every 15 min
           // for users with stale lead_comms; bridge picks up and runs the iris
           // CLI sync-comms command which fetches iMessage/Mail/Gmail and POSTs
@@ -1678,6 +1898,140 @@ class TaskExecutor {
             args = ['playwright', 'test', scriptPath, playwrightHeadedFlag(), `--timeout=${timeoutMs}`].filter(Boolean)
             workspace.projectDir = workspace.dir
           }
+          break
+        }
+
+        case 'browser_agent': {
+          // agent-browser (Vercel) as a SECOND browser engine, running ALONGSIDE Playwright.
+          //
+          // Nothing here replaces or demotes the Playwright path. `som` and `leadgen` were 18 of
+          // the last 30 production tasks and are the working half of Hive; swapping the engine
+          // under them would be rewriting what carries the traffic, on an engine that had not
+          // been installed. This adds a lane instead.
+          //
+          // WHAT IT IS GOOD FOR, and the reason it is worth a lane: agent-browser is a
+          // deterministic CDP command CLI (open / read / click / type / batch), not an
+          // LLM-in-the-loop. The AGENT is the caller. So it suits work where the page is not
+          // known ahead of time and no stable selector exists to write a spec against — which is
+          // exactly where the existing scrapers break when a site moves its markup.
+          //
+          // Auth stays a node property: it reads cookies from the same session file the
+          // Playwright lane already uses, so "runs in the user's authenticated, scoped, audited
+          // node" holds for this lane too rather than being re-earned.
+          const rawCommands = (task.config && task.config.commands) || task.prompt
+          const commands = Array.isArray(rawCommands)
+            ? rawCommands.filter(Boolean)
+            : String(rawCommands || '').split('\n').map(c => c.trim()).filter(Boolean)
+
+          if (!commands.length) {
+            reject(new Error(
+              'browser_agent requires config.commands (array) or a newline-separated prompt. ' +
+              'Each line is one agent-browser command, e.g. "open https://example.com" then "read".'
+            ))
+            return
+          }
+
+          // NODE VERSION: WARN, DO NOT BLOCK.
+          //
+          // agent-browser declares `node >=24`, and the first version of this executor rejected
+          // anything lower. Then I ran it on Node 22 and it drove a real browser fine — so the
+          // guard would have refused working nodes on the strength of a declared range that is
+          // more conservative than reality. A guard that invents a failure is worse than no
+          // guard: the task never runs and the log blames the node.
+          //
+          // So: say so once, and let the engine speak for itself. npm prints EBADENGINE, which is
+          // noisy but honest, and a genuine incompatibility still fails loudly with its own error.
+          const nodeMajor = parseInt(process.versions.node.split('.')[0], 10)
+          if (nodeMajor < 24) {
+            console.log(
+              `[executor] browser_agent: node ${process.versions.node} is below agent-browser's ` +
+              'declared >=24 — verified working on 22, proceeding. If it fails on an engine error, ' +
+              'that is the reason, and the Playwright lane is unchanged and still available.'
+            )
+          }
+
+          const version = process.env.AGENT_BROWSER_VERSION || 'latest'
+
+          // SEEDING AUTH: the two lanes do not speak the same session format, and finding that
+          // out required running it rather than reading it.
+          //
+          // BROWSER_SESSION_FILE is one of two things, set further up this file: a Chrome PROFILE
+          // DIRECTORY (extracted from a tar.gz credential), or a JSON file in Playwright's
+          // `storageState` shape — {cookies:[...], origins:[...]}. The first version of this
+          // executor handed either straight to `cookies set --curl`, on the assumption that its
+          // documented JSON auto-detection would cope. It does not: storageState returns
+          // "no cookies found in input", and because the seed runs inside a --bail batch, EVERY
+          // authenticated task would have failed at command one.
+          //
+          // agent-browser does accept a flat cookie array, so translate. The profile-directory
+          // case has no equivalent and is skipped with a reason rather than half-attempted.
+          const sessionFile = process.env.BROWSER_SESSION_FILE || (task.config && task.config.session_file)
+          const preamble = []
+          if (sessionFile && fs.existsSync(sessionFile)) {
+            if (fs.statSync(sessionFile).isDirectory()) {
+              console.log(
+                `[executor] browser_agent: ${sessionFile} is a Chrome profile directory, which this ` +
+                'lane cannot consume — running unauthenticated. Profile-backed targets belong in the ' +
+                'Playwright lane until this is wired.'
+              )
+            } else {
+              try {
+                const parsed = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
+                const cookies = Array.isArray(parsed) ? parsed : (parsed.cookies || [])
+                if (cookies.length) {
+                  const flat = path.join(workspace.dir, 'agent-browser-cookies.json')
+                  fs.writeFileSync(flat, JSON.stringify(cookies), 'utf-8')
+                  fs.chmodSync(flat, 0o600)
+                  preamble.push(`cookies set --curl ${JSON.stringify(flat)}`)
+                  console.log(`[executor] browser_agent: seeded ${cookies.length} cookie(s) from ${sessionFile}`)
+                } else {
+                  console.log(`[executor] browser_agent: ${sessionFile} carried no cookies — running unauthenticated`)
+                }
+              } catch (e) {
+                // A malformed session must not take the task with it; the target may not need auth.
+                console.log(`[executor] browser_agent: could not read session ${sessionFile} (${e.message}) — running unauthenticated`)
+              }
+            }
+          } else if (sessionFile) {
+            console.log(`[executor] browser_agent: session file ${sessionFile} not found — running unauthenticated`)
+          }
+
+          // --bail by default. The CLI's own default is "continue all", which for unattended
+          // automation means later steps run against a page that never loaded and the failure is
+          // reported several commands away from its cause.
+          const bail = (task.config && task.config.bail === false) ? [] : ['--bail']
+
+          // ORDERING: cookies need a page. `Network.setCookies` fails with "Invalid cookie
+          // fields" when no target is open — a message that says nothing about the real cause,
+          // and which I chased through three wrong theories (the sentinel `expires: -1`, then the
+          // sameSite value, then the field set) before noticing the only thing that had changed
+          // was running `close --all` first.
+          //
+          // So the seed goes AFTER an initial open, and the caller's own first command runs again
+          // afterwards so the page they asked for loads WITH the cookies rather than before them.
+          // Costs one extra navigation; the alternative is a lane that silently browses signed
+          // out, which is the failure this whole session keeps finding.
+          let batch
+          if (preamble.length && /^open\s+/i.test(commands[0] || '')) {
+            batch = [commands[0]].concat(preamble).concat(commands)
+          } else if (preamble.length) {
+            // No leading `open` to borrow. Seeding would fail on a cold browser, so skip it and
+            // say why rather than emitting a command that dies at step one.
+            console.log(
+              '[executor] browser_agent: session present but the first command is not an `open`, ' +
+              'so cookies cannot be seeded (they need a page). Start the command list with ' +
+              '`open <url>` on the target domain to run authenticated.'
+            )
+            batch = commands
+          } else {
+            batch = commands
+          }
+
+          console.log(`[executor] browser_agent: ${batch.length} command(s) via agent-browser@${version}`)
+
+          cmd = 'npx'
+          args = ['-y', `agent-browser@${version}`, 'batch'].concat(bail).concat(batch)
+          workspace.projectDir = workspace.dir
           break
         }
 
@@ -4056,24 +4410,21 @@ exit 1
           }).on('error', reject)
         })
 
-        // Phase 2: Decrypt if encrypted
-        if (config.encrypted && config.encryption_iv) {
-          try {
-            const configPath = path.join(os.homedir(), '.iris', 'config.json')
-            const nodeConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
-            const secret = nodeConfig.node_api_key || nodeConfig.api_key || ''
-            const key = crypto.createHash('sha256').update(secret).digest()
-            const iv = Buffer.from(config.encryption_iv, 'hex')
-            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv)
-
-            const encryptedData = fs.readFileSync(fullPath)
-            const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()])
-            fs.writeFileSync(fullPath, decrypted)
-            console.log(`[hive-inbox] Decrypted ${safeName} (${decrypted.length} bytes)`)
-          } catch (decryptErr) {
-            console.error(`[hive-inbox] Decryption failed for ${safeName}: ${decryptErr.message}`)
-            // Keep the encrypted file — better than losing data
-          }
+        // DUAL-READ (#177946 phase 3). Two on-the-wire formats coexist during the cutover:
+        //
+        //   ihw.v1  — envelope: per-transfer DEK, AES-256-GCM, DEK wrapped to THIS node's
+        //             registered key. Selected by config.envelope_version.
+        //   legacy  — AES-256-CBC under SHA-256(this node's own api key). Selected by
+        //             config.encryption_iv.
+        //
+        // Both branches must stay until every in-flight legacy transfer has expired — files TTL
+        // at 24h, text/links at 7d — because a sender on an older CLI keeps producing legacy
+        // blobs. Dropping the legacy branch early would make those undecryptable on arrival with
+        // no way to re-send them.
+        if (config.encrypted && config.envelope_version) {
+          decryptEnvelope(fullPath, safeName, config)
+        } else if (config.encrypted && config.encryption_iv) {
+          decryptLegacyCbc(fullPath, safeName, config)
         }
 
         const stat = fs.statSync(fullPath)
@@ -4475,4 +4826,219 @@ exit 1
   }
 }
 
-module.exports = { TaskExecutor }
+// =============================================================================================
+// Hive inbox decryption — #177946 phase 3
+// =============================================================================================
+
+const ENVELOPE_VERSION = 'ihw.v1'
+const RS = '\x1e'
+const US = '\x1f'
+
+/**
+ * The frozen ihw.v1 binding. LENGTH-PREFIXED, not joined.
+ *
+ * Must match fl-iris-api's EnvelopeCrypto::bind() and the CLI's envelope.ts byte for byte — this
+ * is the third implementation of the same 12 lines, which is unavoidable (the daemon is plain
+ * Node, separate from the bundled CLI) and is exactly why it is pinned by golden vectors on the
+ * other two sides.
+ *
+ * BYTE length, not string length: PHP's strlen() counts bytes, and JS String.length counts UTF-16
+ * code units. Using .length here would derive a different key for any non-ASCII id and surface
+ * only as "this file will not open".
+ */
+function envelopeBind(purpose, fields) {
+  const parts = [ENVELOPE_VERSION, purpose]
+  for (const value of fields) parts.push(`${Buffer.byteLength(value, 'utf8')}${US}${value}`)
+  return parts.join(RS)
+}
+
+/** This node's envelope keypair, written by `iris hive keys register`. */
+function loadEnvelopeKeypair() {
+  try {
+    const keyFile = path.join(os.homedir(), '.iris', 'keys', 'envelope.json')
+    if (!fs.existsSync(keyFile)) return null
+    const stored = JSON.parse(fs.readFileSync(keyFile, 'utf-8'))
+    return {
+      publicKey: Buffer.from(stored.public_key, 'base64'),
+      secretKey: Buffer.from(stored.secret_key, 'base64'),
+    }
+  } catch {
+    return null
+  }
+}
+
+const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex')
+const X25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex')
+
+/**
+ * Open an ihw.v1 envelope: fetch this node's wrap, unwrap the DEK, then open the content.
+ *
+ * On ANY failure the sealed bytes are preserved under `<name>.undecryptable` and the original
+ * name is left absent rather than holding ciphertext. Writing ciphertext under `report.pdf` — what
+ * the legacy branch did — makes an unopenable file indistinguishable from a corrupt one, and the
+ * only signal was a console line nobody tails (#178783).
+ */
+function decryptEnvelope(fullPath, safeName, config) {
+  const fail = (reason) => {
+    try {
+      fs.renameSync(fullPath, `${fullPath}.undecryptable`)
+    } catch {}
+    console.error(`[hive-inbox] ENVELOPE DECRYPT FAILED for ${safeName}: ${reason}`)
+    console.error(`[hive-inbox]   sealed bytes kept at ${safeName}.undecryptable — the original name is NOT a usable file`)
+  }
+
+  if (config.envelope_version !== ENVELOPE_VERSION) {
+    // A newer sender. Refusing beats guessing: a format we do not know is not one we can
+    // half-open, and the bytes are kept so a later daemon can.
+    return fail(`unknown envelope version '${config.envelope_version}' (this daemon speaks ${ENVELOPE_VERSION}) — upgrade the daemon`)
+  }
+
+  const kp = loadEnvelopeKeypair()
+  if (!kp) return fail('no envelope key on this node — run `iris hive keys register`')
+
+  const envelopeId = config.envelope_id
+  const targetId = config.envelope_target
+  if (!envelopeId || !targetId) return fail('task config is missing envelope_id or envelope_target')
+
+  try {
+    const wrap = fetchWrapSync(envelopeId, targetId)
+    if (!wrap) return fail(`no wrap recorded for ${targetId} on envelope ${envelopeId}`)
+
+    // Unwrap the DEK: X25519 -> HKDF-SHA256 -> AES-256-GCM.
+    const shared = crypto.diffieHellman({
+      privateKey: crypto.createPrivateKey({
+        key: Buffer.concat([X25519_PKCS8_PREFIX, kp.secretKey]),
+        format: 'der',
+        type: 'pkcs8',
+      }),
+      publicKey: crypto.createPublicKey({
+        key: Buffer.concat([X25519_SPKI_PREFIX, Buffer.from(wrap.eph_public, 'base64')]),
+        format: 'der',
+        type: 'spki',
+      }),
+    })
+
+    const info = envelopeBind('wrap', [
+      Buffer.from(wrap.eph_public, 'base64').toString('hex'),
+      kp.publicKey.toString('hex'),
+      envelopeId,
+      targetId,
+    ])
+    const wrapKey = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32))
+
+    const wrapDecipher = crypto.createDecipheriv('aes-256-gcm', wrapKey, Buffer.from(wrap.nonce, 'base64'), { authTagLength: 16 })
+    wrapDecipher.setAAD(Buffer.from(envelopeBind('wrap', [envelopeId, targetId]), 'utf8'))
+    wrapDecipher.setAuthTag(Buffer.from(wrap.tag, 'base64'))
+    const dek = Buffer.concat([
+      wrapDecipher.update(Buffer.from(wrap.wrapped_dek, 'base64')),
+      wrapDecipher.final(),
+    ])
+
+    // Open the content.
+    const decipher = crypto.createDecipheriv('aes-256-gcm', dek, Buffer.from(config.envelope_nonce, 'base64'), { authTagLength: 16 })
+    decipher.setAAD(Buffer.from(envelopeBind('content', [envelopeId]), 'utf8'))
+    decipher.setAuthTag(Buffer.from(config.envelope_tag, 'base64'))
+
+    const sealed = fs.readFileSync(fullPath)
+    const plaintext = Buffer.concat([decipher.update(sealed), decipher.final()])
+
+    fs.writeFileSync(fullPath, plaintext)
+    dek.fill(0)
+    wrapKey.fill(0)
+    shared.fill(0)
+
+    console.log(`[hive-inbox] Opened envelope ${safeName} (${plaintext.length} bytes, ${ENVELOPE_VERSION})`)
+  } catch (err) {
+    // A GCM tag failure here is UNAMBIGUOUS — wrong key, altered bytes, or a wrap belonging to a
+    // different transfer. Unlike CBC, there is no chance of "decrypting" to garbage that looks
+    // like success.
+    fail(err.message)
+  }
+}
+
+/** Fetch this node's wrap for an envelope. Synchronous by design — the caller is mid-download. */
+function fetchWrapSync(envelopeId, targetId) {
+  const { execFileSync } = require('child_process')
+  const configPath = path.join(os.homedir(), '.iris', 'config.json')
+  const nodeConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+  const token = nodeConfig.node_api_key || nodeConfig.api_key || ''
+  const base = process.env.IRIS_API_URL || 'https://freelabel.net'
+
+  const out = execFileSync('curl', [
+    '-sS', '--max-time', '15',
+    '-H', `Authorization: Bearer ${token}`,
+    `${base}/api/v6/hive/transfers/${encodeURIComponent(envelopeId)}/wraps/${encodeURIComponent(targetId)}`,
+  ], { encoding: 'utf-8' })
+
+  const body = JSON.parse(out)
+  return body && body.success ? body.wrap : null
+}
+
+/**
+ * LEGACY phase-2 path: AES-256-CBC under SHA-256(this node's own api key).
+ *
+ * Kept only until in-flight legacy transfers expire (files 24h, text/links 7d). Two properties
+ * make it unfit for PHI and unfixable in place: it only works when sender and receiver share one
+ * credential, and CBC is unauthenticated, so a wrong key is detected solely by PKCS#7 padding —
+ * which is coincidentally valid about 1 time in 256. In that case final() does NOT throw and the
+ * daemon writes GARBAGE over the file while logging success (#178783). Nothing can fix that
+ * without AEAD, which is what ihw.v1 provides.
+ */
+function decryptLegacyCbc(fullPath, safeName, config) {
+  try {
+    const configPath = path.join(os.homedir(), '.iris', 'config.json')
+    const nodeConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+    const secret = nodeConfig.node_api_key || nodeConfig.api_key || ''
+    const key = crypto.createHash('sha256').update(secret).digest()
+    const iv = Buffer.from(config.encryption_iv, 'hex')
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv)
+
+    const encryptedData = fs.readFileSync(fullPath)
+    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()])
+    fs.writeFileSync(fullPath, decrypted)
+    console.log(`[hive-inbox] Decrypted ${safeName} (${decrypted.length} bytes, legacy CBC)`)
+  } catch (decryptErr) {
+    // Was: keep the ciphertext under the ORIGINAL filename with only a console line. That makes
+    // an unreadable file look like a corrupt one to whoever opens it. Renamed instead, so the
+    // absence of the expected file is itself the signal (#178783).
+    try {
+      fs.renameSync(fullPath, `${fullPath}.undecryptable`)
+    } catch {}
+    console.error(`[hive-inbox] LEGACY DECRYPT FAILED for ${safeName}: ${decryptErr.message}`)
+    console.error(`[hive-inbox]   ciphertext kept at ${safeName}.undecryptable — likely a sender on a different api key`)
+  }
+}
+
+/**
+ * Pure envelope math, exported for testing.
+ *
+ * This daemon is the THIRD implementation of ihw.v1 (after PHP's EnvelopeCrypto and the CLI's
+ * envelope.ts) and cannot be merged with either — it is plain Node, separate from the bundled
+ * CLI. Three copies of a frozen format is exactly where drift happens, and drift here does not
+ * throw: it produces files the recipient silently cannot open. So the pure parts are exported and
+ * pinned against a PHP-produced golden vector in tests/envelope-vector.test.js.
+ */
+function openEnvelopeBuffers({ ephPublic, wrapNonce, wrappedDek, wrapTag, recipientSecret, recipientPublic, envelopeId, targetId, contentNonce, contentTag, sealed }) {
+  const shared = crypto.diffieHellman({
+    privateKey: crypto.createPrivateKey({ key: Buffer.concat([X25519_PKCS8_PREFIX, recipientSecret]), format: 'der', type: 'pkcs8' }),
+    publicKey: crypto.createPublicKey({ key: Buffer.concat([X25519_SPKI_PREFIX, ephPublic]), format: 'der', type: 'spki' }),
+  })
+
+  const info = envelopeBind('wrap', [ephPublic.toString('hex'), recipientPublic.toString('hex'), envelopeId, targetId])
+  const wrapKey = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32))
+
+  const wd = crypto.createDecipheriv('aes-256-gcm', wrapKey, wrapNonce, { authTagLength: 16 })
+  wd.setAAD(Buffer.from(envelopeBind('wrap', [envelopeId, targetId]), 'utf8'))
+  wd.setAuthTag(wrapTag)
+  const dek = Buffer.concat([wd.update(wrappedDek), wd.final()])
+
+  if (!sealed) return { dek, plaintext: null }
+
+  const cd = crypto.createDecipheriv('aes-256-gcm', dek, contentNonce, { authTagLength: 16 })
+  cd.setAAD(Buffer.from(envelopeBind('content', [envelopeId]), 'utf8'))
+  cd.setAuthTag(contentTag)
+
+  return { dek, plaintext: Buffer.concat([cd.update(sealed), cd.final()]) }
+}
+
+module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION }

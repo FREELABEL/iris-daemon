@@ -149,6 +149,12 @@ describe('execute-script endpoint', () => {
   })
 
   afterEach(() => {
+    // closeAllConnections() BEFORE close(): server.close() stops accepting but WAITS for open
+    // connections, and on Node 19+ http.globalAgent defaults to keepAlive:true. Defensive —
+    // this was NOT the cause of the exit hang investigated on 2026-08-23 (that was an
+    // un-unref'd 6-hourly setInterval in the TaskExecutor constructor), but leaving a keep-alive
+    // socket pinned to a closed-over server is a real leak and cheap to close properly.
+    server.closeAllConnections?.()
     server.close()
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
