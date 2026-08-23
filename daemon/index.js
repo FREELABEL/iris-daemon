@@ -2252,15 +2252,22 @@ LIMIT ${limit}
   _registerMeshRoutes (app, prefix) {
     if (!this.meshAuth || !this.meshRegistry) return
 
+    // Two auth tiers (see mesh-auth.js). meshProtect = a paired peer's X-Mesh-Key; every peer
+    // read/write passes it. operatorProtect = the local X-Bridge-Key; only the machine operator
+    // may mint invites or mutate the registry. The mesh HTTP surface is exempt from the bridge's
+    // global bridgeAuth (openPrefixes '/daemon/mesh/'), so EVERY route below must carry its own
+    // gate — an ungated one is wide open the moment the listener binds routably (#182079).
     const meshProtect = this.meshAuth.middleware()
+    const operatorProtect = this.meshAuth.operatorMiddleware()
 
-    // ── Discovery & Registry (unprotected) ──────────────────────
+    // ── Discovery & Registry ────────────────────────────────────
+    // Read = paired peers (topology is not public). Mutation = operator only.
 
-    app.get(`${prefix}/mesh/peers`, (req, res) => {
+    app.get(`${prefix}/mesh/peers`, meshProtect, (req, res) => {
       res.json({ peers: this.meshRegistry.getAllPeers(), node: this.nodeName })
     })
 
-    app.post(`${prefix}/mesh/peers`, (req, res) => {
+    app.post(`${prefix}/mesh/peers`, operatorProtect, (req, res) => {
       const { host, port, psk } = req.body || {}
       if (!host) return res.status(400).json({ error: 'host required' })
       const peer = this.meshRegistry.addPeer(host, host, port || 3200, 'manual')
@@ -2268,14 +2275,17 @@ LIMIT ${limit}
       res.json({ peer })
     })
 
-    app.delete(`${prefix}/mesh/peers/:name`, (req, res) => {
+    app.delete(`${prefix}/mesh/peers/:name`, operatorProtect, (req, res) => {
       this.meshRegistry.removePeer(req.params.name)
       res.json({ ok: true })
     })
 
-    // ── Auth / Pairing (unprotected) ────────────────────────────
+    // ── Auth / Pairing ──────────────────────────────────────────
+    // /invite is the credential factory — operator only (#182092). /pair is authenticated by the
+    // invite CODE itself (a single-use, 5-min bearer secret the operator hands over out-of-band);
+    // the joining peer holds neither the bridge token nor a PSK yet, so it cannot carry either.
 
-    app.post(`${prefix}/mesh/invite`, (req, res) => {
+    app.post(`${prefix}/mesh/invite`, operatorProtect, (req, res) => {
       const invite = this.meshAuth.generateInvite()
       res.json(invite)
     })
@@ -2327,7 +2337,7 @@ LIMIT ${limit}
       }
     })
 
-    app.get(`${prefix}/mesh/task/:id/status`, (req, res) => {
+    app.get(`${prefix}/mesh/task/:id/status`, meshProtect, (req, res) => {
       const status = this.meshDispatch.getTaskStatus(req.params.id)
       if (!status) return res.status(404).json({ error: 'Task not found' })
       res.json(status)
@@ -2342,12 +2352,12 @@ LIMIT ${limit}
       res.json({ ok: true })
     })
 
-    app.get(`${prefix}/mesh/chat`, (req, res) => {
+    app.get(`${prefix}/mesh/chat`, meshProtect, (req, res) => {
       const { since, peer } = req.query
       res.json({ messages: this.meshChat.getMessages({ since, peer }), node: this.nodeName })
     })
 
-    app.get(`${prefix}/mesh/chat/poll`, async (req, res) => {
+    app.get(`${prefix}/mesh/chat/poll`, meshProtect, async (req, res) => {
       const msg = await this.meshChat.waitForMessage(30000)
       if (msg) {
         res.json({ message: msg })
@@ -2356,16 +2366,22 @@ LIMIT ${limit}
       }
     })
 
-    // ── Energy Alerts (protected receive, public read) ──────────
+    // ── Energy Alerts ───────────────────────────────────────────
+    // Both receive and read are paired-peer only — an energy telemetry read is still mesh state.
 
     app.post(`${prefix}/mesh/energy`, meshProtect, (req, res) => {
       this.meshEnergy.receiveAlert(req.body || {})
       res.json({ ok: true })
     })
 
-    app.get(`${prefix}/mesh/energy`, (req, res) => {
+    app.get(`${prefix}/mesh/energy`, meshProtect, (req, res) => {
       res.json({ alerts: this.meshEnergy.getAlerts() })
     })
+
+    // Visibility for the operator: what the mesh surface is, and where it binds. When bound
+    // routably this line is the one-glance confirmation that the surface is gated (#182079).
+    const bindHost = require('./mesh-discovery').bridgeBindHost()
+    console.log(`[mesh] routes registered on ${prefix}/mesh/* — invite+registry gated by X-Bridge-Key (operator), all peer ops+reads by X-Mesh-Key; bind=${bindHost}`)
   }
 
   // Returns the primary local (LAN) IP address of this machine.
