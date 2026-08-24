@@ -139,6 +139,7 @@ function createSecurityTestServer (tokenPath) {
   // --- Routes: protected ---
   app.post('/api/sessions/claude-code', (req, res) => res.json({ session: 'new' }))
   app.get('/api/imessage/conversations', (req, res) => res.json({ conversations: [] }))
+  app.get('/api/imessage/mentions', (req, res) => res.json({ mentions: [] })) // #182121
   app.post('/api/imessage/send', (req, res) => res.json({ sent: true }))
   app.get('/api/mail/search', (req, res) => res.json({ emails: [] }))
   app.post('/api/mail/send', (req, res) => res.json({ sent: true }))
@@ -293,6 +294,7 @@ describe('bridge auth middleware (E2E)', () => {
   const protectedEndpoints = [
     { method: 'POST', path: '/api/sessions/claude-code', body: {} },
     { method: 'GET', path: '/api/imessage/conversations' },
+    { method: 'GET', path: '/api/imessage/mentions' }, // #182121
     { method: 'POST', path: '/api/imessage/send', body: { to: 'test', message: 'hi' } },
     { method: 'GET', path: '/api/mail/search?from=test' },
     { method: 'POST', path: '/api/mail/send', body: { to: 'test@test.com' } },

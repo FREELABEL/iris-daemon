@@ -147,6 +147,11 @@ const PROVIDERS = {
       list_conversations: { method: 'GET', path: '/api/imessage/conversations' },
       search_messages: { method: 'GET', path: '/api/imessage/search' },
       resolve_handle: { method: 'GET', path: '/api/imessage/resolve' },
+      // #182121 — live read of THIS node's local @heyiris mentions log. Secondary to
+      // the cross-machine Atlas dataset (#182118): useful for "what has this specific
+      // laptop captured right now", not the primary aggregation path (it fails
+      // whenever the node is offline, which is exactly what the cloud push solves).
+      get_mentions: { method: 'GET', path: '/api/imessage/mentions' },
       // WRITE. Reaches a real person's phone, so it exists only on an explicit call —
       // never on a schedule, and never from the always-on reply channel (#137256).
       send_message: { method: 'POST', path: '/api/imessage/direct-send' },

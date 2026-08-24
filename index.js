@@ -1748,6 +1748,53 @@ app.get('/api/imessage/conversations', async (req, res) => {
 })
 
 /**
+ * GET /api/imessage/mentions — #182121 (stretch, secondary to #182118/#182119).
+ *
+ * Reads THIS node's local ~/.iris/mentions/*.jsonl — the same file _logMentionLocally()
+ * writes and the CLI's `--local` mode reads. Cross-machine aggregation is the Atlas
+ * dataset (#182118); this exists for the case that dataset can't answer: "what has THIS
+ * specific laptop captured RIGHT NOW", live, unfiltered by whatever has or hasn't
+ * synced to the cloud yet. A live per-node read is strictly worse as the PRIMARY
+ * mechanism — it fails whenever the node is asleep, which is exactly the case the
+ * cloud-push design exists to solve — so this is a debugging tool, not a replacement.
+ */
+app.get('/api/imessage/mentions', (req, res) => {
+  const os = require('os')
+  const mentionsDir = path.join(os.homedir(), '.iris', 'mentions')
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days || '30', 10)))
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10)))
+
+  if (!fs.existsSync(mentionsDir)) {
+    return res.json({ mentions: [], count: 0, source: 'local-file' })
+  }
+
+  try {
+    const cutoff = new Date(Date.now() - days * 86400 * 1000)
+    const files = fs.readdirSync(mentionsDir)
+      .filter((f) => f.endsWith('.jsonl'))
+      .sort()
+      .filter((f) => new Date(f.replace('.jsonl', '')) >= cutoff)
+
+    let mentions = []
+    for (const file of files) {
+      const lines = fs.readFileSync(path.join(mentionsDir, file), 'utf-8').split('\n').filter(Boolean)
+      for (const line of lines) {
+        try { mentions.push(JSON.parse(line)) } catch { /* skip a malformed line */ }
+      }
+    }
+
+    mentions = mentions.filter((m) => new Date(m.ts).getTime() >= cutoff.getTime())
+    mentions.sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime())
+    mentions = mentions.slice(0, limit)
+
+    res.json({ mentions, count: mentions.length, source: 'local-file' })
+  } catch (err) {
+    console.error(`[imessage/mentions] ${err.message}`)
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/imessage/direct-send
  * Send an iMessage by chat GUID or phone/email handle.
  * Body: { chat_guid?: string, handle?: string, text: string }
