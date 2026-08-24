@@ -207,11 +207,15 @@ class Daemon {
       ensureChromiumInstalled({ background: true })
     }
 
-    // Step 4: Start A2A HTTP server
-    await this.startA2AServer()
-
-    // Step 4b: Start mesh networking (offline/LAN peer-to-peer)
+    // Step 4: Start mesh networking FIRST so meshAuth/meshRegistry exist before the A2A server
+    // registers the mesh routes. startA2AServer() calls _registerMeshRoutes(), which early-returns
+    // when meshAuth is null — registering before mesh init left the whole mesh HTTP surface
+    // unmounted (every /daemon/mesh/* 404'd, not 403'd) regardless of bind or auth (#182108).
+    // _startMesh() depends only on env + objects built in the constructor, not on the HTTP server.
     this._startMesh()
+
+    // Step 4b: Start A2A HTTP server (now mounts the mesh routes, since mesh objects exist)
+    await this.startA2AServer()
 
     // Step 5: Start heartbeat loop (with capacity + status + session reporting)
     this.heartbeat = new Heartbeat(this.cloud, 30000)
@@ -2250,7 +2254,14 @@ LIMIT ${limit}
    * Called from startA2AServer() with the Express app and prefix.
    */
   _registerMeshRoutes (app, prefix) {
-    if (!this.meshAuth || !this.meshRegistry) return
+    if (!this.meshAuth || !this.meshRegistry) {
+      // Visible, not silent. A bare `return` here turned a startup-ordering bug into a mesh
+      // surface that never mounted and never said why (#182108) — the same failure family as
+      // advertising on loopback and the A2A false-green. If this ever logs, mesh init has not
+      // run before route registration.
+      console.warn('[mesh] routes NOT registered — mesh not initialised before startA2AServer (ordering bug); mesh HTTP surface will be absent')
+      return
+    }
 
     // Two auth tiers (see mesh-auth.js). meshProtect = a paired peer's X-Mesh-Key; every peer
     // read/write passes it. operatorProtect = the local X-Bridge-Key; only the machine operator
