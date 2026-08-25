@@ -4069,7 +4069,7 @@ exit 1
         }
 
         if (tmuxSession) {
-          const { sessionName, outputFile, exitFile, channel } = tmuxSession
+          const { sessionName, outputFile, exitFile, channel, stdoutFile, stderrFile } = tmuxSession
           this.runningTasks.set(task.id, { sessionName, tmux: true, _startedAt: Date.now(), _taskTitle: task.title || task.type, _taskType: task.type })
 
           // Stream output from pipe-pane log file
@@ -4109,13 +4109,39 @@ exit 1
               // Store exit code for ledger (read in finally block)
               const entry = this.runningTasks.get(task.id)
               if (entry) entry._exitCode = exitCode
-              // Final output read
-              const { lines: finalLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
-              if (finalLines.length > 0) outputLines.push(...finalLines)
-              if (exitCode === 0 || isGraceful) {
-                resolve({ exitCode })
+              // THE RESULT COMES FROM THE REDIRECTED FILES, not the pipe-pane log.
+              //
+              // pipe-pane records a TERMINAL: stdout and stderr are merged by the pty before
+              // anything downstream can separate them, so a caller could not tell an error
+              // from a result (#182004). The wrapper now redirects the real streams to two
+              // files; those are the result. The pipe-pane log stays for the live view, which
+              // is what it is actually good for.
+              let stdout = ''
+              let stderr = ''
+              try { if (stdoutFile && fs.existsSync(stdoutFile)) stdout = fs.readFileSync(stdoutFile, 'utf-8') } catch { /* fall back below */ }
+              try { if (stderrFile && fs.existsSync(stderrFile)) stderr = fs.readFileSync(stderrFile, 'utf-8') } catch { /* fall back below */ }
+
+              if (stdout === '' && stderr === '') {
+                // No redirect files (an older session, or a swarm pane): fall back to the
+                // scrape so nothing regresses — but the streams are merged and it is worse.
+                const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
+                if (finalLines.length > 0) outputLines.push(...finalLines)
               } else {
-                reject(new Error(`Process exited with code ${exitCode}`))
+                outputLines.length = 0
+                if (stdout) outputLines.push(...stdout.replace(/\n$/, '').split('\n'))
+              }
+
+              if (exitCode === 0 || isGraceful) {
+                resolve({ exitCode, stdout, stderr })
+              } else {
+                // Carry the code and BOTH streams on the failure path too. Rejecting with only
+                // a message is what forced the CLI to parse "Process exited with code N" out of
+                // English prose — the exit code was lost precisely when it mattered most.
+                const err = new Error(`Process exited with code ${exitCode}`)
+                err.exitCode = exitCode
+                err.stdout = stdout
+                err.stderr = stderr
+                reject(err)
               }
             })
             .catch(err => {

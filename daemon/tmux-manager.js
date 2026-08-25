@@ -138,6 +138,10 @@ class TmuxManager {
     const sessionName = this._sessionName(task)
     const outputFile = path.join(LOG_DIR, `${sessionName}.log`)
     const exitFile = path.join(EXIT_DIR, `${sessionName}.exit`)
+    // Real stdout/stderr, redirected by the wrapper. See _buildWrappedCommand: the pipe-pane
+    // log is a TERMINAL RECORDING and is the wrong thing to return as a program's output.
+    const stdoutFile = path.join(LOG_DIR, `${sessionName}.stdout`)
+    const stderrFile = path.join(LOG_DIR, `${sessionName}.stderr`)
     const channel = `${sessionName}-done`
     const startChannel = `${sessionName}-start`
 
@@ -153,7 +157,7 @@ class TmuxManager {
 
     // Build the full command string for tmux
     // Wrap in bash to capture exit code + signal wait-for channel
-    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel, startChannel)
+    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile)
 
     // Build -e flags so env vars land in the process's environment at spawn
     // time (see below for why this can't use set-environment after the fact).
@@ -211,7 +215,7 @@ class TmuxManager {
     this._appendLedger(record)
 
     console.log(`[tmux] Created session: ${sessionName} [${source}] (${cmd} ${(args || []).slice(0, 2).join(' ')}...)`)
-    return { sessionName, outputFile, exitFile, channel }
+    return { sessionName, outputFile, exitFile, channel, stdoutFile, stderrFile }
   }
 
   /**
@@ -223,11 +227,26 @@ class TmuxManager {
    *   once pipe-pane is attached, so no output can be produced (and lost)
    *   before the log capture is listening (#182004).
    */
-  _buildWrappedCommand (cmd, args, exitFile, channel, startChannel) {
+  _buildWrappedCommand (cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile) {
     const escapedCmd = this._shellEscape(cmd)
     const escapedArgs = (args || []).map(a => this._shellEscape(a)).join(' ')
     const escapedExitFile = this._shellEscape(exitFile)
     const waitForStart = startChannel ? `tmux -L ${SOCKET} wait-for ${startChannel}; ` : ''
+
+    // REDIRECT THE REAL STREAMS TO FILES.
+    //
+    // The pipe-pane log was the only thing a caller could read, and a pipe-pane log is a
+    // recording of a TERMINAL, not of a program: stdout and stderr are already merged by the
+    // pty before anything downstream can separate them, so a caller could not tell an error
+    // message from a result (#182004). `iris hive selftest` scored that assertion FAIL on a
+    // live node while every marker was present — the bytes arrived, the structure did not.
+    //
+    // Redirecting to two files gives the ordinary, boring, correct thing every other runner
+    // has: separated streams. pipe-pane stays, because a live terminal view is what it is
+    // genuinely good for — it is just no longer the RESULT channel.
+    const redirect = (stdoutFile && stderrFile)
+      ? ` > ${this._shellEscape(stdoutFile)} 2> ${this._shellEscape(stderrFile)}`
+      : ''
 
     // The wrapper:
     // 0. Blocks until the caller signals startChannel (see above)
@@ -235,7 +254,7 @@ class TmuxManager {
     // 2. Captures $? to exit file
     // 3. Signals the wait-for channel
     // 4. Exits the pane (which kills the session if it's the only pane)
-    return `${waitForStart}${escapedCmd} ${escapedArgs}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
+    return `${waitForStart}${escapedCmd} ${escapedArgs}${redirect}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
   }
 
   /**
