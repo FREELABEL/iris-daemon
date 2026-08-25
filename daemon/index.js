@@ -140,6 +140,7 @@ class Daemon {
     // machine ("AlexMaysnow1063" vs "alex-mayo-bisnow"), dead-ending the first call (#182368).
     // Best-effort: a machine off the tailnet advertises nothing and behaves exactly as before.
     const tailscaleIp = await detectTailscaleIp()
+    this.tailscaleIp = tailscaleIp
     if (tailscaleIp) console.log(`[daemon] Tailnet address: ${tailscaleIp}`)
 
     const heartbeatResult = await this.cloud.sendHeartbeat({
@@ -241,6 +242,13 @@ class Daemon {
     this.heartbeat = new Heartbeat(this.cloud, 30000)
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
+      // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup
+      // meant a hub that was mid-deploy when this node registered simply dropped it, and
+      // nothing re-offered it until the next daemon restart — the node would sit there
+      // advertising nothing while believing it had reported (#182368). Measured exactly
+      // that way: the daemon logged "Tailnet address: 100.114.214.29" and the hub had no
+      // record of it. It is a cached string; re-sending costs nothing.
+      ...(this.tailscaleIp ? { tailscale_ip: this.tailscaleIp } : {}),
       paused: this.paused,
       pause_reason: this.pauseReason,
       active_sessions: this._getLocalSessions(),
