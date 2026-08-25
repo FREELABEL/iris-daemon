@@ -139,6 +139,15 @@ class Daemon {
     this.nodeId = heartbeatResult.node_id
     this._persistNodeId(this.nodeId)
 
+    // Give the EXECUTOR its identity too. task-executor.js declares nodeId/nodeName and never
+    // assigned them, so every result it stamped carried executed_by_node_id: null — the field
+    // existed, the plumbing worked, and the value was always empty. A stamp that is reliably
+    // null is worse than no stamp: it looks like an answer (#182312).
+    if (this.executor) {
+      this.executor.nodeId = this.nodeId
+      this.executor.nodeName = this.nodeName
+    }
+
     console.log(`[daemon] Node registered: ${this.nodeId}`)
     console.log(`[daemon] Name: ${this.nodeName}`)
     console.log(`[daemon] User: ${heartbeatResult.user_id ?? 'unknown'}`)

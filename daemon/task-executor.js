@@ -1392,6 +1392,10 @@ class TaskExecutor {
       // Submit result (truncate output to avoid oversized payloads that lose the status field)
       const fullOutput = outputLines.join('\n')
       const MAX_OUTPUT = 50000 // 50KB max
+      const cap = (v) => {
+        if (typeof v !== 'string' || v === '') return v === '' ? '' : undefined
+        return v.length > MAX_OUTPUT ? '... (truncated) ...\n' + v.slice(-MAX_OUTPUT) : v
+      }
       const truncatedOutput = fullOutput.length > MAX_OUTPUT
         ? '... (truncated) ...\n' + fullOutput.slice(-MAX_OUTPUT)
         : fullOutput
@@ -1450,6 +1454,12 @@ class TaskExecutor {
         // `final.result.exit_code`, sitting alongside output/duration_ms —
         // metadata.exit_code alone was invisible to it (#181633).
         exit_code: result.exitCode,
+        // The SEPARATED streams, alongside the merged `output` that older callers still read.
+        // Both execution paths (tmux-with-redirect and direct spawn) now resolve these; sending
+        // only the merged field is what made "a caller cannot tell an error from a result" true
+        // no matter how carefully the node kept them apart (#182004).
+        stdout: cap(result.stdout),
+        stderr: cap(result.stderr),
         metadata: {
           // WHICH MACHINE ACTUALLY RAN THIS (#182312). A task dispatched to one node executed
           // on another, and nothing in the result said so — three selftest runs scored 6/8,
@@ -4172,6 +4182,10 @@ exit 1
         }
       }
 
+      // Separate buffers. outputLines is a caller-owned param that interleaves both streams;
+      // these keep the split the OS already gave us so the result can carry it.
+      const stdoutLines = []
+      const stderrLines = []
       // ── Direct spawn path (fallback when tmux unavailable) ──
       const child = spawn(cmd, args, {
         cwd: workspace.projectDir,
@@ -4194,6 +4208,12 @@ exit 1
 
       child.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
+        // Kept separately as well as in outputLines. The OS hands us two streams and this used
+        // to concatenate them into one array with a "[stderr] " prefix — the same defect as the
+        // PTY scrape, one layer up, and the reason `hive selftest` still scored
+        // "stdout and stderr come back as separate streams" FAIL even on the clean spawn path.
+        // A caller cannot tell an error from a result by grepping for a prefix we invented.
+        stdoutLines.push(...lines)
         outputLines.push(...lines)
         lines.forEach((line) => {
           if (line.trim()) {
@@ -4204,6 +4224,7 @@ exit 1
 
       child.stderr.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
+        stderrLines.push(...lines)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
         lines.forEach((line) => {
           if (line.trim()) {
@@ -4227,9 +4248,15 @@ exit 1
       child.on('close', (code) => {
         clearTimeout(timer)
         if (code === 0 || isGraceful) {
-          resolve({ exitCode: code || 0 })
+          resolve({ exitCode: code || 0, stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') })
         } else {
-          reject(new Error(`Process exited with code ${code}`))
+          {
+            const err = new Error(`Process exited with code ${code}`)
+            err.exitCode = code
+            err.stdout = stdoutLines.join('\n')
+            err.stderr = stderrLines.join('\n')
+            reject(err)
+          }
         }
       })
 
@@ -4295,6 +4322,10 @@ exit 1
 
       console.log(`[executor] Runtime ${runtime}: ${cmd} ${args.slice(0, 2).join(' ')}...`)
 
+      // Separate buffers. outputLines is a caller-owned param that interleaves both streams;
+      // these keep the split the OS already gave us so the result can carry it.
+      const stdoutLines = []
+      const stderrLines = []
       const irisPathRuntime = path.join(os.homedir(), '.iris', 'bin')
       const child = spawn(cmd, args, {
         cwd: workspace.projectDir,
@@ -4317,6 +4348,12 @@ exit 1
 
       child.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
+        // Kept separately as well as in outputLines. The OS hands us two streams and this used
+        // to concatenate them into one array with a "[stderr] " prefix — the same defect as the
+        // PTY scrape, one layer up, and the reason `hive selftest` still scored
+        // "stdout and stderr come back as separate streams" FAIL even on the clean spawn path.
+        // A caller cannot tell an error from a result by grepping for a prefix we invented.
+        stdoutLines.push(...lines)
         outputLines.push(...lines)
         lines.forEach((line) => {
           if (line.trim()) {
@@ -4327,6 +4364,7 @@ exit 1
 
       child.stderr.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
+        stderrLines.push(...lines)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
         lines.forEach((line) => {
           if (line.trim()) {
