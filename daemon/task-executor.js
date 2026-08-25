@@ -1651,6 +1651,13 @@ class TaskExecutor {
         output: outputLines.join('\n'),
         duration_ms: Date.now() - startTime,
         exit_code: exitCode,
+        // The separated streams on the FAILURE path too. runProcess attaches them to the
+        // rejection precisely so they survive it. Sending them only on success is how the
+        // exit code was lost before (#181633) and it fails the same way here: a non-zero exit
+        // is exactly when a caller needs stderr, and `hive selftest` exits 42 by design, so
+        // EVERY acceptance run takes this branch.
+        stdout: typeof err.stdout === 'string' ? err.stdout : undefined,
+        stderr: typeof err.stderr === 'string' ? err.stderr : undefined,
         metadata: {
           exit_code: exitCode,
           executed_by_node_id: this.nodeId ?? null,
@@ -4151,6 +4158,12 @@ exit 1
               } else {
                 outputLines.length = 0
                 if (stdout) outputLines.push(...stdout.replace(/\n$/, '').split('\n'))
+                // stderr belongs in the merged `output` too. It is the legacy field and it has
+                // always meant "everything the run printed" — dropping stderr from it to make
+                // the separated field clean would silently lose error text for every existing
+                // reader. The separated `stderr` is what callers should use; this keeps the old
+                // contract intact rather than trading one silent loss for another.
+                if (stderr) outputLines.push(...stderr.replace(/\n$/, '').split('\n').map((l) => `[stderr] ${l}`))
               }
 
               if (exitCode === 0 || isGraceful) {
