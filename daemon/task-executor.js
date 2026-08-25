@@ -1451,6 +1451,14 @@ class TaskExecutor {
         // metadata.exit_code alone was invisible to it (#181633).
         exit_code: result.exitCode,
         metadata: {
+          // WHICH MACHINE ACTUALLY RAN THIS (#182312). A task dispatched to one node executed
+          // on another, and nothing in the result said so — three selftest runs scored 6/8,
+          // 0/1 and 4/8 before anyone noticed two of those numbers described different
+          // computers. Stamping the executor turns a silent mis-route into something a caller
+          // can assert on, which is the difference between a bug found in one command and one
+          // found in a client's data.
+          executed_by_node_id: this.nodeId ?? null,
+          executed_by_node_name: this.nodeName ?? null,
           exit_code: result.exitCode,
           ...(taskStatus !== wireStatus ? { internal_status: taskStatus } : {}),
         },
@@ -1633,7 +1641,11 @@ class TaskExecutor {
         output: outputLines.join('\n'),
         duration_ms: Date.now() - startTime,
         exit_code: exitCode,
-        metadata: { exit_code: exitCode }
+        metadata: {
+          exit_code: exitCode,
+          executed_by_node_id: this.nodeId ?? null,
+          executed_by_node_name: this.nodeName ?? null,
+        }
       })
 
       console.error(`[executor] [${ts()}] Task ${taskId} failed: ${err.message}`)

@@ -137,6 +137,7 @@ class Daemon {
       hardware_profile: this.hardwareProfile
     })
     this.nodeId = heartbeatResult.node_id
+    this._persistNodeId(this.nodeId)
 
     console.log(`[daemon] Node registered: ${this.nodeId}`)
     console.log(`[daemon] Name: ${this.nodeName}`)
@@ -337,6 +338,36 @@ class Daemon {
         }
       }
     } catch { /* no config file yet */ }
+  }
+
+  /**
+   * Write this daemon's own node id to ~/.iris/config.json.
+   *
+   * It was only ever held in memory, so `config.json` on this machine had no `node_id` at all
+   * while MacBookPro's did — and a daemon that cannot say which node it is cannot refuse work
+   * addressed to a different one. Measured 2026-08-24: a task dispatched to MacBookPro
+   * executed here instead (#182312). Persisting it also means anything else that reads the
+   * config (the CLI, a support dump, the next restart) agrees with the hub about who this is.
+   */
+  _persistNodeId (nodeId) {
+    if (!nodeId) return
+    try {
+      let config = {}
+      if (fs.existsSync(CONFIG_FILE)) {
+        config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
+      }
+      if (config.node_id === nodeId) return
+      const previous = config.node_id
+      config.node_id = nodeId
+      const dir = path.dirname(CONFIG_FILE)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
+      console.log(previous
+        ? `[daemon] node_id changed in config: ${previous} -> ${nodeId}`
+        : `[daemon] node_id persisted to config: ${nodeId}`)
+    } catch (err) {
+      console.error('[daemon] Failed to persist node_id:', err.message)
+    }
   }
 
   _savePauseState () {
@@ -1965,6 +1996,43 @@ LIMIT ${limit}
         }
       } else {
         console.log(`[daemon] Accepted task: ${event.task_id}`)
+      }
+
+      // ── REFUSE WORK ADDRESSED TO A DIFFERENT MACHINE (#182312) ──────────────────
+      //
+      // Measured 2026-08-24: a task dispatched to MacBookPro executed here. The whole value
+      // of the Hive is "route it to the machine that HAS something" — a permission, a file, a
+      // signed-in browser — and a task that lands elsewhere does not error, it returns an
+      // EMPTY result, which is a legitimate-looking answer to most queries.
+      //
+      // The daemon knows the answer, so it checks rather than trusting delivery. If we do not
+      // know our own id we refuse too, and say so: a daemon that cannot tell whether the work
+      // is addressed to it should idle loudly, never guess.
+      const targetNodeId = task?.node_id ?? task?.node?.id ?? null
+      if (targetNodeId) {
+        if (!this.nodeId) {
+          console.error(`[daemon] REFUSING task ${event.task_id} — this daemon does not know its own node_id, so it cannot tell whether the task is addressed to it (#182312)`)
+          this.pendingTaskIds.delete(event.task_id)
+          try {
+            await this.cloud.submitResult(event.task_id, {
+              status: 'failed',
+              error: 'Node identity unknown — refusing work rather than running it on an unverified machine (#182312)'
+            })
+          } catch { /* best effort */ }
+          return
+        }
+        if (String(targetNodeId) !== String(this.nodeId)) {
+          console.error(`[daemon] REFUSING task ${event.task_id} — addressed to node ${targetNodeId}, this is ${this.nodeId} (#182312)`)
+          this.pendingTaskIds.delete(event.task_id)
+          this.recentlyRejectedTasks.set(event.task_id, Date.now())
+          try {
+            await this.cloud.submitResult(event.task_id, {
+              status: 'failed',
+              error: `Task addressed to node ${targetNodeId} but reached node ${this.nodeId}. Refused — running it here would answer from the wrong machine (#182312).`
+            })
+          } catch { /* best effort */ }
+          return
+        }
       }
 
       // Tag source for tmux ledger tracking
