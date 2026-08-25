@@ -24,6 +24,7 @@ const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
 const { Heartbeat } = require('./heartbeat')
+const { detectTailscaleIp } = require('./tailscale-address')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
@@ -133,8 +134,17 @@ class Daemon {
 
     // Step 1: Authenticate with cloud and register as online
     console.log('[daemon] Authenticating with cloud...')
+    // Tell the hub where this machine is reachable on the tailnet, so `hive fs` / `hive vault`
+    // can resolve it from a FACT rather than by matching its Hive name against tailnet peer
+    // names. Those names are chosen independently and the match fails outright for this very
+    // machine ("AlexMaysnow1063" vs "alex-mayo-bisnow"), dead-ending the first call (#182368).
+    // Best-effort: a machine off the tailnet advertises nothing and behaves exactly as before.
+    const tailscaleIp = await detectTailscaleIp()
+    if (tailscaleIp) console.log(`[daemon] Tailnet address: ${tailscaleIp}`)
+
     const heartbeatResult = await this.cloud.sendHeartbeat({
-      hardware_profile: this.hardwareProfile
+      hardware_profile: this.hardwareProfile,
+      ...(tailscaleIp ? { tailscale_ip: tailscaleIp } : {})
     })
     this.nodeId = heartbeatResult.node_id
     this._persistNodeId(this.nodeId)
