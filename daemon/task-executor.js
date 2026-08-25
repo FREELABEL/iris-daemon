@@ -199,24 +199,56 @@ function resolveDaemonIdentity () {
 // Cache-first: use the local copy if present, otherwise PULL it from the cloud
 // (the Hive "pull the script if it doesn't exist on the machine" use case) and
 // cache it under ~/.iris/data/scripts/<slug>.json for next time.
-async function resolveUserScriptBySlug (slug) {
-  const cacheDir = path.join(os.homedir(), '.iris', 'data', 'scripts')
-  const cacheFile = path.join(cacheDir, `${slug}.json`)
+/**
+ * Resolve a script to run, ADDRESSED BY CONTENT rather than by name.
+ *
+ * WHAT WAS DELETED HERE, AND WHY. This used to cache by SLUG:
+ *
+ *     const cacheFile = path.join(cacheDir, `${slug}.json`)
+ *     if (fs.existsSync(cacheFile)) { ...return cached... }     // unconditionally
+ *
+ * The only condition for reuse was "a file exists and its script_content is a string" — no
+ * version, no hash, no ETag, no TTL, no revalidation. So a node that ran a slug once ran that
+ * copy FOREVER, and `iris scripts push` changed nothing on it. Two machines, same slug,
+ * different code, both reporting success, and no way to ask either which version it held
+ * (#182275). It was also executed unverified: the pull validated only that script_content was
+ * a string, so whatever the endpoint returned, ran (#182276).
+ *
+ * The fix is NOT a TTL bolted onto a slug-keyed cache. A mutable name as a cache key is the
+ * part that should not exist, so it is gone. Scripts are now stored at
+ * `scripts/by-content/<sha256>.json`, which makes staleness impossible by construction rather
+ * than unlikely by policy: a different version is a different hash is a different file. And
+ * verification comes free, because the address and the checksum are the same value.
+ *
+ * `expectedSha` is sent by `iris scripts run`. When present it is authoritative: a cached copy
+ * at that hash is known-correct with no network call, and a pulled copy that hashes to
+ * anything else is REFUSED rather than run.
+ */
+async function resolveUserScriptBySlug (slug, expectedSha = null) {
+  const contentDir = path.join(os.homedir(), '.iris', 'data', 'scripts', 'by-content')
+  const sha = (s) => crypto.createHash('sha256').update(s, 'utf-8').digest('hex')
 
-  if (fs.existsSync(cacheFile)) {
-    try {
-      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
-      if (cached && typeof cached.script_content === 'string') {
-        console.log(`[executor] user_script '${slug}' — using cached copy`)
-        return cached
-      }
-    } catch { /* fall through to a fresh pull */ }
+  // A hash we already hold needs no network and cannot be stale.
+  if (expectedSha) {
+    const hit = path.join(contentDir, `${expectedSha}.json`)
+    if (fs.existsSync(hit)) {
+      try {
+        const cached = JSON.parse(fs.readFileSync(hit, 'utf8'))
+        if (cached && typeof cached.script_content === 'string' && sha(cached.script_content) === expectedSha) {
+          console.log(`[executor] user_script '${slug}' — cache hit ${expectedSha.slice(0, 12)}… (verified)`)
+          return { ...cached, _verified: true, _sha256: expectedSha }
+        }
+        // Present but does not hash to its own filename: the file is corrupt, not merely old.
+        console.warn(`[executor] user_script '${slug}' — cached blob ${expectedSha.slice(0, 12)}… FAILED its own digest; re-pulling`)
+        fs.unlinkSync(hit)
+      } catch { /* unreadable — fall through and re-pull */ }
+    }
   }
 
   const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
   const { token } = resolveDaemonIdentity()
   const url = `${apiBase}/api/v6/node-agent/scripts/${encodeURIComponent(slug)}`
-  console.log(`[executor] user_script '${slug}' — not cached, pulling from cloud`)
+  console.log(`[executor] user_script '${slug}' — pulling from cloud`)
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } })
   if (!res.ok) throw new Error(`Failed to pull script '${slug}' from cloud: HTTP ${res.status}`)
   const json = await res.json()
@@ -224,11 +256,27 @@ async function resolveUserScriptBySlug (slug) {
   if (!script || typeof script.script_content !== 'string') {
     throw new Error(`Script '${slug}' returned no script_content`)
   }
+
+  const actual = sha(script.script_content)
+
+  // REFUSE rather than run. A mismatch means the bytes are not the bytes the caller asked for,
+  // and executing them because they arrived over TLS is exactly the assumption #182276 is about.
+  if (expectedSha && actual !== expectedSha) {
+    throw new Error(
+      `Script '${slug}' failed integrity check: expected ${expectedSha.slice(0, 12)}…, ` +
+      `the endpoint returned content hashing to ${actual.slice(0, 12)}…. Refusing to execute.`
+    )
+  }
+
   try {
-    fs.mkdirSync(cacheDir, { recursive: true })
-    fs.writeFileSync(cacheFile, JSON.stringify(script))
-  } catch { /* cache write is best-effort */ }
-  return script
+    fs.mkdirSync(contentDir, { recursive: true })
+    fs.writeFileSync(path.join(contentDir, `${actual}.json`), JSON.stringify(script))
+  } catch { /* cache write is best-effort; correctness does not depend on it */ }
+
+  if (!expectedSha) {
+    console.warn(`[executor] user_script '${slug}' — no expected digest supplied; ran UNVERIFIED (older CLI?)`)
+  }
+  return { ...script, _verified: Boolean(expectedSha), _sha256: actual }
 }
 
 async function fetchDbCampaignConfigs () {
@@ -1735,7 +1783,8 @@ class TaskExecutor {
           // script" use case), then run per its runtime.
           const slug = (task.config?.script_slug || task.prompt || '').trim()
           if (!slug) throw new Error('user_script requires a script_slug')
-          const script = await resolveUserScriptBySlug(slug)
+          const expectedSha = task.config?.script_sha256 || null
+          const script = await resolveUserScriptBySlug(slug, expectedSha)
           const runtime = task.config?.runtime || script.runtime || 'bash'
           const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
           const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
