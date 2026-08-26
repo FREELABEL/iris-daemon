@@ -10,6 +10,32 @@ const { spawn } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 
+/**
+ * Write daemon state so only its owner can read it (#182461).
+ *
+ * These files are not metadata. schedules.json carries each run's captured stdout/stderr,
+ * and pending-results.json carries the same for every result queued while the cloud was
+ * unreachable — so a script that echoes a key, or an error that prints its environment,
+ * lands on disk verbatim. Measured on this machine: a real IRIS_API_KEY value sitting in
+ * ~/.iris/daemon-data/schedules.json at mode 0644, readable by every local process.
+ *
+ * mesh-auth.js and ssh-share.js already write 0600. This file was simply never brought in
+ * line, which matters more now that the CLI and Desktop app are going to beta users whose
+ * machines we do not control.
+ *
+ * The chmod after the write is load-bearing and easy to miss: the `mode` option applies
+ * only when the file is CREATED. An install that already has a 0644 schedules.json would
+ * keep it forever, so upgrading would silently not fix anyone.
+ */
+function writePrivate (filePath, contents) {
+  fs.writeFileSync(filePath, contents, { encoding: 'utf-8', mode: 0o600 })
+  try {
+    fs.chmodSync(filePath, 0o600)
+  } catch {
+    // Best effort — a platform without chmod must not lose the write itself.
+  }
+}
+
 class ScheduleRegistry {
   constructor (config, cloud) {
     this.config = config
@@ -38,7 +64,7 @@ class ScheduleRegistry {
   _save () {
     try {
       const data = Array.from(this.schedules.values())
-      fs.writeFileSync(this.schedulesFile, JSON.stringify(data, null, 2), 'utf-8')
+      writePrivate(this.schedulesFile, JSON.stringify(data, null, 2))
     } catch (err) {
       console.warn('[schedules] Failed to save schedules.json:', err.message)
     }
@@ -213,7 +239,7 @@ class ScheduleRegistry {
       if (pending.length > 1000) {
         pending = pending.slice(-1000)
       }
-      fs.writeFileSync(this.pendingFile, JSON.stringify(pending, null, 2), 'utf-8')
+      writePrivate(this.pendingFile, JSON.stringify(pending, null, 2))
     } catch (err) {
       console.warn('[schedules] Failed to save pending result:', err.message)
     }
@@ -238,7 +264,7 @@ class ScheduleRegistry {
       }
 
       if (failed.length > 0) {
-        fs.writeFileSync(this.pendingFile, JSON.stringify(failed, null, 2), 'utf-8')
+        writePrivate(this.pendingFile, JSON.stringify(failed, null, 2))
       } else {
         fs.unlinkSync(this.pendingFile)
       }
