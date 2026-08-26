@@ -251,6 +251,19 @@ class Daemon {
       ...(this.tailscaleIp ? { tailscale_ip: this.tailscaleIp } : {}),
       paused: this.paused,
       pause_reason: this.pauseReason,
+      // HOW LONG THIS PROCESS HAS BEEN ALIVE (#182434).
+      //
+      // The cloud marks a node offline only when it MISSES heartbeats. A node that
+      // crash-loops heartbeats once per restart, so it never misses one, and the fleet view
+      // shows the same steady ONLINE as a machine that has been up for eight hours. Work
+      // keeps being dispatched to it; a task lands mid-crash and hangs to timeout, which
+      // reads to the caller as a broken transport rather than a machine that went away.
+      //
+      // Uptime is what separates those two states: across successive beats a stable node's
+      // climbs, a crash-looping node's keeps resetting toward zero. Additive and derived
+      // from the process itself — no persistence, so nothing new can go stale or lie.
+      uptime_seconds: Math.round(process.uptime()),
+      started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
       active_sessions: this._getLocalSessions(),
       session_capabilities: this._getSessionCapabilities(),
       // Which LOCAL DATA SOURCES this machine can actually serve right now, with a

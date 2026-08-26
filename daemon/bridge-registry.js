@@ -129,12 +129,26 @@ const PROVIDERS = {
       if (process.platform !== 'darwin') return { ok: false, reason: 'iMessage requires macOS' }
       const db = path.join(os.homedir(), 'Library', 'Messages', 'chat.db')
       if (!exists(db)) return { ok: false, reason: 'Messages chat.db not found' }
-      // Presence of the file is NOT permission to read it — Full Disk Access is a
-      // separate grant, and without it every query fails with EPERM. Probe for real.
+      // Presence of the file is NOT permission to read it — Full Disk Access is a separate
+      // grant. This probe used to be `fs.accessSync(db, R_OK)`, which reads as a real check
+      // and is not one: access(2) tests unix permission BITS, and TCC leaves those intact
+      // while denying the open(). The file is mode 0600 and owned by the user either way, so
+      // R_OK returned success on a machine that could not read a single row (#182007).
+      //
+      // cli/lib/permissions.ts states the rule this violates: "a probe that does not actually
+      // touch the file cannot tell 'granted' from 'never asked'." So touch it — open() is the
+      // syscall TCC actually denies.
+      let fd
       try {
-        fs.accessSync(db, fs.constants.R_OK)
-      } catch {
-        return { ok: false, reason: 'No Full Disk Access for Messages — grant it in System Settings › Privacy' }
+        fd = fs.openSync(db, 'r')
+        fs.readSync(fd, Buffer.alloc(1), 0, 1, 0)
+      } catch (e) {
+        if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+          return { ok: false, reason: 'No Full Disk Access for Messages — grant it in System Settings › Privacy, then RESTART the daemon (TCC is read at process start)' }
+        }
+        return { ok: false, reason: `Messages chat.db unreadable: ${(e && e.code) || 'unknown error'}` }
+      } finally {
+        if (fd !== undefined) { try { fs.closeSync(fd) } catch { /* already gone */ } }
       }
       return { ok: true }
     },

@@ -276,12 +276,65 @@ function detectAppleApps () {
   const appExists = (name) =>
     fs.existsSync(`/System/Applications/${name}`) || fs.existsSync(`/Applications/${name}`)
 
+  // ADVERTISE A CAPABILITY ONLY ON EVIDENCE OF ACCESS, NEVER ON EVIDENCE OF EXISTENCE (#182007).
+  //
+  // This used to be `fs.existsSync(chatDbPath)`. existsSync is a stat, and TCC blocks the
+  // open() — not the stat. So on a Mac without Full Disk Access the file is present and
+  // unreadable, and this reported the node as iMessage-capable. Measured 2026-08-23 on
+  // MacBookPro: presence TRUE, sqlite3 read "authorization denied", 69 consecutive Calendar
+  // failures, and `hive nodes show` still listing the node healthy with nine capabilities.
+  //
+  // A blind node that advertises sight is worse than one that advertises nothing, because a
+  // TCC-blocked read returns EMPTY rather than failing — so the node accepts the work and
+  // answers zero rows, which reads as a legitimate result. That is the same defect the
+  // capability gate is meant to stop (#182452), one layer down: it cannot be fixed there
+  // while the input to it is a lie.
+  //
+  // The distinction the probe must preserve is three-way, because the remedies differ:
+  // absent (nothing to read), blocked (grant FDA, then RESTART — TCC is read at process
+  // start), readable.
+  const imessageAccess = probeReadAccess(chatDbPath)
+
   return {
     platform: 'darwin',
-    imessage: fs.existsSync(chatDbPath),
+    imessage: imessageAccess.readable,
+    // WHY, not just whether. "false" alone sent people to look for a missing file on a
+    // machine where the file was right there and the daemon simply had no permission.
+    imessage_reason: imessageAccess.reason,
     apple_mail: appExists('Mail.app'),
     messages_app: appExists('Messages.app'),
-    chat_db: fs.existsSync(chatDbPath) ? chatDbPath : null
+    // Only hand out a path that was actually opened. A path that turns out to be unreadable
+    // is an invitation to a caller to fail further downstream, with less context than here.
+    chat_db: imessageAccess.readable ? chatDbPath : null
+  }
+}
+
+/**
+ * Can this process actually READ this file, right now?
+ *
+ * Opens it. Nothing cheaper answers the question: `existsSync` and `fs.access(F_OK)` both
+ * stat, and a TCC denial lands on the open. `fs.access(R_OK)` checks unix permission bits,
+ * which on a TCC-blocked file still say yes.
+ *
+ * @returns {{readable: boolean, reason: string|null}}
+ *   reason is null when readable, otherwise 'absent' | 'permission-denied' | an errno code.
+ */
+function probeReadAccess (filePath) {
+  let fd
+  try {
+    fd = fs.openSync(filePath, 'r')
+    // Pull a byte. Measured: a zero-length file returns 0 here rather than throwing, so an
+    // empty-but-readable file correctly reports readable — there is no EOF case to catch.
+    fs.readSync(fd, Buffer.alloc(1), 0, 1, 0)
+    return { readable: true, reason: null }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { readable: false, reason: 'absent' }
+    if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+      return { readable: false, reason: 'permission-denied' }
+    }
+    return { readable: false, reason: (e && e.code) || 'unknown' }
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd) } catch { /* already gone */ } }
   }
 }
 
