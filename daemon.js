@@ -42,6 +42,7 @@ const path = require('path')
 const fs = require('fs')
 const os = require('os')
 const net = require('net')
+const socketGuard = require('./daemon/socket-guard')
 
 const IRIS_DIR = path.join(os.homedir(), '.iris')
 const CONFIG_FILE = path.join(IRIS_DIR, 'config.json')
@@ -53,11 +54,20 @@ const SOCK_FILE = process.platform === 'win32'
 // Ensure ~/.iris directory exists
 if (!fs.existsSync(IRIS_DIR)) fs.mkdirSync(IRIS_DIR, { recursive: true })
 
-// Helper: clean up socket file (no-op on Windows named pipes)
+// Helper: clean up socket file (no-op on Windows named pipes).
+//
+// This used to unlink SOCKET_PATH — an identifier that does not exist in this file, which
+// defines SOCK_FILE. Every call threw a ReferenceError into the bare `catch {}`, so the
+// socket was NEVER removed and the next start could not bind:
+//
+//     [ipc] Server error: listen EADDRINUSE ... ~/.iris/daemon.sock
+//
+// The node still reported ONLINE throughout, because each restart heartbeats once before
+// wedging. One process sat eight hours that way. A cleanup that silently does nothing is
+// indistinguishable from one that works — which is why socket-guard returns what happened
+// instead of swallowing it (#182371).
 function cleanupSocket () {
-  if (process.platform !== 'win32') {
-    try { fs.unlinkSync(SOCKET_PATH) } catch {}
-  }
+  return socketGuard.cleanupSocket(SOCK_FILE)
 }
 
 // Load .env
@@ -524,12 +534,31 @@ function startDaemon () {
       })
     })
 
-    ipcServer.listen(SOCK_FILE, () => {
-      // Socket is now locked to this process
+    // Clear a STALE socket before binding. A leftover file with no listener makes bind fail
+    // with EADDRINUSE forever; a socket someone is actually using must be left alone, so
+    // this probes for a listener rather than trusting the file's existence.
+    socketGuard.ensureSocketFree(SOCK_FILE).then((r) => {
+      if (r.inUse) {
+        console.error(`[ipc] ${SOCK_FILE} is held by another process — another daemon is already running.`)
+        console.error('[ipc] Not starting a second IPC server. Stop the other daemon, or run: launchctl kickstart -k gui/$(id -u)/io.heyiris.daemon')
+        return
+      }
+      if (r.freed) console.log('[ipc] Removed a stale socket left by a previous run')
+      if (r.error) console.error(`[ipc] Could not clear the socket: ${r.error}`)
+
+      ipcServer.listen(SOCK_FILE, () => {
+        // Socket is now locked to this process
+      })
     })
 
     ipcServer.on('error', (err) => {
-      console.error(`[ipc] Server error: ${err.message}`)
+      // Say what to DO about it. This logged the raw message and carried on, so a daemon
+      // that could not bind looked like one that had.
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[ipc] Cannot bind ${SOCK_FILE} — another daemon holds it, or a stale socket could not be removed.`)
+      } else {
+        console.error(`[ipc] Server error: ${err.message}`)
+      }
     })
 
     // ─── Graceful shutdown ────────────────────────────────────
