@@ -35,10 +35,14 @@ setInterval(() => {
   const staleMs = (Date.now() - origin) - last
   if (staleMs < thresholdMs) return
 
-  const msg = `[watchdog] MAIN THREAD BLOCKED for ${Math.round(staleMs / 1000)}s — it answered nothing while stuck. Killing pid ${pid} so the supervisor restarts it. (#182371)`
-  // stderr from a worker still reaches the process's log, and this is written BEFORE the
-  // kill so the reason survives the death.
-  console.error(msg)
+  const msg = `[watchdog] MAIN THREAD BLOCKED for ${Math.round(staleMs / 1000)}s — it answered nothing while stuck. Killing pid ${pid} so the supervisor restarts it. (#182371)\n`
+
+  // writeSync, NOT console.error. console.error buffers, and SIGKILL a microsecond later
+  // discards the buffer — measured in production: the process restarted every ~100s with
+  // NOTHING in the log to say why, so the watchdog was killing silently and looked like it
+  // had never fired. A watchdog whose reason dies with the process is the same
+  // cannot-distinguish defect it exists to fix.
+  try { require('fs').writeSync(2, msg) } catch { /* nothing better available */ }
   try { parentPort && parentPort.postMessage({ blocked: true, staleMs }) } catch { /* main thread is stuck; expected */ }
 
   // SIGKILL, not SIGTERM. A blocked thread never runs a SIGTERM handler — measured: the real

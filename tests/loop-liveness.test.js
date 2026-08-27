@@ -72,6 +72,25 @@ test('a brief block under the threshold is survived', () => {
   assert.notStrictEqual(r.signal, 'SIGKILL', `a 1.2s stall under a 3s threshold must survive: ${JSON.stringify(r)}`)
 })
 
+test('the REASON survives the kill', () => {
+  // console.error buffers; SIGKILL a microsecond later discards it. In production the daemon
+  // restarted every ~100s with nothing in the log to say why, so the watchdog looked like it
+  // had never fired. The kill is worthless if it cannot say what it killed.
+  const script = `
+    const { LoopLiveness } = require('./daemon/loop-liveness')
+    new LoopLiveness({ thresholdMs: 1500, intervalMs: 200 }).start()
+    setTimeout(() => { while (true) {} }, 300)
+    setTimeout(() => {}, 60000)
+  `
+  let stderr = ''
+  try {
+    execFileSync(process.execPath, ['-e', script], { cwd: ROOT, timeout: 25000, stdio: 'pipe' })
+  } catch (err) {
+    stderr = String(err.stderr || '')
+  }
+  assert.match(stderr, /MAIN THREAD BLOCKED/, `the kill must explain itself; got: ${stderr.slice(0, 200)}`)
+})
+
 test('start() reports whether the watchdog is actually armed', () => {
   const { LoopLiveness } = require('../daemon/loop-liveness')
   const l = new LoopLiveness({ thresholdMs: 60000, intervalMs: 1000 })
