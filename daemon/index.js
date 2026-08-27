@@ -240,6 +240,20 @@ class Daemon {
 
     // Step 5: Start heartbeat loop (with capacity + status + session reporting)
     this.heartbeat = new Heartbeat(this.cloud, 30000)
+
+    // A daemon that has not reached the hub in half an hour is not degraded, it is gone.
+    // EXIT so launchd revives it: the one failure a supervisor cannot repair is a process
+    // that stays alive doing nothing, and that is exactly what ran here for 26 hours —
+    // last log line "Failed (7/5)", /daemon/health silent, deaf to SIGTERM, and showing
+    // ONLINE in the fleet view throughout (#182371).
+    //
+    // Exit code 1 so the restart is visible as a failure in launchd's records rather than
+    // looking like a clean stop. ThrottleInterval keeps this from becoming a tight loop
+    // during a genuine hub outage, and the wedge clock resets on any success.
+    this.heartbeat.onWedged = (mins) => {
+      console.error(`[daemon] Exiting after ${mins}m with no successful heartbeat — launchd will restart this node.`)
+      process.exit(1)
+    }
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
       // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup

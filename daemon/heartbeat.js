@@ -32,6 +32,17 @@ class Heartbeat {
 
     // Callback to write status file (set by Daemon)
     this.onPingCallback = null
+
+    // LIVENESS (#182371). A daemon that cannot reach the hub for this long is not
+    // "degraded", it is gone — and the one state a supervisor cannot fix is a process that
+    // stays alive doing nothing. Measured on a real node: alive 1 day 2 hours, last log line
+    // "Failed (7/5)", /daemon/health silent, unresponsive to SIGTERM, and ONLINE in the fleet
+    // view the whole time. Exiting lets launchd revive it; sitting there cannot be recovered
+    // from without a human noticing.
+    this.wedgedAfterMs = 30 * 60 * 1000
+    this.lastSuccessAt = Date.now()
+    this.wedgedReported = false
+    this.onWedged = null
   }
 
   start () {
@@ -52,10 +63,42 @@ class Heartbeat {
   }
 
   async _tick () {
-    await this.ping()
-    // Only schedule next if we haven't been stopped
-    if (this.timer !== null) {
-      this._scheduleNext()
+    // The reschedule lives in `finally` ON PURPOSE. This used to be
+    //     await this.ping(); if (this.timer !== null) this._scheduleNext()
+    // so a single REJECTION from ping() skipped the reschedule and ended the loop forever,
+    // inside a process that stayed alive and kept reporting itself as a healthy node. One
+    // unexpected throw retired a machine from the fleet silently (#182371).
+    try {
+      await this.ping()
+    } catch (err) {
+      // ping() handles its own failures; anything reaching here is a bug in that handling.
+      // It must never be the reason the loop stops.
+      console.error(`[heartbeat] tick error (loop continues): ${err && err.message}`)
+    } finally {
+      this._checkWedged()
+      // Only schedule next if we haven't been stopped.
+      if (this.timer !== null) {
+        this._scheduleNext()
+      }
+    }
+  }
+
+  /**
+   * Has this daemon been unable to reach the hub for long enough to count as dead?
+   *
+   * Reported ONCE per wedge, so a supervisor gets a clean signal rather than a repeating
+   * alarm, and the clock resets on any success — a transient outage must not arm a false
+   * alarm hours later.
+   */
+  _checkWedged () {
+    if (this.wedgedReported) return
+    if (Date.now() - this.lastSuccessAt < this.wedgedAfterMs) return
+
+    this.wedgedReported = true
+    const mins = Math.round((Date.now() - this.lastSuccessAt) / 60000)
+    console.error(`[heartbeat] WEDGED — no successful heartbeat in ${mins}m. This node is not reachable by the hub and cannot be recovered in place.`)
+    if (typeof this.onWedged === 'function') {
+      try { this.onWedged(mins) } catch { /* a failing handler must not stop the loop */ }
     }
   }
 
@@ -72,6 +115,10 @@ class Heartbeat {
       this.failCount = 0
       this.state = 'closed'
       this.currentIntervalMs = this.baseIntervalMs
+      // Reset the wedge clock AND its latch: a node that recovered is healthy again, and
+      // must be able to report a NEW wedge later rather than staying permanently armed.
+      this.lastSuccessAt = Date.now()
+      this.wedgedReported = false
 
       // Trigger status file write after successful heartbeat
       if (this.onPingCallback) this.onPingCallback()
