@@ -11,7 +11,7 @@ const fs = require('fs')
 const path = require('path')
 
 /**
- * Write daemon state so only its owner can read it (#182461).
+ * Write daemon state so only its owner can read it (#182462).
  *
  * These files are not metadata. schedules.json carries each run's captured stdout/stderr,
  * and pending-results.json carries the same for every result queued while the cloud was
