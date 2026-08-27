@@ -25,7 +25,7 @@ const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
 const { Heartbeat } = require('./heartbeat')
 const { detectTailscaleIp } = require('./tailscale-address')
-const { EventLoopWatchdog } = require('./event-loop-watchdog')
+const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
@@ -251,23 +251,17 @@ class Daemon {
     // Exit code 1 so the restart is visible as a failure in launchd's records rather than
     // looking like a clean stop. ThrottleInterval keeps this from becoming a tight loop
     // during a genuine hub outage, and the wedge clock resets on any success.
-    // A blocked event loop cannot be seen from ON that loop, which is why the heartbeat's
-    // wedge detector never fired during the real incident — it was stuck too. This timer's
-    // signal is its own LATENESS, so it reports the moment the loop turns again (#182371).
+    // A blocked event loop cannot be detected from ON that loop. The first attempt here was
+    // a setInterval measuring its own lateness; the machine disproved it in 94 seconds — a
+    // timer on a blocked loop does not run, so it reports a block only AFTER recovery and is
+    // silent forever for a block that never ends, which is the only case that matters.
     //
-    // 30s of lateness is far beyond anything legitimate: the heartbeat itself only wants the
-    // loop every 30s, and a daemon that cannot answer for half a minute has already missed
-    // dispatches. Exit so launchd restarts it — being unavailable for thirty seconds beats
-    // being silently unavailable for an hour while still holding a slot in the fleet.
-    this.loopWatchdog = new EventLoopWatchdog({
-      intervalMs: 1000,
-      thresholdMs: 30000,
-      onBlocked: (lateMs) => {
-        console.error(`[daemon] Exiting — event loop was blocked for ${Math.round(lateMs / 1000)}s. Measured cause on one node: a synchronous directory walk on a timer (#182371).`)
-        process.exit(1)
-      },
-    })
-    this.loopWatchdog.start()
+    // So the check lives in a worker thread with its own loop, reading a SharedArrayBuffer
+    // this one stamps. Shared memory is the only channel that survives, because postMessage
+    // would be delivered TO the stuck loop. On staleness the worker sends SIGKILL — measured:
+    // the real incident ignored SIGTERM for an hour and required kill -9 (#182371).
+    this.loopLiveness = new LoopLiveness({ thresholdMs: 60000, intervalMs: 1000 })
+    this.loopLiveness.start()
 
     this.heartbeat.onWedged = (mins) => {
       console.error(`[daemon] Exiting after ${mins}m with no successful heartbeat — launchd will restart this node.`)
