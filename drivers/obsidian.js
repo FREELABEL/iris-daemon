@@ -39,15 +39,56 @@ function isVault(dir) {
 }
 
 /**
- * Find vaults under the given roots (or the usual suspects).
- * Shallow on purpose — depth 3 covers real layouts without walking an entire home dir.
+ * Cached discovery results. Vault locations change approximately never; this ran on EVERY
+ * heartbeat (#182371).
+ *
+ * Captured on the real node by the fs probe:
+ *     [BLOCKED 1000ms across 2646 sync fs calls WITHOUT yielding]
+ *        899ms 1334x fs.readdirSync   at walk (obsidian.js:55) <- recursive
+ *                                     at discoverVaults
+ *                                     at heartbeat.getStateCallback   <- every 30s
+ *
+ * The depth-3 cap was already here and was not the problem. `defaultSearchRoots()` includes
+ * the whole home directory plus Dropbox and Google Drive, so on a machine with real
+ * cloud-sync trees depth 3 is thousands of directories — and it ran twice a minute forever.
+ * While it ran the daemon answered nothing and still showed ONLINE in the fleet.
  */
-function discoverVaults(roots = null, maxDepth = 3) {
+const VAULT_CACHE_TTL_MS = 60 * 60 * 1000
+const vaultCache = new Map() // rootsKey -> { at, vaults }
+
+/** Exported for tests; also the honest way to force a rescan after a vault is created. */
+function _resetVaultCache() {
+  vaultCache.clear()
+}
+
+/**
+ * Find vaults under the given roots (or the usual suspects).
+ *
+ * Shallow on purpose — depth 3 covers real layouts without walking an entire home dir — and
+ * now also CACHED and DEADLINED. Caching removes the repeat cost; the deadline bounds the
+ * worst single walk, because without it the first heartbeat after every restart still blocks.
+ */
+function discoverVaults(roots = null, maxDepth = 3, opts = {}) {
+  const rootList = roots ?? defaultSearchRoots()
+  const key = rootList.join('\u0000')
+  const now = Date.now()
+
+  const hit = vaultCache.get(key)
+  if (hit && (now - hit.at) < VAULT_CACHE_TTL_MS) return hit.vaults.slice()
+
+  // A wall-clock budget for the whole walk. Exceeding it returns what was found so far
+  // rather than continuing — a partial answer that arrives is worth more here than a
+  // complete one that stops the daemon answering anything at all.
+  const deadlineMs = typeof opts.deadlineMs === 'number' ? opts.deadlineMs : 250
+  const startedAt = now
+  let ranOut = false
+
   const found = []
   const seen = new Set()
 
   const walk = (dir, depth) => {
     if (depth > maxDepth || seen.has(dir)) return
+    if (Date.now() - startedAt > deadlineMs) { ranOut = true; return }
     seen.add(dir)
 
     let entries
@@ -68,7 +109,15 @@ function discoverVaults(roots = null, maxDepth = 3) {
     }
   }
 
-  for (const r of roots ?? defaultSearchRoots()) walk(r, 0)
+  for (const r of rootList) walk(r, 0)
+
+  if (ranOut) {
+    console.warn(`[obsidian] vault scan hit its ${deadlineMs}ms budget after ${seen.size} dirs — returning ${found.length} found so far`)
+  }
+
+  // Cached even when partial. A daemon that re-runs an over-budget walk every 30s is the
+  // failure being fixed; a stale-but-quick answer is recoverable, a wedged daemon is not.
+  vaultCache.set(key, { at: Date.now(), vaults: found.slice() })
   return found
 }
 
@@ -301,4 +350,5 @@ function searchNotes(vaultPath, query, { limit = 50, includeBody = false } = {})
   return results
 }
 
-module.exports = { discoverVaults, isVault, listNotes, readNote, searchNotes, parseFrontmatter, extractLinks, extractTags, resolveInsideVault }
+module.exports = {
+  _resetVaultCache, discoverVaults, isVault, listNotes, readNote, searchNotes, parseFrontmatter, extractLinks, extractTags, resolveInsideVault }
