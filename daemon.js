@@ -38,6 +38,11 @@
  * No PID files, no pgrep, no orphan races.
  */
 
+// Diagnostic, OFF unless IRIS_FS_PROBE_MS is set. Installed FIRST so it wraps fs before any
+// other module captures a reference to it — a probe loaded later would miss every call site
+// that did `const { readdirSync } = require('fs')` at import time (#182371).
+require('./daemon/slow-fs-probe').install()
+
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
