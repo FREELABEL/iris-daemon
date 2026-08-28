@@ -24,6 +24,7 @@ const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
 const { Heartbeat } = require('./heartbeat')
+const { probePermissions } = require('./permission-probe')
 const { detectTailscaleIp } = require('./tailscale-address')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
@@ -81,8 +82,32 @@ class Daemon {
     this._loadPauseState()
   }
 
+  /**
+   * Keep the advertised permission map fresh (S1.2).
+   *
+   * A FAILED probe never clears a previous good answer into a false negative — it leaves the
+   * last measurement standing, timestamped, so staleness is visible rather than invented.
+   */
+  async _refreshPermissions () {
+    try {
+      const probed = await probePermissions()
+      this._permissions = probed
+      console.log(`[daemon] permissions: ${Object.entries(probed).map(([k, v]) => `${k}=${v.available}`).join(' ')}`)
+    } catch (e) {
+      console.warn(`[daemon] permission probe failed, keeping last known: ${e && e.message}`)
+    }
+  }
+
+  _startPermissionProbe () {
+    const FIFTEEN_MINUTES = 15 * 60 * 1000
+    this._refreshPermissions()
+    this._permissionTimer = setInterval(() => this._refreshPermissions(), FIFTEEN_MINUTES)
+    if (this._permissionTimer.unref) this._permissionTimer.unref()
+  }
+
   async start () {
     console.log('[daemon] Starting...')
+    this._startPermissionProbe()
 
     // Step 0: Clean up stale status from previous run
     try {
@@ -289,6 +314,15 @@ class Daemon {
       // Uptime is what separates those two states: across successive beats a stable node's
       // climbs, a crash-looping node's keeps resetting toward zero. Additive and derived
       // from the process itself — no persistence, so nothing new can go stale or lie.
+      // WHAT THIS MACHINE CAN ACTUALLY DO (S1.2/S2.2), so the hub can refuse to dispatch a
+      // script whose requirements this node cannot satisfy — instead of running it here and
+      // returning a confident empty result, which is the failure the epic is about.
+      //
+      // Sent from a CACHE, never probed inline: this launches a browser and makes an outbound
+      // request, and a heartbeat that can block is a heartbeat that makes a healthy node look
+      // dead. OMITTED entirely until the first probe lands — an empty map would assert the node
+      // has no permissions and the gate would refuse work for a reason that is not true.
+      ...(this._permissions ? { permissions: this._permissions } : {}),
       uptime_seconds: Math.round(process.uptime()),
       started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
       active_sessions: this._getLocalSessions(),
