@@ -246,7 +246,41 @@ function planScriptExecution (o) {
   }
 }
 
+/**
+ * S2.4 — the warm path.
+ *
+ * A cold `docker run` pulls hundreds of megabytes before it executes a line. The epic's
+ * constraint is blunt: a page-invoked action cannot wait 30 seconds for a cold container. So
+ * the images are pulled once, in the background, when the node comes up with a runtime.
+ *
+ * This is pre-pull only, deliberately. Keeping WARM CONTAINERS alive between runs would cut
+ * the remaining start-up too, and it is the wrong trade here: a reused container is shared
+ * state between two users' scripts, which is precisely what S2.2 exists to prevent. Paying a
+ * container start per run is the cost of the isolation guarantee, and the pull is the part
+ * that was actually slow.
+ */
+function imagesToWarm () {
+  return [...new Set(Object.values(RUNTIME_IMAGES))]
+}
+
+/**
+ * Decide whether to warm. An unknown runtime state is NOT a yes — same rule as every other
+ * decision in this file, and here the cost of guessing wrong is a pointless multi-hundred-MB
+ * pull on a machine that cannot use it.
+ */
+function planWarmup (isolation) {
+  const available = isolation && isolation.available === true
+
+  return {
+    shouldWarm: !!available,
+    images: available ? imagesToWarm() : [],
+    reason: available ? null : ((isolation && isolation.reason) || 'no container runtime')
+  }
+}
+
 module.exports = {
+  imagesToWarm,
+  planWarmup,
   planScriptExecution,
   nodePolicyFromEnv,
   egressAllowed,

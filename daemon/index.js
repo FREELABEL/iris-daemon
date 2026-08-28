@@ -91,10 +91,40 @@ class Daemon {
   async _refreshPermissions () {
     try {
       const probed = await probePermissions()
+      const first = !this._permissions
       this._permissions = probed
+      // Warm only once the probe has actually told us there is a runtime — warming on a
+      // guess is a few hundred megabytes of pointless traffic on a machine that cannot use it.
+      if (first) this._warmSandboxImages()
       console.log(`[daemon] permissions: ${Object.entries(probed).map(([k, v]) => `${k}=${v.available}`).join(' ')}`)
     } catch (e) {
       console.warn(`[daemon] permission probe failed, keeping last known: ${e && e.message}`)
+    }
+  }
+
+  /**
+   * S2.4 — pull the sandbox images once, in the background, if this node can use them.
+   *
+   * Fire-and-forget on purpose: a node must never wait on a registry to come online, and a
+   * failed pull is a slower first run, not a broken daemon.
+   */
+  _warmSandboxImages () {
+    try {
+      const { planWarmup } = require('./sandbox')
+      const plan = planWarmup(this._permissions && this._permissions.isolation)
+      if (!plan.shouldWarm) {
+        console.log(`[daemon] sandbox warmup skipped — ${plan.reason}`)
+        return
+      }
+      const { spawn } = require('child_process')
+      for (const image of plan.images) {
+        const p = spawn('docker', ['pull', image], { stdio: 'ignore', detached: true })
+        p.on('error', (e) => console.warn(`[daemon] sandbox warmup: ${image} failed — ${e.message}`))
+        p.unref()
+      }
+      console.log(`[daemon] sandbox warmup: pulling ${plan.images.length} image(s)`)
+    } catch (e) {
+      console.warn(`[daemon] sandbox warmup failed: ${e && e.message}`)
     }
   }
 

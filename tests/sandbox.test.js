@@ -216,3 +216,35 @@ describe('node policy from env', () => {
     assert.equal(nodePolicyFromEnv({ IRIS_REQUIRE_ISOLATION: '1' }).require_isolation, true)
   })
 })
+
+// ── S2.4 warm path ───────────────────────────────────────────────────────────
+
+const { imagesToWarm, planWarmup } = require('../daemon/sandbox')
+
+describe('S2.4 — a page-invoked action cannot wait for a cold pull', () => {
+  it('warms every runtime image the sandbox can be asked for', () => {
+    // A cold `docker run` pulls hundreds of MB on first use. The epic's constraint is that a
+    // page-invoked action cannot wait 30s for that.
+    const imgs = imagesToWarm()
+    assert.ok(imgs.length >= 3)
+    assert.ok(imgs.some((i) => i.startsWith('alpine')))
+  })
+
+  it('does nothing when there is no container runtime — no pointless pulls, no errors', () => {
+    const p = planWarmup({ available: false, reason: 'not running' })
+    assert.equal(p.shouldWarm, false)
+    assert.deepEqual(p.images, [])
+  })
+
+  it('warms when a runtime IS available', () => {
+    const p = planWarmup({ available: true })
+    assert.equal(p.shouldWarm, true)
+    assert.ok(p.images.length > 0)
+  })
+
+  it('an UNKNOWN runtime state does not trigger a warmup', () => {
+    // Same rule as everywhere else here: not knowing is not a yes.
+    assert.equal(planWarmup({ available: null }).shouldWarm, false)
+    assert.equal(planWarmup(undefined).shouldWarm, false)
+  })
+})
