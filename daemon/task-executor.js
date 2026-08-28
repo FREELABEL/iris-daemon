@@ -1818,15 +1818,48 @@ class TaskExecutor {
           const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
           const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
           fs.writeFileSync(scriptPath, script.script_content, 'utf-8')
-          if (runtime === 'node') {
-            cmd = 'node'; args = [scriptPath]
-          } else if (runtime === 'python') {
-            cmd = 'python3'; args = [scriptPath]
-          } else if (runtime === 'playwright') {
+          // S2.2/S2.3 — DECIDE HOW THIS RUNS BEFORE RUNNING IT.
+          //
+          // The decision lives in daemon/sandbox.js, not here. This file is 4,000 lines because
+          // every capability historically bought itself a branch in it, and a branch in here is
+          // a branch nobody can test. planScriptExecution() is pure and covered; this call site
+          // only has to obey it.
+          //
+          // playwright keeps the host path for now: it drives a real browser and has its own
+          // Chromium provisioning, so containerising it is its own piece of work rather than a
+          // flag. Saying that out loud beats leaving a silent exception in a security path.
+          if (runtime === 'playwright') {
             cmd = 'npx'; args = ['playwright', 'test', scriptPath]
-          } else {
-            cmd = '/bin/bash'; fs.chmodSync(scriptPath, '755'); args = [scriptPath]
+            break
           }
+
+          const plan = planScriptExecution({
+            runtime,
+            scriptPath,
+            outputDir: workspace.outputDir || path.join(workspace.dir, '.output'),
+            manifest: script.manifest || task.config?.manifest || {},
+            policy: nodePolicyFromEnv(),
+            isolation: await getIsolationState()
+          })
+
+          if (plan.mode === 'refused') {
+            // Fail the task with the reason. NOT a downgrade to the host: everything upstream —
+            // the manifest, the routing gate, the page seam — is built believing isolation holds
+            // where it is required, and quietly running anyway makes all of it a lie at once.
+            throw new Error(`refusing to run '${slug}' unisolated: ${plan.reason}`)
+          }
+
+          if (plan.mode === 'host') {
+            // Say it in the log. An unisolated run is a legitimate choice on a personal
+            // machine and an invisible one is how that choice stops being a choice.
+            console.log(`[executor] user_script '${slug}' running UNISOLATED on the host${plan.reason ? ` (${plan.reason})` : ''}`)
+            if (runtime !== 'node' && runtime !== 'python') fs.chmodSync(scriptPath, '755')
+          } else {
+            console.log(`[executor] user_script '${slug}' sandboxed — network ${plan.args.includes('none') ? 'DENIED' : 'allowed'}`)
+          }
+
+          cmd = plan.cmd
+          args = plan.args
           break
         }
 

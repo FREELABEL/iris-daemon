@@ -137,3 +137,82 @@ describe('the refusal — the rule everything else stands on', () => {
     assert.equal(d.isolated, false)
   })
 })
+
+// ── S2.2 wiring + S2.3 egress ────────────────────────────────────────────────
+
+const { planScriptExecution, nodePolicyFromEnv } = require('../daemon/sandbox')
+
+const plan = (o = {}) =>
+  planScriptExecution({
+    runtime: 'bash',
+    scriptPath: '/tmp/x/user-script.sh',
+    outputDir: '/tmp/x/.output',
+    manifest: {},
+    policy: {},
+    isolation: { available: true },
+    ...o
+  })
+
+describe('planScriptExecution — the call site', () => {
+  it('sandboxes when a runtime is available', () => {
+    const p = plan()
+    assert.equal(p.mode, 'sandboxed')
+    assert.equal(p.cmd, 'docker')
+  })
+
+  it('runs on the host on a personal node with no runtime, and SAYS it is unisolated', () => {
+    const p = plan({ isolation: { available: false, reason: 'not running' } })
+    assert.equal(p.mode, 'host')
+    assert.equal(p.isolated, false)
+    assert.equal(p.cmd, '/bin/bash')
+  })
+
+  it('REFUSES on a shared node with no runtime — it never silently runs unisolated', () => {
+    const p = plan({ policy: { shared: true }, isolation: { available: false, reason: 'not running' } })
+    assert.equal(p.mode, 'refused')
+    assert.ok(!p.cmd, 'a refusal must not hand back a runnable command')
+    assert.match(p.reason, /not running/)
+  })
+
+  it('honours the manifest timeout, bounded', () => {
+    assert.equal(plan({ manifest: { timeout: 30 } }).timeoutMs, 30000)
+  })
+})
+
+describe('S2.3 — egress policy comes from the manifest', () => {
+  it('DENIES network by default — a script that did not ask does not get it', () => {
+    assert.ok(plan().args.includes('none'))
+  })
+
+  it('grants egress only when the manifest asked for it', () => {
+    const p = plan({ manifest: { egress: 'any' } })
+    assert.ok(!p.args.includes('none'), 'egress=any must lift --network none')
+  })
+
+  it('an unrecognised egress value denies rather than opens', () => {
+    // Failing open on a value we do not understand is how a typo becomes internet access
+    // for arbitrary code.
+    const p = plan({ manifest: { egress: 'sure-why-not' } })
+    assert.ok(p.args.includes('none'))
+  })
+
+  it('egress is irrelevant on the host path and does not silently claim to apply', () => {
+    const p = plan({ manifest: { egress: 'none' }, isolation: { available: false } })
+    assert.equal(p.mode, 'host')
+    assert.equal(p.egressEnforced, false)
+  })
+})
+
+describe('node policy from env', () => {
+  it('a plain laptop requires nothing', () => {
+    assert.equal(nodePolicyFromEnv({}).shared, false)
+  })
+
+  it('IRIS_NODE_SHARED=1 makes isolation mandatory', () => {
+    assert.equal(nodePolicyFromEnv({ IRIS_NODE_SHARED: '1' }).shared, true)
+  })
+
+  it('IRIS_REQUIRE_ISOLATION=1 opts a personal node in', () => {
+    assert.equal(nodePolicyFromEnv({ IRIS_REQUIRE_ISOLATION: '1' }).require_isolation, true)
+  })
+})

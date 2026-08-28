@@ -166,7 +166,90 @@ function decideExecution (node, isolation) {
   }
 }
 
+/**
+ * S2.3 — egress policy, taken from the script's own manifest.
+ *
+ * DENY IS THE DEFAULT AND AN UNKNOWN VALUE DENIES. Failing open on a value we do not
+ * understand is how a typo (`egress=ture`) becomes unrestricted internet access for arbitrary
+ * code. Only an explicit, recognised grant lifts the network lock.
+ */
+const EGRESS_GRANTS = new Set(['any', 'all', 'internet'])
+
+function egressAllowed (manifest) {
+  const v = manifest && typeof manifest.egress === 'string' ? manifest.egress.trim().toLowerCase() : null
+  return v !== null && EGRESS_GRANTS.has(v)
+}
+
+/** Node policy from the environment, matching how the executor already reads its config. */
+function nodePolicyFromEnv (env = process.env) {
+  return {
+    shared: env.IRIS_NODE_SHARED === '1',
+    require_isolation: env.IRIS_REQUIRE_ISOLATION === '1'
+  }
+}
+
+/**
+ * Decide HOW a user script runs, and hand back the command — or a refusal.
+ *
+ * This is the whole S2.2 call site in one testable function, deliberately: the executor is
+ * 4,000 lines and every capability that bought itself a branch in there is a capability nobody
+ * can test. The executor's job is to call this and obey it.
+ *
+ * A REFUSAL RETURNS NO COMMAND. Not a command that happens to be safe, not a flag the caller
+ * might forget to check — nothing to run. The only way to execute is to be handed something.
+ */
+function planScriptExecution (o) {
+  const decision = decideExecution(o.policy || {}, o.isolation)
+  const manifest = o.manifest || {}
+
+  if (decision.mode === 'refused') {
+    return { mode: 'refused', isolated: false, reason: decision.reason, cmd: null, args: null }
+  }
+
+  // The manifest may lower the timeout but not raise it past the sandbox ceiling; a script does
+  // not get to grant itself more of the node than the node offers.
+  const timeoutSeconds = Math.min(
+    Number(manifest.timeout) > 0 ? Number(manifest.timeout) : DEFAULT_LIMITS.timeoutSeconds,
+    DEFAULT_LIMITS.timeoutSeconds
+  )
+
+  if (decision.mode === 'sandboxed') {
+    const built = buildSandboxCommand({
+      runtime: o.runtime,
+      scriptPath: o.scriptPath,
+      outputDir: o.outputDir,
+      allowNetwork: egressAllowed(manifest),
+      env: o.env,
+      limits: { ...(o.limits || {}), timeoutSeconds }
+    })
+
+    return { mode: 'sandboxed', isolated: true, reason: null, egressEnforced: true, ...built }
+  }
+
+  // HOST PATH — a personal node with no container runtime. It runs, and it says plainly that
+  // nothing here is enforced. Reporting egress as applied when the script has the machine's
+  // whole network would be a claim the system cannot back.
+  const entry = {
+    bash: ['/bin/bash', o.scriptPath],
+    node: ['node', o.scriptPath],
+    python: ['python3', o.scriptPath]
+  }[o.runtime || 'bash'] || ['/bin/bash', o.scriptPath]
+
+  return {
+    mode: 'host',
+    isolated: false,
+    egressEnforced: false,
+    reason: (o.isolation && o.isolation.reason) || null,
+    cmd: entry[0],
+    args: entry.slice(1),
+    timeoutMs: timeoutSeconds * 1000
+  }
+}
+
 module.exports = {
+  planScriptExecution,
+  nodePolicyFromEnv,
+  egressAllowed,
   buildSandboxCommand,
   isolationRequired,
   decideExecution,
