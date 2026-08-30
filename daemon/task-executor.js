@@ -19,7 +19,8 @@
  * while the giants remain trapped in their walled gardens.
  */
 
-const { spawn, execSync, execFileSync } = require('child_process')
+const { spawn, execSync, execFileSync, exec: execAsync } = require('child_process')
+const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -3845,44 +3846,61 @@ exit 1
           // Execute a shell command on this node on behalf of a Hive peer.
           // Dispatched via HiveNodeProxyController.relay() with action='exec'.
           // Returns { command, stdout, stderr, exit_code, duration_ms }.
-          const execCommand = (task.config && task.config.command) || task.prompt
-          if (!execCommand || typeof execCommand !== 'string') {
-            reject(new Error('peer_exec requires config.command (string)'))
+          // ASYNC, NOT execSync. The heartbeat runs in this same process and the daemon
+          // collects pending work on it, so a synchronous command froze the node for its
+          // whole duration — it stopped heartbeating, looked offline to the hub, and picked
+          // up nothing else. A capability meant to HELP someone could take their node down
+          // for a minute at a time.
+          const execPlan = planPeerExec(task, {
+            dataDir: this.config ? this.config.dataDir : undefined
+          })
+          if (!execPlan.ok) {
+            reject(new Error(execPlan.reason))
             return
           }
-          const execTimeout = Math.min(Number(task.timeout_seconds || 30), 60) * 1000
-          const execCwd = (task.config && task.config.cwd) ||
-            (this.config ? this.config.dataDir : (process.env.WORKSPACE_DIR || process.cwd()))
 
           const execStarted = Date.now()
-          let execStdout = ''
-          let execStderr = ''
-          let execExit = 0
 
-          try {
-            execStdout = execSync(execCommand, {
-              cwd: execCwd,
-              timeout: execTimeout,
-              encoding: 'utf-8',
-              maxBuffer: 5 * 1024 * 1024,
-              shell: '/bin/bash',
-              stdio: ['ignore', 'pipe', 'pipe']
+          execAsync(execPlan.command, {
+            cwd: execPlan.cwd,
+            timeout: execPlan.timeoutMs,
+            encoding: 'utf-8',
+            maxBuffer: 5 * 1024 * 1024,
+            shell: '/bin/bash'
+          }, (err, stdout, stderr) => {
+            const out = (stdout && stdout.toString()) || ''
+            const errOut = (stderr && stderr.toString()) || ''
+
+            // A TIMEOUT IS NOT AN EXIT CODE. child_process reports a killed process with
+            // signal SIGTERM and no status, which would otherwise be reported as exit 1 —
+            // indistinguishable from a command that ran and failed. For an install that
+            // matters: "it failed" and "we cut it off halfway" need different responses
+            // from whoever is helping.
+            const timedOut = !!(err && err.killed && err.signal)
+
+            const execResult = {
+              command: execPlan.command,
+              stdout: out,
+              stderr: errOut || (err && !timedOut ? err.message : ''),
+              exit_code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+              duration_ms: Date.now() - execStarted,
+              cwd: execPlan.cwd,
+              timed_out: timedOut,
+              timeout_seconds: execPlan.timeoutMs / 1000
+            }
+
+            if (timedOut) {
+              execResult.stderr = (errOut ? errOut + '\n' : '')
+                + `Command was still running after ${execPlan.timeoutMs / 1000}s and was stopped. `
+                + 'Any output above is partial, and the command may have half-finished. '
+                + 'For long work, start it in the background and poll instead.'
+            }
+
+            resolve({
+              output: out || execResult.stderr || '(no output)',
+              result: execResult
             })
-          } catch (err) {
-            execExit = err.status || 1
-            execStdout = (err.stdout && err.stdout.toString()) || ''
-            execStderr = (err.stderr && err.stderr.toString()) || (err.message || '')
-          }
-
-          const execResult = {
-            command: execCommand,
-            stdout: execStdout,
-            stderr: execStderr,
-            exit_code: execExit,
-            duration_ms: Date.now() - execStarted,
-            cwd: execCwd
-          }
-          resolve({ output: execStdout || execStderr || '(no output)', result: execResult })
+          })
           return
         }
 
