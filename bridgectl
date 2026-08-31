@@ -80,7 +80,11 @@ case "${1:-status}" in
     restart) "$0" stop || exit 1; sleep 1; "$0" start ;;
     status)
         if curl -s "http://localhost:3200/health" > /dev/null 2>&1; then
-            echo "Running (PID: $(lsof -ti :3200 2>/dev/null || true))"
+            # The health endpoint is the real check and it already passed; lsof only
+            # decorates. It lives in /usr/sbin, which is absent from some minimal PATHs, and
+            # printing "Running (PID: )" makes a healthy daemon look broken.
+            _pid=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
+            if [ -n "${_pid// /}" ]; then echo "Running (PID: ${_pid% })"; else echo "Running"; fi
         else echo "Not running"; fi ;;
     logs) tail -f "$BRIDGE_DIR/bridge.log" ;;
     *) echo "Usage: iris-bridge {start|stop|restart|status|logs}" ;;
