@@ -11,6 +11,27 @@ while [ -h "$SOURCE" ]; do
     [ "${SOURCE#/}" = "$SOURCE" ] && SOURCE="$DIR/$SOURCE"
 done
 BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+# Preflight: name the missing dependency instead of exiting 1 with nothing.
+#
+# The daemon needs node and tmux and checked for neither. When either was absent it exited
+# code 1 silently, and the only way to learn why was to read its logs — which is exactly what
+# a client had to do on 2026-08-31, twice in one session, once for each dependency.
+#
+# "exited with code 1" is not a diagnosis. This turns it into one.
+missing_deps=""
+command -v node >/dev/null 2>&1 || missing_deps="$missing_deps node"
+command -v tmux >/dev/null 2>&1 || missing_deps="$missing_deps tmux"
+if [ -n "$missing_deps" ]; then
+    echo "ERROR: the Hive daemon cannot start — missing:$missing_deps" >&2
+    case "$missing_deps" in
+        *node*) echo "  node: re-run the installer (curl -fsSL https://heyiris.io/install-code | bash)" >&2 ;;
+    esac
+    case "$missing_deps" in
+        *tmux*) echo "  tmux: brew install tmux    (macOS)  |  sudo apt-get install tmux  (Linux)" >&2 ;;
+    esac
+    exit 1
+fi
+
 case "${1:-status}" in
     start)
         PID=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
