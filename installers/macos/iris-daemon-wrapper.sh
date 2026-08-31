@@ -17,9 +17,25 @@ IRIS_DIR="${HOME}/.iris"
 CONFIG_FILE="${IRIS_DIR}/config.json"
 DAEMON_DIR="${IRIS_DIR}/daemon"
 
+# Say WHERE this aborted. `set -e` plus launchd's bare environment means any unexpected
+# failure kills the wrapper with no output at all — the daemon simply never appears, and
+# launchd reports nothing useful. A client spent 2026-08-31 chasing exactly this: "the wrapper
+# is running but not reaching the echo", diagnosed only by adding debug lines by hand.
+# One trap turns a silent death into a line naming the command and the line number.
+trap 'echo "iris-daemon-wrapper: aborted at line $LINENO: $BASH_COMMAND" >&2' ERR
+
 # ─── Resolve PATH ─────────────────────────────────────────────
 # LaunchAgents get a minimal PATH. We need to find node.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH}"
+
+# The installer's own Node, which lives in $HOME and is NOT on any system path.
+# Added 2026-08-31 together with the installer step that puts it there: without this the
+# wrapper cannot see the very Node the installer just provided, and under `set -e` that is a
+# silent abort — the daemon looks broken on a machine where Node is definitely installed.
+# Glob rather than a pinned version so a Node upgrade does not orphan the daemon.
+for _iris_node in "${IRIS_DIR}"/runtime/node-*/bin; do
+  [ -d "$_iris_node" ] && export PATH="$_iris_node:${PATH}"
+done
 
 # nvm (common Node.js version manager)
 if [ -s "${HOME}/.nvm/nvm.sh" ]; then
