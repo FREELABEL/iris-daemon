@@ -21,6 +21,10 @@ BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 missing_deps=""
 command -v node >/dev/null 2>&1 || missing_deps="$missing_deps node"
 command -v tmux >/dev/null 2>&1 || missing_deps="$missing_deps tmux"
+# git is used 10x by the bridge (clone/pull for self-update). On macOS the binary exists as a
+# stub that PROMPTS for Xcode Command Line Tools, so "git is there" is not the same as "git
+# works" — `git --version` is the check that distinguishes them.
+git --version >/dev/null 2>&1 || missing_deps="$missing_deps git"
 if [ -n "$missing_deps" ]; then
     echo "ERROR: the Hive daemon cannot start — missing:$missing_deps" >&2
     case "$missing_deps" in
@@ -28,6 +32,9 @@ if [ -n "$missing_deps" ]; then
     esac
     case "$missing_deps" in
         *tmux*) echo "  tmux: brew install tmux    (macOS)  |  sudo apt-get install tmux  (Linux)" >&2 ;;
+    esac
+    case "$missing_deps" in
+        *git*) echo "  git:  xcode-select --install (macOS)  |  sudo apt-get install git   (Linux)" >&2 ;;
     esac
     exit 1
 fi
