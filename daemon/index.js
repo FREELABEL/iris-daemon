@@ -26,6 +26,8 @@ const { TaskExecutor } = require('./task-executor')
 const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { detectTailscaleIp } = require('./tailscale-address')
+const { deriveSessionStatus } = require('./session-status')
+const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
@@ -2714,21 +2716,52 @@ LIMIT ${limit}
         { slug: 'ollama', name: 'ollama' }
       ]
 
+      const PER_PROVIDER_LIMIT = 25
       const sessions = []
+      const truncated = []
       for (const { slug, name } of providers) {
-        const data = await getJson(`/api/sessions/${slug}?limit=10&counts=0`)
-        for (const s of (data && data.sessions) || []) {
+        const data = await getJson(`/api/sessions/${slug}?limit=${PER_PROVIDER_LIMIT}&counts=0`)
+        const rows = (data && data.sessions) || []
+
+        // Truncation must be VISIBLE. The old limit of 10 per provider produced exactly 20
+        // sessions on every node — measured identically on two different machines with
+        // different workloads, which is what a silent cap looks like from outside. A list
+        // quietly cut cannot be told from a list that is complete.
+        if (rows.length >= PER_PROVIDER_LIMIT) truncated.push(name)
+
+        for (const s of rows) {
           sessions.push({
             session_id: s.session_id,
             provider: s.provider || name,
             name: s.name || 'Session',
-            status: s.status || 'active',
+            // A name a human can use. `name` stays raw; this is derived, so nothing is lost.
+            // Measured live: 14 sessions across two machines had names that were not
+            // identifiers at all — a box-drawing rule, Nerd Font private-use glyphs, a raw
+            // tool-use id, and 'New session - <iso>'. Derived HERE so the MCP tools and the
+            // API fleet view get it too, not just one renderer.
+            label: sessionLabel(s),
+            // DERIVED from updated_at, never defaulted to 'active'.
+            //
+            // This was `s.status || 'active'`, so every session whose provider gave no
+            // status — all of them, for opencode — was stamped active. Measured on the live
+            // fleet: 40 sessions, ONE distinct status value, oldest 15 days old and still
+            // reported as running. Absence was being recorded as activity.
+            status: deriveSessionStatus(s.updated_at),
             project_path: s.project_path || null,
             git_branch: s.git_branch || null,
             model: s.model || null,
             updated_at: s.updated_at || null
           })
         }
+      }
+
+      // Freshest first, so anything that truncates downstream keeps live work rather than
+      // whichever fossils happened to sort first.
+      sessions.sort((a, b) => Date.parse(b.updated_at || 0) - Date.parse(a.updated_at || 0))
+
+      this._cachedSessionsTruncated = truncated
+      if (truncated.length) {
+        console.log(`[sessions] hit the ${PER_PROVIDER_LIMIT}-session cap for: ${truncated.join(', ')} — the fleet view is incomplete for those providers`)
       }
 
       this._cachedSessions = sessions

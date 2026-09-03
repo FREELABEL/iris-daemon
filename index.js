@@ -1,3 +1,4 @@
+const { readOpencodeModel, readGitBranch } = require('./daemon/opencode-session-meta')
 const express = require('express')
 const obsidian = require('./drivers/obsidian')
 const { spawn } = require('child_process')
@@ -194,6 +195,12 @@ module.exports = { setEmbeddedDaemon, app }
 
 const IMessageChannel = require('./channels/imessage')
 let iMessageChannel = null
+
+// ─── Rabbit R1 Channel (handheld agent client) ──────────────────
+
+const R1Channel = require('./channels/r1')
+const r1Devices = require('./lib/r1-devices')
+let r1Channel = null
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
@@ -1708,6 +1715,142 @@ app.delete('/api/providers/imessage', async (req, res) => {
   writeBridgeEnv(env)
 
   res.json({ status: 'stopped' })
+})
+
+// ─── Rabbit R1 Provider ──────────────────────────────────────────
+//
+// All of these sit behind the global bridgeAuth (X-Bridge-Key) — only the
+// machine operator pairs or revokes a handheld. The DEVICES themselves never
+// use the operator key; they carry their own per-device token (lib/r1-devices)
+// presented in the WS hello frame, so a lost R1 is revoked on its own.
+
+function buildR1Config (source, httpServer) {
+  return {
+    enabled: true,
+    server: httpServer,                                   // share the bridge's port
+    path: source.path || '/r1',
+    mode: source.mode || 'chat',
+    dialect: source.dialect || 'openclaw',
+    capture: source.capture === true || source.capture === 'true',
+    agentId: source.agent_id ? Number(source.agent_id) : null,
+    bloqId: source.bloq_id ? Number(source.bloq_id) : null,
+    userId: source.user_id ? Number(source.user_id) : null,
+    irisApiUrl: source.iris_api_url || process.env.IRIS_API_URL || 'https://freelabel.net',
+    language: source.language || null,
+    glossary: source.glossary || null,
+    transcribeProvider: source.transcribe_provider || 'auto',
+    maxReplyChars: source.max_reply_chars ? Number(source.max_reply_chars) : 900,
+    pollIntervalMs: source.poll_interval_ms ? Number(source.poll_interval_ms) : 1200,
+    agentTimeoutMs: source.agent_timeout_ms ? Number(source.agent_timeout_ms) : 120000
+  }
+}
+
+app.post('/api/providers/r1', async (req, res) => {
+  const mode = req.body.mode || 'chat'
+
+  if (mode !== 'chat' && mode !== 'channel') {
+    return res.status(400).json({ error: `unknown mode: ${mode} (expected 'chat' or 'channel')` })
+  }
+  if (mode === 'chat' && !req.body.agent_id) {
+    return res.status(400).json({ error: "chat mode requires agent_id — the agent the R1 talks to" })
+  }
+
+  try {
+    if (r1Channel) {
+      await r1Channel.stop()
+      r1Channel = null
+    }
+
+    const config = buildR1Config(req.body, server)
+    r1Channel = new R1Channel(config)
+    const started = await r1Channel.start()
+
+    const env = readBridgeEnv()
+    env.R1_ENABLED = 'true'
+    env.R1_MODE = config.mode
+    env.R1_DIALECT = config.dialect
+    if (config.capture) env.R1_CAPTURE = '1'
+    if (config.agentId) env.R1_AGENT_ID = String(config.agentId)
+    if (config.bloqId) env.R1_BLOQ_ID = String(config.bloqId)
+    if (config.userId) env.R1_USER_ID = String(config.userId)
+    if (config.path !== '/r1') env.R1_PATH = config.path
+    if (config.language) env.R1_LANGUAGE = config.language
+    if (config.glossary) env.R1_GLOSSARY = config.glossary
+    if (config.irisApiUrl) env.R1_IRIS_API_URL = config.irisApiUrl
+    writeBridgeEnv(env)
+
+    res.json({ ...started, devices_paired: r1Devices.list().length })
+  } catch (err) {
+    if (r1Channel) {
+      try { await r1Channel.stop() } catch { /* ignore */ }
+      r1Channel = null
+    }
+    console.error(`[r1] Start failed: ${err.message}`)
+    res.status(400).json({ error: `Failed to start R1 channel: ${err.message}` })
+  }
+})
+
+app.delete('/api/providers/r1', async (req, res) => {
+  if (r1Channel) {
+    try { await r1Channel.stop() } catch { /* ignore */ }
+    r1Channel = null
+  }
+
+  const env = readBridgeEnv()
+  for (const key of ['R1_ENABLED', 'R1_MODE', 'R1_DIALECT', 'R1_CAPTURE', 'R1_AGENT_ID',
+    'R1_BLOQ_ID', 'R1_USER_ID', 'R1_PATH', 'R1_LANGUAGE', 'R1_GLOSSARY', 'R1_IRIS_API_URL']) {
+    delete env[key]
+  }
+  writeBridgeEnv(env)
+
+  // Pairings deliberately SURVIVE stopping the channel — turning the gateway
+  // off for a night should not force you to re-pair every handheld. Removing a
+  // device is its own explicit act.
+  res.json({ status: 'stopped', devices_paired: r1Devices.list().length })
+})
+
+app.get('/api/providers/r1', (req, res) => {
+  if (!r1Channel) {
+    return res.json({
+      channel: 'r1',
+      running: false,
+      devices_paired: r1Devices.list().length,
+      hint: 'POST /api/providers/r1 with { agent_id } to start the gateway'
+    })
+  }
+  res.json({ ...r1Channel.getStatus(), devices_paired: r1Devices.list().length })
+})
+
+// ─── R1 Device Pairing ───────────────────────────────────────────
+
+app.post('/api/r1/devices', (req, res) => {
+  const { device_id, label, agent_id } = req.body
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' })
+
+  try {
+    const paired = r1Devices.pair(device_id, { label, agentId: agent_id ? Number(agent_id) : null })
+    console.log(`[r1] Paired device ${paired.device_id} (${paired.label})`)
+    // The plaintext token is returned HERE AND NOWHERE ELSE — only its sha256
+    // is stored. Losing it means re-pairing, which is the intended trade.
+    res.json({ ...paired, note: 'Store this token on the device now — it is not recoverable.' })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+app.get('/api/r1/devices', (req, res) => {
+  const connected = new Set((r1Channel?.getStatus().sessions || []).map(s => s.device_id))
+  res.json({
+    devices: r1Devices.list().map(d => ({ ...d, connected: connected.has(d.device_id) })),
+    registry: r1Devices.REGISTRY_PATH
+  })
+})
+
+app.delete('/api/r1/devices/:deviceId', (req, res) => {
+  const removed = r1Devices.revoke(req.params.deviceId)
+  if (!removed) return res.status(404).json({ error: `no paired device ${req.params.deviceId}` })
+  console.log(`[r1] Revoked device ${req.params.deviceId}`)
+  res.json({ status: 'revoked', device_id: req.params.deviceId })
 })
 
 // ─── iMessage Direct Endpoints ───────────────────────────────────
@@ -3648,8 +3791,13 @@ app.get('/api/sessions/opencode', async (req, res) => {
             session_id: data.id,
             name: data.title || data.slug || 'OpenCode Session',
             project_path: data.directory || null,
-            git_branch: null,
-            model: null,
+            // Were both hardcoded null, so half the fleet's sessions had no model —
+            // measured 10 of 20 on each of two machines. Both reads are BOUNDED: the model
+            // is one file (newest message only, of hundreds), the branch is one small file
+            // (.git/HEAD, no subprocess). Unbounded per-session reads on a listing that
+            // feeds the heartbeat is what wedged a node for 26 hours (#182371).
+            git_branch: readGitBranch(data.directory),
+            model: readOpencodeModel(msgDir),
             created_at: data.time && data.time.created ? new Date(data.time.created).toISOString() : null,
             updated_at: data.time && data.time.updated ? new Date(data.time.updated).toISOString() : null,
             message_count: messageCount,
@@ -4267,6 +4415,37 @@ async function autoStartBots () {
       }
     }
   }
+
+  // ─── R1 ───
+  // Safe to attach to `server` here: autoStartBots() is invoked from inside the
+  // app.listen callback, so the HTTP server is already listening.
+  if (env.R1_ENABLED === 'true') {
+    const mode = env.R1_MODE || 'chat'
+    if (mode === 'chat' && !env.R1_AGENT_ID) {
+      console.warn('[auto-start] R1 skipped: chat mode with no R1_AGENT_ID')
+    } else {
+      console.log(`[auto-start] Found saved R1 config (mode: ${mode}), starting...`)
+      try {
+        r1Channel = new R1Channel(buildR1Config({
+          mode,
+          dialect: env.R1_DIALECT,
+          capture: env.R1_CAPTURE === '1',
+          path: env.R1_PATH,
+          agent_id: env.R1_AGENT_ID,
+          bloq_id: env.R1_BLOQ_ID,
+          user_id: env.R1_USER_ID,
+          language: env.R1_LANGUAGE,
+          glossary: env.R1_GLOSSARY,
+          iris_api_url: env.R1_IRIS_API_URL
+        }, server))
+        await r1Channel.start()
+        console.log(`[auto-start] R1 gateway up — ${r1Devices.list().length} device(s) paired`)
+      } catch (err) {
+        console.error(`[auto-start] R1 failed: ${err.message}`)
+        r1Channel = null
+      }
+    }
+  }
 }
 
 // ─── Auto-Start Daemon (Embedded Mode) ────────────────────────────
@@ -4433,6 +4612,8 @@ const server = app.listen(PORT, BIND_HOST, () => {
   console.log(`  POST /api/providers/imessage`)
   console.log(`  DELETE /api/providers/imessage`)
   console.log(`  POST /webhook/bluebubbles`)
+  console.log(`  GET/POST/DELETE /api/providers/r1     (Rabbit R1 gateway)`)
+  console.log(`  GET/POST /api/r1/devices              (pair a handheld)`)
   console.log(`  GET  /api/sessions/claude-code`)
   console.log(`  POST /api/sessions/claude-code`)
   console.log(`  POST /api/sessions/claude-code/:id/message`)
