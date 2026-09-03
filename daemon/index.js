@@ -27,6 +27,7 @@ const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { detectTailscaleIp } = require('./tailscale-address')
 const { deriveSessionStatus } = require('./session-status')
+const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
@@ -2733,6 +2734,12 @@ LIMIT ${limit}
             session_id: s.session_id,
             provider: s.provider || name,
             name: s.name || 'Session',
+            // A name a human can use. `name` stays raw; this is derived, so nothing is lost.
+            // Measured live: 14 sessions across two machines had names that were not
+            // identifiers at all — a box-drawing rule, Nerd Font private-use glyphs, a raw
+            // tool-use id, and 'New session - <iso>'. Derived HERE so the MCP tools and the
+            // API fleet view get it too, not just one renderer.
+            label: sessionLabel(s),
             // DERIVED from updated_at, never defaulted to 'active'.
             //
             // This was `s.status || 'active'`, so every session whose provider gave no
