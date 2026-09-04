@@ -2726,9 +2726,21 @@ LIMIT ${limit}
       const PER_PROVIDER_LIMIT = 25
       const sessions = []
       const truncated = []
+      const unreachable = []
       for (const { slug, name } of providers) {
         const data = await getJson(`/api/sessions/${slug}?limit=${PER_PROVIDER_LIMIT}&counts=0`)
-        const rows = (data && data.sessions) || []
+
+        // null means we could NOT ASK — a non-200, a parse failure, a timeout. It does not
+        // mean the provider has no sessions, and `(data && data.sessions) || []` silently
+        // turned the first into the second. That is the same collapse fixed one layer up in
+        // #183538, still present here: a node whose bridge cannot serve /api/sessions/* was
+        // reporting a confident "zero sessions" instead of "I could not look".
+        if (data === null) {
+          unreachable.push(name)
+          continue
+        }
+
+        const rows = data.sessions || []
 
         // Truncation must be VISIBLE. The old limit of 10 per provider produced exactly 20
         // sessions on every node — measured identically on two different machines with
@@ -2767,10 +2779,20 @@ LIMIT ${limit}
       sessions.sort((a, b) => Date.parse(b.updated_at || 0) - Date.parse(a.updated_at || 0))
 
       this._cachedSessionsTruncated = truncated
-      // The refresh RAN and produced an answer — even if that answer is zero sessions.
-      // This flag is what lets the heartbeat distinguish "I looked and found none" from
-      // "I could not look", which the fleet record could not tell apart (#183538).
-      this._sessionsReportable = true
+      this._cachedSessionsUnreachable = unreachable
+
+      // Reportable only if we could ask AT LEAST ONE provider. If every provider was
+      // unreachable we know nothing, and saying "zero sessions" would be a confident lie —
+      // the heartbeat omits the field instead and the server keeps the last known list
+      // without re-timestamping it.
+      //
+      // A PARTIAL failure still reports, because what we did learn is true and useful; the
+      // providers we could not reach are named so the gap is visible rather than implied by
+      // an absence.
+      this._sessionsReportable = unreachable.length < providers.length
+      if (unreachable.length) {
+        console.warn(`[sessions] could not reach: ${unreachable.join(', ')} — their sessions are UNKNOWN, not zero`)
+      }
       if (truncated.length) {
         console.log(`[sessions] hit the ${PER_PROVIDER_LIMIT}-session cap for: ${truncated.join(', ')} — the fleet view is incomplete for those providers`)
       }
