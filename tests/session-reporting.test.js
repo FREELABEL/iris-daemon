@@ -34,8 +34,14 @@ test('the heartbeat OMITS active_sessions when the refresh could not run', () =>
   )
 })
 
-test('a successful refresh marks the node reportable', () => {
-  assert.match(SRC, /this\._sessionsReportable = true/)
+test('reportability is DERIVED from reachability, never hardcoded true', () => {
+  // It was `= true` on any completed loop, which is how a refresh that reached nothing still
+  // announced "zero sessions". The flag must be computed from what we could actually ask.
+  assert.ok(
+    !/this\._sessionsReportable = true\b/.test(SRC),
+    'reportability must not be hardcoded true — it has to be earned',
+  )
+  assert.match(SRC, /this\._sessionsReportable = unreachable\.length < providers\.length/)
 })
 
 test('a FAILED refresh marks it unreportable rather than reporting zero', () => {
@@ -68,4 +74,22 @@ test('a failed refresh does NOT wipe the last known list', () => {
 test('the failure is announced, not silent', () => {
   // A refresh that quietly stops is indistinguishable from one that keeps succeeding.
   assert.match(SRC, /\[sessions\] refresh failed/)
+})
+
+test('a provider we could NOT ASK is not counted as zero sessions', () => {
+  // getJson resolves null for a non-200, a parse failure or a timeout. The old
+  // `(data && data.sessions) || []` turned that into an empty list, so a node whose bridge
+  // could not serve /api/sessions/* reported a confident "zero sessions". Same collapse as
+  // the bug one layer up, one layer down.
+  assert.match(SRC, /if \(data === null\) \{[\s\S]{0,120}?unreachable\.push\(name\)/)
+})
+
+test('all providers unreachable means UNREPORTABLE, not zero', () => {
+  assert.match(SRC, /this\._sessionsReportable = unreachable\.length < providers\.length/)
+})
+
+test('a PARTIAL failure still reports, and names what was missed', () => {
+  // What we did learn is true and useful. The gap has to be visible rather than implied by
+  // an absence in the list.
+  assert.match(SRC, /could not reach: .*their sessions are UNKNOWN, not zero/)
 })
