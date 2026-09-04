@@ -357,7 +357,11 @@ class Daemon {
       ...(this._permissions ? { permissions: this._permissions } : {}),
       uptime_seconds: Math.round(process.uptime()),
       started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
-      active_sessions: this._getLocalSessions(),
+      // OMITTED when the refresh could not run. Presence of this key is the signal the
+      // server uses: absent means "no update, preserve what you have", an explicit []
+      // means "I looked, there are none". Sending [] on failure is what let a machine
+      // that had stopped reporting keep showing 20 fossils as live (#183538).
+      ...(this._sessionsReportable ? { active_sessions: this._getLocalSessions() } : {}),
       session_capabilities: this._getSessionCapabilities(),
       // Which LOCAL DATA SOURCES this machine can actually serve right now, with a
       // reason for every one it cannot. Reported on every heartbeat (30s) rather than
@@ -444,6 +448,9 @@ class Daemon {
 
     // Initial session cache population
     this._cachedSessions = []
+    // Starts false: until the first refresh succeeds this node has not confirmed anything,
+    // and must not overwrite a good list with a hopeful empty one.
+    this._sessionsReportable = false
     this._refreshSessionCache()
 
     // Step 6: Listen for SIGUSR1 (pause/resume toggle from CLI)
@@ -2760,13 +2767,21 @@ LIMIT ${limit}
       sessions.sort((a, b) => Date.parse(b.updated_at || 0) - Date.parse(a.updated_at || 0))
 
       this._cachedSessionsTruncated = truncated
+      // The refresh RAN and produced an answer — even if that answer is zero sessions.
+      // This flag is what lets the heartbeat distinguish "I looked and found none" from
+      // "I could not look", which the fleet record could not tell apart (#183538).
+      this._sessionsReportable = true
       if (truncated.length) {
         console.log(`[sessions] hit the ${PER_PROVIDER_LIMIT}-session cap for: ${truncated.join(', ')} — the fleet view is incomplete for those providers`)
       }
 
       this._cachedSessions = sessions
-    } catch {
-      this._cachedSessions = []
+    } catch (err) {
+      // Could NOT look. Keep whatever was last known, but stop claiming it is current —
+      // the heartbeat will omit the field entirely, so the server preserves the old list
+      // without re-timestamping it as freshly confirmed.
+      this._sessionsReportable = false
+      console.warn(`[sessions] refresh failed, not reporting this cycle: ${err && err.message}`)
     }
   }
 
