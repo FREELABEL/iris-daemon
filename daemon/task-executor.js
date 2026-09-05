@@ -225,6 +225,29 @@ function resolveDaemonIdentity () {
  * at that hash is known-correct with no network call, and a pulled copy that hashes to
  * anything else is REFUSED rather than run.
  */
+/**
+ * The assets a script needs, from the cloud.
+ *
+ * Best-effort on absence, strict on failure: an empty list is normal (most scripts ship no
+ * assets), but a 500 or a malformed body must NOT read as "no assets" — that would run a
+ * watermarker with no watermark and call it a success.
+ */
+async function resolveUserScriptAssets (slug) {
+  const apiBase = process.env.IRIS_API_BASE || process.env.API_BASE_URL || 'https://freelabel.net'
+  const token = process.env.IRIS_NODE_TOKEN || process.env.NODE_TOKEN || ''
+  const url = `${apiBase}/api/v6/node-agent/scripts/${encodeURIComponent(slug)}/assets`
+
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } })
+  if (res.status === 404) return []                       // no such script here — the caller already failed
+  if (!res.ok) throw new Error(`asset fetch failed: HTTP ${res.status}`)
+
+  const body = await res.json()
+  const data = body && body.data
+  if (!Array.isArray(data)) throw new Error('asset response was not a list')
+
+  return data
+}
+
 async function resolveUserScriptBySlug (slug, expectedSha = null) {
   const contentDir = path.join(os.homedir(), '.iris', 'data', 'scripts', 'by-content')
   const sha = (s) => crypto.createHash('sha256').update(s, 'utf-8').digest('hex')
@@ -1819,6 +1842,20 @@ class TaskExecutor {
           const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
           const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
           fs.writeFileSync(scriptPath, script.script_content, 'utf-8')
+
+          // M6.2 — the files this script needs, written next to it. A watermarker without its
+          // watermark fails deep inside itself; materialising first means a missing asset is
+          // reported here, with the asset's name, instead of as whatever the script does when
+          // its input is absent.
+          try {
+            const assets = await resolveUserScriptAssets(slug)
+            if (assets.length) materialiseAssets(workspace.dir, assets)
+          } catch (e) {
+            // A script whose inputs are incomplete should not start. Throwing here fails the
+            // task with the reason, rather than running something that will produce wrong
+            // output and exit 0.
+            throw new Error(`could not prepare assets for '${slug}': ${e.message}`)
+          }
           // S2.2/S2.3 — DECIDE HOW THIS RUNS BEFORE RUNNING IT.
           //
           // The decision lives in daemon/sandbox.js, not here. This file is 4,000 lines because
