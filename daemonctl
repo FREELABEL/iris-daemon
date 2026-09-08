@@ -67,7 +67,22 @@ case "${1:-status}" in
             echo "Daemon already running"; exit 0
         fi
         rm -f "$SOCK"
-        nohup node "$BRIDGE_DIR/daemon.js" >> "$BRIDGE_DIR/daemon.log" 2>&1 &
+        # Prefer the supervisor when one exists. `stop` boots the launchd job out, so a
+        # plain nohup here would bring the daemon back UNSUPERVISED — alive now, gone after
+        # the next crash or reboot, and no longer the thing launchctl reports on. Loading
+        # the job starts it too, so this is a start either way.
+        LBL="io.heyiris.daemon"
+        PLIST="$HOME/Library/LaunchAgents/$LBL.plist"
+        if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
+            if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+               || launchctl load "$PLIST" 2>/dev/null; then
+                sleep 2
+                echo "Daemon started (launchd)"
+                exit 0
+            fi
+        fi
+
+        nohup node "$BRIDGE_DIR/daemon.js" > "$BRIDGE_DIR/daemon.log" 2>&1 &
         sleep 3
         if [ -S "$SOCK" ]; then
             echo "Hive daemon started (PID: $!)"
@@ -78,12 +93,90 @@ case "${1:-status}" in
             exit 1
         fi ;;
     stop)
+        # VERIFY THE STOP. This used to `kill` and immediately print "Daemon stopped",
+        # which is a claim, not an observation. When the process did not die promptly the
+        # next `start` found it alive, printed "Daemon already running", and the operator
+        # was told twice that everything worked while the OLD process kept running with a
+        # stale key — 401ing on every heartbeat. Measured 2026-08-12 after a key rotation.
+        #
+        # Also look for the process by name, not only by whoever holds port 3200. A daemon
+        # that crashed before binding, or bound elsewhere, is invisible to lsof and was
+        # reported as "Not running" while very much running.
         SOCK="$HOME/.iris/daemon.sock"
-        PID=$(lsof -ti :3200 2>/dev/null || true)
-        if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; echo "Daemon stopped (PID: $PID)"
-        elif [ -S "$SOCK" ]; then rm -f "$SOCK"; echo "Cleaned stale socket"
-        else echo "Not running"; fi ;;
-    restart) "$0" stop; sleep 1; "$0" start ;;
+
+        # THE DAEMON IS SUPERVISED. io.heyiris.daemon is a launchd job with KeepAlive, so
+        # killing the pid is whack-a-mole: launchd respawns it within a second and `stop`
+        # looks broken when it worked. Worse, `restart` then hits a live process and prints
+        # "Daemon already running" — reporting success for a daemon still holding whatever
+        # key it booted with. Stop the JOB, not the process.
+        LBL="io.heyiris.daemon"
+        PLIST="$HOME/Library/LaunchAgents/$LBL.plist"
+        if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
+            launchctl bootout "gui/$(id -u)/$LBL" 2>/dev/null \
+              || launchctl unload "$PLIST" 2>/dev/null || true
+            sleep 1
+        fi
+
+        PIDS=$(lsof -ti :3200 2>/dev/null || true)
+        PIDS="$PIDS $(pgrep -f "$BRIDGE_DIR/daemon.js" 2>/dev/null || true)"
+        PIDS=$(echo $PIDS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')
+
+        if [ -z "$(echo $PIDS | tr -d ' ')" ]; then
+            if [ -S "$SOCK" ]; then rm -f "$SOCK"; echo "Cleaned stale socket"
+            else echo "Not running"; fi
+            exit 0
+        fi
+
+        for P in $PIDS; do kill "$P" 2>/dev/null || true; done
+
+        # Give it up to 5s to exit cleanly, then stop asking nicely. Polling beats a fixed
+        # sleep in both directions: a fast exit is not punished, a slow one is not missed.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            STILL=""
+            for P in $PIDS; do kill -0 "$P" 2>/dev/null && STILL="$STILL $P"; done
+            [ -z "$(echo $STILL | tr -d ' ')" ] && break
+            sleep 0.5
+        done
+
+        STILL=""
+        for P in $PIDS; do kill -0 "$P" 2>/dev/null && STILL="$STILL $P"; done
+        if [ -n "$(echo $STILL | tr -d ' ')" ]; then
+            echo "Daemon did not exit on SIGTERM — forcing:$STILL"
+            for P in $STILL; do kill -9 "$P" 2>/dev/null || true; done
+            sleep 1
+        fi
+
+        STILL=""
+        for P in $PIDS; do kill -0 "$P" 2>/dev/null && STILL="$STILL $P"; done
+        rm -f "$SOCK" 2>/dev/null || true
+        if [ -n "$(echo $STILL | tr -d ' ')" ]; then
+            echo "FAILED to stop daemon:$STILL — still running" >&2
+            exit 1
+        fi
+        echo "Daemon stopped (PID:$PIDS)" ;;
+    restart)
+        # Under launchd, `kickstart -k` is the only restart that is guaranteed to replace the
+        # process — it kills and relaunches in one supervised step, so there is no window
+        # where `start` can find a survivor and no-op. This matters after a key rotation:
+        # the running process holds a credential that is now invalid, so it MUST be replaced.
+        LBL="io.heyiris.daemon"
+        PLIST="$HOME/Library/LaunchAgents/$LBL.plist"
+        if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
+            if launchctl kickstart -k "gui/$(id -u)/$LBL" 2>/dev/null; then
+                sleep 2
+                echo "Daemon restarted (launchd)"
+                exit 0
+            fi
+        fi
+
+        # Unsupervised fallback. `stop` exits non-zero if the process survived, so do not
+        # carry on to `start` — it would find the old process and report success for it.
+        if ! "$0" stop; then
+            echo "Not restarting: the old daemon is still running." >&2
+            exit 1
+        fi
+        sleep 1
+        "$0" start ;;
     status)
         SOCK="$HOME/.iris/daemon.sock"
         if [ -S "$SOCK" ]; then
