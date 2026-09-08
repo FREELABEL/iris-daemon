@@ -22,7 +22,11 @@
 
 // Task types that drive a real Chromium browser. Kept in sync with
 // TaskExecutor.BROWSER_TYPES — these consume the machine-wide 'browser' slot(s).
-const BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover']
+// browser_agent drives a real browser, so it takes the browser slot like custom_playwright.
+// Omitted, it was exempt from this gate — an agent-browser run could start alongside a
+// Playwright run and the two would contend for the same browser, which is the exact
+// contention the gate exists to prevent.
+const BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover', 'browser_agent']
 
 // Task types that must not run two-at-once on this node. Each maps to an exclusive
 // resource key below; for types with a known shared login that key models the real

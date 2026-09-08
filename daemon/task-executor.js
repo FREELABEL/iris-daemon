@@ -569,7 +569,13 @@ function playwrightHeadedFlag () {
 class TaskExecutor {
   // Task types that spawn Playwright/Chromium — only 1 browser at a time.
   // This prevents 5 Chromium windows opening simultaneously when schedules cluster.
-  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover']
+  // browser_agent belongs here for the same reason custom_playwright does: it drives a real
+  // browser. Left out, it was exempt from the browser concurrency gate — so an agent-browser
+  // run could start alongside a Playwright run and the two would contend for the same
+  // browser, which is the failure the gate exists to prevent. Caught by
+  // tests/browser-agent-executor.test.js, which asserted membership from the day the executor
+  // case was added and had been red ever since.
+  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover', 'browser_agent']
 
   // comms_sync auto-retries once on "instant death" (Bun spawn crash). Default
   // OFF — a failed comms_sync just fails instead of retrying. Flip on with the

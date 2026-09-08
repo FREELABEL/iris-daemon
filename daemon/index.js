@@ -33,6 +33,7 @@ const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
+const { runScript, clampTimeout } = require('./script-runner')
 const { ensureChromiumInstalled, chromiumInstalled } = require('../lib/playwright-setup')
 const { execSync, spawn } = require('child_process')
 const fs = require('fs')
@@ -997,84 +998,38 @@ class Daemon {
     })
 
     // ─── Script Execution (atomic push + run) ─────────────────────────
-    app.post(`${prefix}/execute-script`, (req, res) => {
+    //
+    // The body of this lived inline here, and tests/execute-script.test.js kept a hand-copied
+    // duplicate of it that had already drifted. Both now share daemon/script-runner.js, which
+    // also fixes the timeout: `spawn` without `detached` could only signal the direct child, so
+    // a grandchild survived, held the stdout pipe open, and turned a 3s cap into 25s of measured
+    // wall clock (2026-08-05). See that module's header for the full failure.
+    app.post(`${prefix}/execute-script`, async (req, res) => {
       const { filename, content, args: scriptArgs, timeout_ms, persist, env: requestEnv } = req.body || {}
 
-      if (!filename || !content) {
-        return res.status(400).json({ error: 'filename and content required' })
-      }
+      const scriptsDir = path.join(this.config.dataDir, 'scripts')
+      const timeout = clampTimeout(timeout_ms)
 
-      // Validate filename — no path separators or traversal
-      if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
-        return res.status(400).json({ error: 'filename must be a plain name (no paths)' })
-      }
+      console.log(`[execute-script] Running: ${filename} (timeout: ${timeout}ms, persist: ${!!persist})`)
 
-      const baseDir = this.config.dataDir
-      const scriptsDir = path.join(baseDir, 'scripts')
-      if (!fs.existsSync(scriptsDir)) fs.mkdirSync(scriptsDir, { recursive: true })
-
-      const scriptPath = path.join(scriptsDir, filename)
-      fs.writeFileSync(scriptPath, content, 'utf-8')
-      fs.chmodSync(scriptPath, '755')
-
-      // Auto-detect interpreter
-      const ext = path.extname(filename).toLowerCase()
-      const interpreters = { '.py': 'python3', '.js': 'node', '.ts': 'npx' }
-      const cmd = interpreters[ext] || '/bin/bash'
-      const spawnArgs = ext === '.ts' ? ['ts-node', scriptPath, ...(scriptArgs || [])] : [scriptPath, ...(scriptArgs || [])]
-
-      const timeout = Math.min(Math.max(timeout_ms || 30000, 1000), 300000)
-      const startTime = Date.now()
-
-      console.log(`[execute-script] Running: ${cmd} ${filename} (timeout: ${timeout}ms, persist: ${!!persist})`)
-
-      // #58002: Merge project env vars (from --project flag) into child process environment
-      const childEnv = { ...process.env, ...(requestEnv && typeof requestEnv === 'object' ? requestEnv : {}) }
-      const child = spawn(cmd, spawnArgs, {
-        cwd: scriptsDir,
-        env: childEnv,
-        stdio: ['pipe', 'pipe', 'pipe']
-      })
-
-      let stdout = ''
-      let stderr = ''
-      let killed = false
-
-      child.stdout.on('data', d => { stdout += d.toString() })
-      child.stderr.on('data', d => { stderr += d.toString() })
-
-      const timer = setTimeout(() => {
-        killed = true
-        child.kill('SIGKILL')
-      }, timeout)
-
-      child.on('close', (code) => {
-        clearTimeout(timer)
-        const duration = Date.now() - startTime
-
-        // Cleanup unless persist requested
-        if (!persist && fs.existsSync(scriptPath)) {
-          fs.unlinkSync(scriptPath)
-        }
-
-        console.log(`[execute-script] ${filename} → exit ${code} (${duration}ms)${killed ? ' [TIMEOUT]' : ''}`)
-
-        res.json({
-          status: killed ? 'timeout' : (code === 0 ? 'completed' : 'failed'),
-          exit_code: code,
-          stdout: stdout.slice(-50000),
-          stderr: stderr.slice(-10000),
-          duration_ms: duration,
-          script_path: persist ? '/scripts/' + filename : null,
-          machine: this.nodeName
+      try {
+        const result = await runScript({
+          scriptsDir,
+          filename,
+          content,
+          args: scriptArgs || [],
+          timeoutMs: timeout_ms,
+          persist: !!persist,
+          // #58002: project env vars (from --project) are merged over the daemon's own env.
+          env: requestEnv && typeof requestEnv === 'object' ? requestEnv : {}
         })
-      })
 
-      child.on('error', (err) => {
-        clearTimeout(timer)
-        if (!persist && fs.existsSync(scriptPath)) fs.unlinkSync(scriptPath)
-        res.status(500).json({ error: err.message })
-      })
+        console.log(`[execute-script] ${filename} → exit ${result.exit_code} (${result.duration_ms}ms)${result.timed_out ? ' [TIMEOUT]' : ''}`)
+
+        res.json({ ...result, machine: this.nodeName })
+      } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message })
+      }
     })
 
     // ─── Schedule Management ──────────────────────────────────────────

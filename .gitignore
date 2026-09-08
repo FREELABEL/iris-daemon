@@ -16,3 +16,6 @@ native-imessage-state.json
 # Test artifacts
 test-results/
 som/test-results/
+
+# Runtime cache, not source. It changes on every campaign fetch.
+som/.som-campaigns-cache.json
