@@ -1801,6 +1801,40 @@ class TaskExecutor {
           break
         }
 
+        case 'mcp_call': {
+          // Call a tool on an MCP server this node has ALLOWED. The task names the server;
+          // it never supplies a command, so the cloud can ask for `argent` and can only get
+          // it if this machine's owner put `argent` in ~/.iris/mcp-servers.json.
+          //
+          // Letting the task carry {command, args} was rejected: `sandbox_execute` already
+          // runs arbitrary shell from this same channel, so the capability would not be new,
+          // but that path goes through planScriptExecution() which can contain or refuse it.
+          // A long-lived MCP server process bypasses that entirely — a wider hole by a
+          // quieter route.
+          //
+          // Omit `tool` to get tools/list, which is how a node answers "what can you do".
+          const mcpCfg = task.config || {}
+          const mcpServer = mcpCfg.server || mcpCfg.mcp_server || (task.prompt || '').trim()
+          if (!mcpServer) {
+            reject(new Error("mcp_call requires config.server (the server NAME, allowlisted on this node) — commands are never accepted from a task"))
+            return
+          }
+
+          const mcpReq = {
+            server: mcpServer,
+            tool: mcpCfg.tool || null,
+            arguments: mcpCfg.arguments || mcpCfg.args || {},
+            timeout_ms: Number(mcpCfg.timeout_ms) > 0 ? Number(mcpCfg.timeout_ms) : undefined,
+            cwd: mcpCfg.cwd || workspace.dir
+          }
+          const mcpReqPath = path.join(workspace.dir, 'mcp-request.json')
+          fs.writeFileSync(mcpReqPath, JSON.stringify(mcpReq, null, 2), 'utf-8')
+
+          cmd = 'node'
+          args = [path.join(path.resolve(__dirname), 'mcp-run.js'), mcpReqPath]
+          break
+        }
+
         case 'hive_script': {
           // Run a Node.js script that can require the IRIS SDK
           // task.prompt = the JS script content

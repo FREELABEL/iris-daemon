@@ -228,6 +228,19 @@ const PROVIDERS = {
  */
 function capabilities () {
   const out = {}
+
+  // MCP servers this node has ALLOWED, advertised by name so the fleet can route work to a
+  // node that has the one it needs — the same shape as a Hive Script's declared requirements.
+  // Names and descriptions only: the commands stay on the machine. The fleet needs to know
+  // WHICH servers a node offers; it has no business knowing how they are launched.
+  try {
+    out.mcp = require('./mcp-registry').advertisement()
+  } catch (e) {
+    // Never let this take the heartbeat down — a node that stops heartbeating reads as
+    // OFFLINE, which is a far worse lie than an absent capability.
+    out.mcp = { available: false, reason: `mcp registry probe failed: ${e.message}`, detail: null, functions: [] }
+  }
+
   for (const [key, provider] of Object.entries(PROVIDERS)) {
     let probe
     try {
