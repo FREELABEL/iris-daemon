@@ -20,6 +20,7 @@
  */
 
 const { spawn, execSync, execFileSync, exec: execAsync } = require('child_process')
+const { OutputStreamer } = require('./output-streamer')
 const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
 const path = require('path')
@@ -997,6 +998,15 @@ class TaskExecutor {
     // Set up progress reporting (every 5s)
     let lastProgress = 0
     let outputLines = []
+
+    // LIVE OUTPUT. Every line below was already being collected and handed to console.log,
+    // where only someone sitting at this machine could see it. This forwards it so a task can
+    // be watched instead of waited on. It batches, drops rather than queues when output
+    // outpaces the wire, counts what it dropped, and can never fail the task — see
+    // daemon/output-streamer.js.
+    const outputStream = new OutputStreamer(this.cloud, taskId)
+    outputStream.start()
+
     const progressInterval = setInterval(async () => {
       const progress = this.estimateProgress(outputLines, task)
       if (progress !== lastProgress) {
@@ -1097,6 +1107,7 @@ class TaskExecutor {
           }
         } catch { /* non-macOS or notification failed */ }
         clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
         await this.cloud.submitResult(taskId, {
           status: 'completed',
           output: `Message delivered from ${senderName}`,
@@ -1137,6 +1148,7 @@ class TaskExecutor {
           const _callMs = Date.now() - _callStart
           console.log(`[timing] bridge_call ${provider}.${fnName}  preamble=${_callStart - startTime}ms  call=${_callMs}ms`)
           clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
           await this.cloud.submitResult(taskId, {
             status: 'completed',
             // `data` is the structured return; `output` stays populated so anything
@@ -1152,6 +1164,7 @@ class TaskExecutor {
           // listening / route error, and flattening those into one message is how
           // "bridge is offline" came to mean five different things.
           clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
           console.error(`[bridge-call] ${provider}.${fnName} failed: ${err.message}`)
           await this.cloud.submitResult(taskId, {
             status: 'failed',
@@ -1235,6 +1248,7 @@ class TaskExecutor {
         console.log(`[hive-search] Found ${limitedResults.length} result(s) for "${searchQuery}"`)
 
         clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
         await this.cloud.submitResult(taskId, {
           status: 'completed',
           output: JSON.stringify(limitedResults),
@@ -1272,7 +1286,7 @@ class TaskExecutor {
       if (runtime !== 'iris_agent' && task.type !== 'hive_script') {
         result = await this.runRuntimeProcess(task, runtime, workspace, outputLines)
       } else {
-        result = await this.runProcess(task, workspace, outputLines)
+        result = await this.runProcess(task, workspace, outputLines, outputStream)
       }
 
       // ── Exchange task: commit + push changes after execution ──
@@ -1304,6 +1318,7 @@ class TaskExecutor {
       }
 
       clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
 
       // ── Retry comms_sync on instant death (exit code null = signal kill) ──
       // Bun-compiled iris binary sometimes crashes on concurrent spawn (tempfile race).
@@ -1313,7 +1328,7 @@ class TaskExecutor {
         console.log(`[executor] comms_sync: instant death (exit null, ${Date.now() - startTime}ms) — retrying in 3s`)
         await new Promise(r => setTimeout(r, 3000))
         const retryLines = []
-        result = await this.runProcess(task, workspace, retryLines)
+        result = await this.runProcess(task, workspace, retryLines, outputStream)
         outputLines.push('[executor] === RETRY ATTEMPT ===', ...retryLines)
         console.log(`[executor] comms_sync retry: exit=${result.exitCode}`)
       }
@@ -1398,7 +1413,7 @@ class TaskExecutor {
         // Retry the original task
         const retryOutputLines = []
         outputLines.push('[executor] Retrying after re-auth...')
-        result = await this.runProcess(task, workspace, retryOutputLines)
+        result = await this.runProcess(task, workspace, retryOutputLines, outputStream)
         outputLines.push(...retryOutputLines)
 
         // If it fails again, give up
@@ -1666,6 +1681,7 @@ class TaskExecutor {
       this.notifyDiscord(task, notifyStatus, Date.now() - startTime, outputLines, notifyError).catch(() => {})
     } catch (err) {
       clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
 
       // The tmux path's promise rejects on a non-zero, non-graceful exit
       // (see runProcess) — that exit code was recorded on runningTasks
@@ -1731,7 +1747,10 @@ class TaskExecutor {
     }
   }
 
-  runProcess (task, workspace, outputLines) {
+  // outputStream is OPTIONAL. It carries live output to the cloud while the task runs, and a
+  // caller that does not pass one gets exactly the previous behaviour — which is what keeps
+  // the direct-invocation tests, and any other call site, working unchanged.
+  runProcess (task, workspace, outputLines, outputStream = null) {
     return new Promise(async (resolve, reject) => {
       let cmd, args
 
@@ -4169,6 +4188,7 @@ exit 1
           // implement it, say so plainly so the cloud can route elsewhere.
           if (KNOWN_STRUCTURED_TYPES.has(task.type)) {
             clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
             await this.cloud.submitResult(taskId, {
               status: 'failed',
               error: `This node does not support task type "${task.type}" — its daemon is out of date. Update the IRIS bridge on this machine.`,
@@ -4356,6 +4376,7 @@ exit 1
         // A caller cannot tell an error from a result by grepping for a prefix we invented.
         stdoutLines.push(...lines)
         outputLines.push(...lines)
+        if (outputStream) lines.forEach((line) => { if (line.trim()) outputStream.push(line, 'stdout') })
         lines.forEach((line) => {
           if (line.trim()) {
             console.log(`[task:${task.id.substring(0, 8)}] ${line}`)
@@ -4367,6 +4388,8 @@ exit 1
         const lines = data.toString().split('\n').filter(Boolean)
         stderrLines.push(...lines)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
+        // Pushed as its own STREAM, not with an invented prefix — the viewer can style it.
+        if (outputStream) lines.forEach((line) => { if (line.trim()) outputStream.push(line, 'stderr') })
         lines.forEach((line) => {
           if (line.trim()) {
             console.log(`[task:${task.id.substring(0, 8)}:err] ${line}`)

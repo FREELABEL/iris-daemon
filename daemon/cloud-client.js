@@ -150,6 +150,20 @@ class CloudClient {
   }
 
   /**
+   * Live output while the task is still RUNNING — the "watch it work" channel.
+   *
+   * Separate from reportProgress because progress carries a percentage and a 500-character
+   * status line for a progress bar. Widening that to take a log stream would change the
+   * contract for every existing consumer.
+   *
+   * Nothing is persisted at the far end: it broadcasts and returns. The final output still
+   * arrives through submitResult.
+   */
+  async reportOutput (taskId, seq, chunk, stream = 'stdout') {
+    return this.post(`/api/v6/node-agent/tasks/${taskId}/output`, { seq, chunk, stream })
+  }
+
+  /**
    * Submit final task result.
    */
   async submitResult (taskId, result) {
