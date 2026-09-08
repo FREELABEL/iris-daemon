@@ -5,6 +5,7 @@ const path = require('path')
 const os = require('os')
 const http = require('http')
 const { WorkspaceManager } = require('../daemon/workspace-manager')
+const { runScript } = require('../daemon/script-runner')
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -44,73 +45,36 @@ function httpGet (port, urlPath) {
 // Minimal Express-like server that mounts just the execute-script + files routes
 function createTestServer (dataDir) {
   const express = require('express')
-  const { spawn } = require('child_process')
   const app = express()
   app.use(express.json())
 
   const prefix = ''
 
-  // ─── execute-script (copied from daemon/index.js) ─────────────
-  app.post(`${prefix}/execute-script`, (req, res) => {
-    const { filename, content, args: scriptArgs, timeout_ms, persist } = req.body || {}
-
-    if (!filename || !content) {
-      return res.status(400).json({ error: 'filename and content required' })
-    }
-
-    if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
-      return res.status(400).json({ error: 'filename must be a plain name (no paths)' })
-    }
-
-    const baseDir = dataDir
-    const scriptsDir = path.join(baseDir, 'scripts')
-    if (!fs.existsSync(scriptsDir)) fs.mkdirSync(scriptsDir, { recursive: true })
-
-    const scriptPath = path.join(scriptsDir, filename)
-    fs.writeFileSync(scriptPath, content, 'utf-8')
-    fs.chmodSync(scriptPath, '755')
-
-    const ext = path.extname(filename).toLowerCase()
-    const interpreters = { '.py': 'python3', '.js': 'node', '.ts': 'npx' }
-    const cmd = interpreters[ext] || '/bin/bash'
-    const spawnArgs = ext === '.ts' ? ['ts-node', scriptPath, ...(scriptArgs || [])] : [scriptPath, ...(scriptArgs || [])]
-
-    const timeout = Math.min(Math.max(timeout_ms || 30000, 1000), 300000)
-
-    const child = spawn(cmd, spawnArgs, {
-      cwd: scriptsDir,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe']
-    })
-
-    let stdout = ''
-    let stderr = ''
-    let killed = false
-
-    child.stdout.on('data', d => { stdout += d.toString() })
-    child.stderr.on('data', d => { stderr += d.toString() })
-
-    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL') }, timeout)
-
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      if (!persist && fs.existsSync(scriptPath)) fs.unlinkSync(scriptPath)
-      res.json({
-        status: killed ? 'timeout' : (code === 0 ? 'completed' : 'failed'),
-        exit_code: code,
-        stdout: stdout.slice(-50000),
-        stderr: stderr.slice(-10000),
-        duration_ms: 0,
-        script_path: persist ? '/scripts/' + filename : null,
-        machine: 'test-node'
+  // ─── execute-script ───────────────────────────────────────────
+  //
+  // This used to be a HAND-COPIED duplicate of the handler in daemon/index.js, and the copy had
+  // drifted: it hardcoded duration_ms to 0, never merged caller env, and — critically — carried
+  // its own version of the timeout, so it could never have caught the process-group bug that
+  // made a 3s cap run for 25s in production. Green tests against code that does not ship.
+  //
+  // It now mounts the SAME module the daemon does. The tests below therefore exercise the real
+  // behaviour over the real HTTP surface, which is the only thing they were ever meant to prove.
+  app.post(`${prefix}/execute-script`, async (req, res) => {
+    const { filename, content, args: scriptArgs, timeout_ms, persist, env: requestEnv } = req.body || {}
+    try {
+      const result = await runScript({
+        scriptsDir: path.join(dataDir, 'scripts'),
+        filename,
+        content,
+        args: scriptArgs || [],
+        timeoutMs: timeout_ms,
+        persist: !!persist,
+        env: requestEnv && typeof requestEnv === 'object' ? requestEnv : {}
       })
-    })
-
-    child.on('error', (err) => {
-      clearTimeout(timer)
-      if (!persist && fs.existsSync(scriptPath)) fs.unlinkSync(scriptPath)
-      res.status(500).json({ error: err.message })
-    })
+      res.json({ ...result, machine: 'test-node' })
+    } catch (err) {
+      res.status(err.statusCode || 500).json({ error: err.message })
+    }
   })
 
   // ─── files browse (for verifying persist) ─────────────────────
@@ -148,14 +112,13 @@ describe('execute-script endpoint', () => {
     })
   })
 
-  afterEach(() => {
-    // closeAllConnections() BEFORE close(): server.close() stops accepting but WAITS for open
-    // connections, and on Node 19+ http.globalAgent defaults to keepAlive:true. Defensive —
-    // this was NOT the cause of the exit hang investigated on 2026-08-23 (that was an
-    // un-unref'd 6-hourly setInterval in the TaskExecutor constructor), but leaving a keep-alive
-    // socket pinned to a closed-over server is a real leak and cheap to close properly.
-    server.closeAllConnections?.()
-    server.close()
+  afterEach(async () => {
+    // `server.close()` alone NEVER finishes here: httpPost uses the global agent, so keep-alive
+    // sockets stay open, close() waits for them, the event loop never drains and the whole file
+    // hangs. `node --test tests/` therefore never terminated — the suite could not run in CI at
+    // all. Destroy the sockets, and await the close.
+    if (server.closeAllConnections) server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 
