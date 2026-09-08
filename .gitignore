@@ -19,3 +19,6 @@ som/test-results/
 
 # Runtime cache, not source. It changes on every campaign fetch.
 som/.som-campaigns-cache.json
+
+# Paired R1 device registry — runtime state, holds per-device token hashes.
+r1-devices.json
