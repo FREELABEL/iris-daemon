@@ -45,6 +45,18 @@ async function main () {
   if (!resolved.ok) die(resolved.reason)
 
   const opts = { timeoutMs: req.timeout_ms, cwd: req.cwd }
+
+  // An empty object survives the cloud as an empty ARRAY. PHP's json_decode($x, true) turns
+  // `{}` into `[]`, re-encodes it as `[]`, and JS treats `[]` as truthy — so a `|| {}`
+  // fallback never fires and the MCP server rejects the call:
+  //
+  //   invalid_type at params.arguments: expected record, received array
+  //
+  // Found only by dispatching through the real cloud path; every local test passed because
+  // nothing here round-trips through PHP.
+  req.arguments = (req.arguments && typeof req.arguments === 'object' && !Array.isArray(req.arguments))
+    ? req.arguments
+    : {}
   const res = req.tool
     ? await callTool(resolved.server, req.tool, req.arguments, opts)
     : await listTools(resolved.server, opts)
