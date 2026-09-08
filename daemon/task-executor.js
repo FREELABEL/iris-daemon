@@ -4249,24 +4249,34 @@ exit 1
           const { sessionName, outputFile, exitFile, channel, stdoutFile, stderrFile } = tmuxSession
           this.runningTasks.set(task.id, { sessionName, tmux: true, _startedAt: Date.now(), _taskTitle: task.title || task.type, _taskType: task.type })
 
-          // Stream output from pipe-pane log file
-          let lastLineCount = 0
+          // Stream output from the REAL stdout/stderr files, not the pipe-pane log.
+          //
+          // This poll read `outputFile` — the pipe-pane PTY recording — and had been reading an
+          // EMPTY FILE since the streams were split. _buildWrappedCommand redirects the command
+          // to <session>.stdout and <session>.stderr, so nothing reaches the pane, so pipe-pane
+          // captures nothing. The dead poll was invisible because its only symptom was an
+          // absence: no `[task:…]` lines in the daemon log, which reads exactly like a quiet
+          // task. Found by watching Pusher during a task that printed nine lines and produced
+          // zero events.
+          //
+          // Reading the two files separately also keeps stdout and stderr APART, which the PTY
+          // could never do — the same distinction the result path already fought for.
+          let lastOutCount = 0
+          let lastErrCount = 0
+          const drain = (file, last, stream) => {
+            const { lines, total } = this.tmux.readNewLines(file, last)
+            if (!lines.length) return last
+            outputLines.push(...(stream === 'stderr' ? lines.map(l => `[stderr] ${l}`) : lines))
+            lines.forEach((line) => {
+              if (!line.trim()) return
+              if (outputStream) outputStream.push(line, stream)
+              console.log(`[task:${task.id.substring(0, 8)}${stream === 'stderr' ? ':err' : ''}] ${line}`)
+            })
+            return total
+          }
           const outputPoll = setInterval(() => {
-            const { lines: newLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
-            if (newLines.length > 0) {
-              outputLines.push(...newLines)
-              // LIVE. This is the path a tmux-run task actually takes, and hooking only the
-              // direct-spawn handlers left it emitting nothing — the streamer's buffer stayed
-              // empty, flush() had nothing to send, and the absence of any error looked
-              // exactly like success. Pushed as 'stdout' because pipe-pane records a PTY,
-              // which has already merged the two streams; claiming otherwise here would
-              // invent a distinction the transport destroyed.
-              if (outputStream) newLines.forEach(line => { if (line.trim()) outputStream.push(line, 'stdout') })
-              newLines.forEach(line => {
-                if (line.trim()) console.log(`[task:${task.id.substring(0, 8)}] ${line}`)
-              })
-              lastLineCount = total
-            }
+            lastOutCount = drain(stdoutFile, lastOutCount, 'stdout')
+            lastErrCount = drain(stderrFile, lastErrCount, 'stderr')
           }, 500)
 
           // Timeout
@@ -4275,11 +4285,8 @@ exit 1
             // Final output read — mirrors the success path below (#182004);
             // without this, anything printed between the last poll tick and
             // the timeout firing was silently dropped.
-            const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
-            if (finalLines.length > 0) {
-              outputLines.push(...finalLines)
-              if (outputStream) finalLines.forEach(l => { if (l.trim()) outputStream.push(l, 'stdout') })
-            }
+            lastOutCount = drain(stdoutFile, lastOutCount, 'stdout')
+            lastErrCount = drain(stderrFile, lastErrCount, 'stderr')
             this.tmux.cleanup(sessionName)
             if (isGraceful) {
               resolve({ exitCode: 124, timedOut: true })
@@ -4311,11 +4318,8 @@ exit 1
               if (stdout === '' && stderr === '') {
                 // No redirect files (an older session, or a swarm pane): fall back to the
                 // scrape so nothing regresses — but the streams are merged and it is worse.
-                const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
-                if (finalLines.length > 0) {
-                  outputLines.push(...finalLines)
-                  if (outputStream) finalLines.forEach(l => { if (l.trim()) outputStream.push(l, 'stdout') })
-                }
+                lastOutCount = drain(stdoutFile, lastOutCount, 'stdout')
+                lastErrCount = drain(stderrFile, lastErrCount, 'stderr')
               } else {
                 outputLines.length = 0
                 if (stdout) outputLines.push(...stdout.replace(/\n$/, '').split('\n'))
