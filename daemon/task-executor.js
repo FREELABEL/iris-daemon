@@ -4255,6 +4255,13 @@ exit 1
             const { lines: newLines, total } = this.tmux.readNewLines(outputFile, lastLineCount)
             if (newLines.length > 0) {
               outputLines.push(...newLines)
+              // LIVE. This is the path a tmux-run task actually takes, and hooking only the
+              // direct-spawn handlers left it emitting nothing — the streamer's buffer stayed
+              // empty, flush() had nothing to send, and the absence of any error looked
+              // exactly like success. Pushed as 'stdout' because pipe-pane records a PTY,
+              // which has already merged the two streams; claiming otherwise here would
+              // invent a distinction the transport destroyed.
+              if (outputStream) newLines.forEach(line => { if (line.trim()) outputStream.push(line, 'stdout') })
               newLines.forEach(line => {
                 if (line.trim()) console.log(`[task:${task.id.substring(0, 8)}] ${line}`)
               })
@@ -4269,7 +4276,10 @@ exit 1
             // without this, anything printed between the last poll tick and
             // the timeout firing was silently dropped.
             const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
-            if (finalLines.length > 0) outputLines.push(...finalLines)
+            if (finalLines.length > 0) {
+              outputLines.push(...finalLines)
+              if (outputStream) finalLines.forEach(l => { if (l.trim()) outputStream.push(l, 'stdout') })
+            }
             this.tmux.cleanup(sessionName)
             if (isGraceful) {
               resolve({ exitCode: 124, timedOut: true })
@@ -4302,7 +4312,10 @@ exit 1
                 // No redirect files (an older session, or a swarm pane): fall back to the
                 // scrape so nothing regresses — but the streams are merged and it is worse.
                 const { lines: finalLines } = this.tmux.readNewLines(outputFile, lastLineCount)
-                if (finalLines.length > 0) outputLines.push(...finalLines)
+                if (finalLines.length > 0) {
+                  outputLines.push(...finalLines)
+                  if (outputStream) finalLines.forEach(l => { if (l.trim()) outputStream.push(l, 'stdout') })
+                }
               } else {
                 outputLines.length = 0
                 if (stdout) outputLines.push(...stdout.replace(/\n$/, '').split('\n'))
