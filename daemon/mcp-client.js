@@ -29,6 +29,11 @@ const PROTOCOL_VERSION = '2024-11-05'
 function callMcp (server, req) {
   return new Promise((resolve) => {
     const timeoutMs = Math.max(1000, req.timeoutMs || DEFAULT_TIMEOUT_MS)
+    // Overridable, for two reasons that are the same reason. A cold `npx` has to DOWNLOAD the
+    // server before it can answer, which can exceed the default on a first run — and a fixed
+    // 45s constant also made this path untestable without a 45-second test, so it went
+    // untested. A timeout nobody can exercise is a timeout nobody knows fires.
+    const handshakeMs = Math.max(500, req.handshakeMs || HANDSHAKE_TIMEOUT_MS)
     let child
     try {
       child = spawn(server.command, server.args || [], {
@@ -59,8 +64,8 @@ function callMcp (server, req) {
     }
 
     const handshakeTimer = setTimeout(
-      () => finish({ ok: false, error: `MCP server did not complete initialize within ${HANDSHAKE_TIMEOUT_MS}ms` }),
-      HANDSHAKE_TIMEOUT_MS
+      () => finish({ ok: false, error: `MCP server did not complete initialize within ${handshakeMs}ms` }),
+      handshakeMs
     )
     const callTimer = setTimeout(
       () => finish({ ok: false, error: `MCP call '${req.method}' exceeded ${timeoutMs}ms` }),
@@ -114,9 +119,16 @@ function callMcp (server, req) {
   })
 }
 
-const listTools = (server, opts = {}) => callMcp(server, { method: 'tools/list', timeoutMs: opts.timeoutMs, cwd: opts.cwd })
+const listTools = (server, opts = {}) =>
+  callMcp(server, { method: 'tools/list', timeoutMs: opts.timeoutMs, handshakeMs: opts.handshakeMs, cwd: opts.cwd })
 
 const callTool = (server, tool, args, opts = {}) =>
-  callMcp(server, { method: 'tools/call', params: { name: tool, arguments: args || {} }, timeoutMs: opts.timeoutMs, cwd: opts.cwd })
+  callMcp(server, {
+    method: 'tools/call',
+    params: { name: tool, arguments: args || {} },
+    timeoutMs: opts.timeoutMs,
+    handshakeMs: opts.handshakeMs,
+    cwd: opts.cwd
+  })
 
 module.exports = { callMcp, listTools, callTool, DEFAULT_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, MAX_BUFFER_BYTES }
