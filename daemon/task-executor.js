@@ -1490,6 +1490,20 @@ class TaskExecutor {
       // never sees it. Map down to `completed` and stash the original under metadata
       // so we don't lose the warning signal.
       const wireStatus = taskStatus === 'completed_with_warnings' ? 'completed' : taskStatus
+
+      // EXECUTED JOB → INBOX (epic #184516). A handoff run on this node (`iris hive handoff
+      // --run`) is dispatched with config.hive_inbox + inbox_type 'job'. Its result belongs in
+      // the same inbox a delivered message lands in, so "what did my agent do with that item"
+      // is answered by `iris hive inbox`, not by digging through task history. Best-effort:
+      // the result is still submitted below whether or not the inbox write succeeds.
+      if (task.config?.hive_inbox && task.config?.inbox_type === 'job') {
+        try {
+          await this._saveToHiveInbox(task, { status: wireStatus, result: truncatedOutput })
+        } catch (err) {
+          console.error(`[hive-inbox] Job entry failed: ${err.message}`)
+        }
+      }
+
       await this.cloud.submitResult(taskId, {
         status: wireStatus,
         output: truncatedOutput,
@@ -4641,9 +4655,15 @@ exit 1
    * Handles file downloads (streaming), text, and link types.
    * Security: path traversal protection, streaming I/O, TTL checks.
    */
-  async _saveToHiveInbox (task) {
+  async _saveToHiveInbox (task, extra = {}) {
     const config = task.config || {}
-    const inboxType = config.inbox_type || 'text' // file | text | link
+    // file | text | link — plus, for agent-to-agent work (epic #184516):
+    //   message  — a custom message from another agent
+    //   handoff  — a work item (bloq/Atlas ref in config.handoff) delivered for this agent
+    //   job      — an executed handoff, written at completion with its status + result
+    // message/handoff/job carry their text in a backing .txt exactly like 'text', so the CLI,
+    // the bridge route and the web UI read them unchanged; the type is what changes rendering.
+    const inboxType = config.inbox_type || 'text'
     const senderName = config.sender_name || 'Unknown'
     const msgText = (task.prompt || '').trim()
 
@@ -4779,6 +4799,11 @@ exit 1
       original_name: config.file_name || null,
       message: msgText.substring(0, 500) || null,
       url: config.url || null,
+      // Agent-to-agent fields (epic #184516). Null for file/text/link so existing readers
+      // see exactly the shape they always did.
+      item: (config.handoff && config.handoff.item) || null,
+      status: extra.status || (inboxType === 'handoff' ? 'pending' : null),
+      result: extra.result ? String(extra.result).substring(0, 2000) : null,
     }
     fs.appendFileSync(manifestPath, JSON.stringify(entry) + '\n')
     console.log(`[hive-inbox] Saved ${inboxType} from ${senderName}: ${savedFile}`)
