@@ -4804,6 +4804,10 @@ exit 1
       item: (config.handoff && config.handoff.item) || null,
       status: extra.status || (inboxType === 'handoff' ? 'pending' : null),
       result: extra.result ? String(extra.result).substring(0, 2000) : null,
+      // Burn-after-read. Persisted here because the READER is what acts on it: the CLI deletes
+      // the body and this manifest row on first open. Absent/false behaves exactly as before,
+      // so an older reader simply ignores it rather than breaking.
+      burn: config.burn === true,
     }
     fs.appendFileSync(manifestPath, JSON.stringify(entry) + '\n')
     console.log(`[hive-inbox] Saved ${inboxType} from ${senderName}: ${savedFile}`)
