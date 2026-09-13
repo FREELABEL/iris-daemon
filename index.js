@@ -61,27 +61,15 @@ const PORT = process.env.BRIDGE_PORT || 3200
 
 // ─── Auth — protect mutating endpoints with auto-generated token ───
 const { bridgeAuth, getToken, TOKEN_PATH } = require('./lib/bridge-auth')
-app.use(bridgeAuth({
-  openPaths: new Set([
-    '/health',
-    '/.well-known/security.txt',
-    '/api/config',
-    '/api/environment',
-    '/api/discover',
-    '/api/ollama/models',
-    '/daemon/health',
-    '/daemon/capacity',
-    '/daemon/profile',
-    '/daemon/queue'
-  ]),
-  openPrefixes: [
-    '/daemon/mesh/', // mesh routes use their own X-Mesh-Key auth
-    '/hive/inbox' // inbox read/mark-read — protected by CORS allowlist (only
-    // localhost + freelabel/heyiris origins can read responses); a random
-    // site's fetch to localhost:3200 is blocked by the browser. Token-based
-    // hardening (cloud pairing) is a planned fast-follow for XSS'd origins.
-  ]
-}))
+// The open-route list lives in ONE place (lib/bridge-auth-policy.js) so the
+// security suite asserts the same object the daemon runs. Two routes left this
+// list on 2026-09-12: /daemon/queue (#184808) and /hive/inbox (#184824). The
+// second returned message BODIES to an unauthenticated caller, defended only
+// by a CORS allowlist — which browsers honour and curl, scripts, apps and other
+// machines do not. `iris hive vpn serve 3200` publishes this port to a tailnet
+// that carries client machines, so that gap was one command from being live.
+const { OPEN_PATHS, OPEN_PREFIXES } = require('./lib/bridge-auth-policy')
+app.use(bridgeAuth({ openPaths: OPEN_PATHS, openPrefixes: OPEN_PREFIXES }))
 
 // Full paths to CLIs (avoids PATH issues in subprocess)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude'

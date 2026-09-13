@@ -111,18 +111,11 @@ function createSecurityTestServer (tokenPath) {
   // --- Real auth middleware ---
   // Inline the logic so we test against the exact same code pattern
   const { bridgeAuth, getToken } = require('../lib/bridge-auth')
-  const authMiddleware = bridgeAuth({
-    openPaths: new Set([
-      '/health',
-      '/.well-known/security.txt',
-      '/api/config',
-      '/daemon/health',
-      '/daemon/capacity',
-      '/daemon/profile',
-      '/daemon/queue'
-    ]),
-    openPrefixes: ['/daemon/mesh/']
-  })
+  // Import the REAL policy rather than restating it. A restated allow-list is a
+  // second copy of the thing under test: the suite would stay green while the
+  // daemon exempted a route the test never named.
+  const { OPEN_PATHS, OPEN_PREFIXES } = require('../lib/bridge-auth-policy')
+  const authMiddleware = bridgeAuth({ openPaths: OPEN_PATHS, openPrefixes: OPEN_PREFIXES })
   app.use(authMiddleware)
 
   // --- Routes: open ---
@@ -135,6 +128,9 @@ function createSecurityTestServer (tokenPath) {
   app.get('/daemon/capacity', (req, res) => res.json({ capacity: 100 }))
   app.get('/daemon/profile', (req, res) => res.json({ name: 'test-node' }))
   app.get('/daemon/queue', (req, res) => res.json({ tasks: [] }))
+  app.get('/hive/inbox', (req, res) => res.json({ items: [] }))
+  app.get('/hive/inbox/:id', (req, res) => res.json({ id: req.params.id, body: 'secret' }))
+  app.post('/hive/inbox/:id/read', (req, res) => res.json({ ok: true }))
 
   // --- Routes: protected ---
   app.post('/api/sessions/claude-code', (req, res) => res.json({ session: 'new' }))
@@ -277,9 +273,37 @@ describe('bridge auth middleware (E2E)', () => {
     assert.equal(res.status, 200)
   })
 
-  it('GET /daemon/queue — accessible without auth', async () => {
+  // #184808 — /daemon/queue used to be asserted OPEN here. It names live task
+  // ids and repo paths, and anything that could open the port could read it.
+  it('GET /daemon/queue — requires auth (#184808)', async () => {
     const res = await httpGet(port, '/daemon/queue')
-    assert.equal(res.status, 200)
+    assert.equal(res.status, 401)
+  })
+
+  // #184824 — /hive/inbox returned message BODIES with no credential. The old
+  // defence was a CORS allowlist, which is enforced by browsers and therefore
+  // absent for curl, scripts, native apps, and other machines on the tailnet.
+  it('GET /hive/inbox — requires auth (#184824)', async () => {
+    const res = await httpGet(port, '/hive/inbox')
+    assert.equal(res.status, 401)
+  })
+
+  it('GET /hive/inbox/:id — requires auth (#184824)', async () => {
+    const res = await httpGet(port, '/hive/inbox/any-id')
+    assert.equal(res.status, 401)
+  })
+
+  it('POST /hive/inbox/:id/read — requires auth (#184824)', async () => {
+    const res = await httpPost(port, '/hive/inbox/any-id/read', {})
+    assert.equal(res.status, 401)
+  })
+
+  it('401 body says how to fix it, and which of the two failures it was', async () => {
+    const missing = await httpGet(port, '/hive/inbox')
+    assert.equal(missing.body.reason, 'key_missing')
+    assert.match(missing.body.how_to_fix, /X-Bridge-Key/)
+    const wrong = await httpGet(port, '/hive/inbox', { 'X-Bridge-Key': 'not-the-token' })
+    assert.equal(wrong.body.reason, 'key_mismatch')
   })
 
   // --- Mesh routes: skip bridge auth (use own X-Mesh-Key auth) ---
