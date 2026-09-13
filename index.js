@@ -109,6 +109,22 @@ function writeHiveInboxManifest (items) {
 }
 
 // List inbox items (newest first). ?unread=1 filters unread; ?limit=N caps.
+// The phone surface (#184810). A static shell, no credential baked in: it asks
+// for the bridge key once and keeps it in that browser's localStorage, then
+// calls the same authenticated /hive/inbox routes everything else does.
+//
+// The PAGE is open because a browser navigating to a URL cannot set a header,
+// and the page carries nothing — the data behind it is what is gated. That is
+// the distinction the old /hive/inbox exemption got wrong (#184824): it opened
+// the DATA and called a CORS allowlist the control.
+//
+// Read-only on purpose. The daemon has no send route, and adding one here would
+// put "message any peer" on the tailnet behind a key that now also lives in a
+// phone's browser storage. Filed rather than half-built — see #184810.
+app.get('/hive/ui', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'hive-inbox.html'))
+})
+
 app.get('/hive/inbox', (req, res) => {
   try {
     let items = readHiveInboxManifest().reverse() // newest first

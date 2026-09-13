@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Hive Inbox</title>
+<style>
+  /* Subject is a message queue on a machine you own: a ledger, not a feed.
+     Neutrals are warmed slightly off-grey so the unread accent is the only
+     saturated thing on the page. Numbers and ids are mono because they are
+     read as values, not prose. */
+  :root {
+    --bg:#faf9f7; --panel:#ffffff; --line:#e6e3dd;
+    --ink:#1a1917; --ink-dim:#6b6862; --ink-faint:#97938b;
+    --accent:#b4531f; --ok:#2f6b4f; --warn:#8a2f2f;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#141312; --panel:#1d1b19; --line:#2f2c28;
+      --ink:#f0ede8; --ink-dim:#a09b93; --ink-faint:#6e6960;
+      --accent:#e08b4f; --ok:#6fb894; --warn:#e08080;
+    }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent }
+  body {
+    margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+    font-size:15px; line-height:1.5;
+    padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px);
+  }
+  header { padding-block:20px 12px; border-bottom:1px solid var(--line); margin-bottom:16px }
+  h1 { margin:0; font-size:18px; font-weight:600; letter-spacing:-0.01em }
+  .counts { margin-top:6px; font-family:var(--mono); font-size:13px; color:var(--ink-dim) }
+  .counts b { color:var(--accent); font-weight:600 }
+  .node { font-family:var(--mono); font-size:12px; color:var(--ink-faint) }
+  ul { list-style:none; margin:0; padding:0 }
+  li {
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:12px 14px; margin-bottom:8px; cursor:pointer;
+  }
+  li.unread { border-left:3px solid var(--accent) }
+  .row { display:flex; justify-content:space-between; gap:12px; align-items:baseline }
+  .from { font-family:var(--mono); font-size:12px; color:var(--ink-dim) }
+  .when { font-family:var(--mono); font-size:12px; color:var(--ink-faint); white-space:nowrap }
+  .msg { margin-top:6px; color:var(--ink); overflow-wrap:anywhere }
+  li[aria-expanded="true"] .msg { white-space:pre-wrap }
+  li[aria-expanded="false"] .msg {
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+  }
+  .state { padding:32px 8px; text-align:center; color:var(--ink-dim) }
+  .state code { font-family:var(--mono); font-size:13px; color:var(--ink) }
+  button {
+    font:inherit; font-weight:500; border:1px solid var(--line); border-radius:8px;
+    background:var(--panel); color:var(--ink); padding:10px 16px; cursor:pointer;
+  }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff }
+  input {
+    font:inherit; font-family:var(--mono); width:100%; padding:10px 12px; margin:12px 0;
+    border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink);
+  }
+  .err { color:var(--warn) }
+  footer { margin-top:20px; font-size:12px; color:var(--ink-faint); text-align:center }
+  footer button { padding:4px 10px; font-size:12px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hive Inbox</h1>
+  <div class="counts" id="counts">—</div>
+  <div class="node" id="node"></div>
+</header>
+<div id="app"><div class="state">Loading…</div></div>
+<footer id="foot" hidden><button id="forget">Forget key on this device</button></footer>
+
+<script>
+// This page ships NO credential. It is a static shell; every request it makes
+// carries X-Bridge-Key, which the operator pastes once and which is kept only
+// in this browser's localStorage. The page itself is safe to serve without auth
+// because it contains nothing — the data behind it is what is gated.
+const KEY = 'iris.bridgeKey';
+const app = document.getElementById('app');
+const el = (h) => { const d = document.createElement('div'); d.innerHTML = h; return d.firstElementChild; };
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function key () { try { return localStorage.getItem(KEY) || ''; } catch { return ''; } }
+
+function when (iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const mins = Math.round((Date.now() - d) / 60000);
+  if (mins < 1) return 'now';
+  if (mins < 60) return mins + 'm';
+  if (mins < 1440) return Math.round(mins / 60) + 'h';
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function askForKey (why) {
+  app.replaceChildren(el(`<div class="state">
+    <p class="${why ? 'err' : ''}">${esc(why || 'This device is not connected to the daemon yet.')}</p>
+    <p>On the machine running the daemon:<br><code>cat ~/.iris/bridge-token</code></p>
+    <input id="k" type="password" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" placeholder="paste the bridge key">
+    <button class="primary" id="save">Connect</button>
+  </div>`));
+  document.getElementById('save').onclick = () => {
+    const v = document.getElementById('k').value.trim();
+    if (!v) return;
+    try { localStorage.setItem(KEY, v); } catch {
+      return askForKey('This browser will not store the key — private browsing?');
+    }
+    load();
+  };
+}
+
+async function load () {
+  document.getElementById('foot').hidden = !key();
+  try {
+    const res = await fetch('/hive/inbox?limit=100', { headers: { 'X-Bridge-Key': key() } });
+    // Three outcomes, kept distinct. Calling a 401 "daemon unreachable" would
+    // send someone to restart a daemon that is answering perfectly.
+    if (res.status === 401) {
+      const b = await res.json().catch(() => ({}));
+      return askForKey(b.reason === 'key_mismatch'
+        ? 'This daemon rejected that key. It may have rotated.'
+        : null);
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    render(await res.json());
+  } catch (e) {
+    app.replaceChildren(el(`<div class="state">
+      <p class="err">Cannot reach the daemon.</p>
+      <p>Is it running, and is this device on the tailnet?</p>
+      <button id="retry">Retry</button></div>`));
+    document.getElementById('retry').onclick = load;
+  }
+}
+
+let unread = 0, total = 0;
+function paintCounts () {
+  document.getElementById('counts').innerHTML =
+    `<b>${unread}</b> unread &middot; ${total} total`;
+}
+
+function render (data) {
+  const items = data.items || [];
+  unread = data.unread || 0;
+  total = data.count || items.length;
+  paintCounts();
+  document.getElementById('node').textContent = data.node || '';
+  if (!items.length) {
+    return app.replaceChildren(el('<div class="state">Nothing in the inbox.</div>'));
+  }
+  const ul = document.createElement('ul');
+  for (const it of items) {
+    const li = el(`<li class="${it.read ? '' : 'unread'}" aria-expanded="false">
+      <div class="row">
+        <span class="from">${esc(it.from_node || 'unknown')}</span>
+        <span class="when">${esc(when(it.received_at))}</span>
+      </div>
+      <div class="msg">${esc(it.message || '(no text)')}</div>
+    </li>`);
+    li.onclick = () => expand(li, it);
+    ul.appendChild(li);
+  }
+  app.replaceChildren(ul);
+}
+
+// Tapping fetches the FULL body — the list endpoint truncates at 500 chars, so
+// showing the list text as if it were the message would quietly lose content.
+//
+// This used to call load() afterwards to refresh the unread count, which rebuilt
+// the whole list and threw away the element the user had just opened: tap,
+// and it collapses. Adjust the count in place instead. Found by driving the page
+// in a real browser — the code reads fine.
+async function expand (li, it) {
+  const open = li.getAttribute('aria-expanded') === 'true';
+  li.setAttribute('aria-expanded', open ? 'false' : 'true');
+  if (open || li.dataset.full) return;
+  try {
+    const r = await fetch('/hive/inbox/' + encodeURIComponent(it.id), { headers: { 'X-Bridge-Key': key() } });
+    if (!r.ok) return;
+    const full = await r.json();
+    li.querySelector('.msg').textContent = full.body || full.message || '(no text)';
+    li.dataset.full = '1';
+    // Reading it marks it read server-side, so mirror that here rather than refetching.
+    if (li.classList.contains('unread')) {
+      li.classList.remove('unread');
+      unread = Math.max(0, unread - 1);
+      paintCounts();
+    }
+  } catch { /* leave the truncated text in place rather than blanking it */ }
+}
+
+document.getElementById('forget').onclick = () => {
+  try { localStorage.removeItem(KEY); } catch {}
+  askForKey('Key removed from this device.');
+};
+
+key() ? load() : askForKey();
+// Refresh on a timer, but never while something is open — a background poll
+// that collapses the message you are reading is worse than a stale count.
+setInterval(() => {
+  if (!key() || document.hidden) return;
+  if (document.querySelector('li[aria-expanded="true"]')) return;
+  load();
+}, 30000);
+</script>
+</body>
+</html>
