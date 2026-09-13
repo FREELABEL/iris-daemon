@@ -61,6 +61,9 @@ const PORT = process.env.BRIDGE_PORT || 3200
 
 // ─── Auth — protect mutating endpoints with auto-generated token ───
 const { bridgeAuth, getToken, TOKEN_PATH } = require('./lib/bridge-auth')
+// Repeat TCC denials collapse to one block per process here rather than per call site —
+// the poll loops were writing the same unreadable-store line every cycle (#184935).
+const { logDriverError } = require('./daemon/tcc-notice')
 // The open-route list lives in ONE place (lib/bridge-auth-policy.js) so the
 // security suite asserts the same object the daemon runs. Two routes left this
 // list on 2026-09-12: /daemon/queue (#184808) and /hive/inbox (#184824). The
@@ -1890,7 +1893,7 @@ app.get('/api/imessage/conversations', async (req, res) => {
       source: 'chat-db',
     })
   } catch (err) {
-    console.error(`[imessage/conversations] ${err.message}`)
+    logDriverError('imessage/conversations', err, { store: 'Messages' })
     res.status(503).json({ error: err.message })
   }
 })
@@ -2396,7 +2399,7 @@ app.get('/api/imessage/search', async (req, res) => {
       source: 'chat-db',
     })
   } catch (err) {
-    console.error(`[imessage/search] ${err.message}`)
+    logDriverError('imessage/search', err, { store: 'Messages' })
     res.status(503).json({ error: err.message })
   }
 })
@@ -2685,7 +2688,7 @@ app.get('/api/mail/search', async (req, res) => {
       ...(req.query.include_body ? { body_note: 'bodies are not in the envelope index; use the message id against .emlx' } : {}),
     })
   } catch (err) {
-    console.error(`[mail/search] ${err.message}`)
+    logDriverError('mail/search', err, { store: 'Mail' })
     res.status(503).json({ error: err.message })
   }
 })
@@ -2744,7 +2747,7 @@ app.get('/api/calendar/events', async (req, res) => {
   } catch (err) {
     // A NAMED reason, never an empty list. "You have no meetings" and "I cannot read your
     // calendar" must never look the same to the caller.
-    console.error(`[calendar/events] Failed: ${err.message}`)
+    logDriverError('calendar/events', err, { store: 'the Calendar store' })
     res.status(503).json({ error: err.message })
   }
 })

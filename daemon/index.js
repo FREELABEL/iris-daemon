@@ -35,6 +35,7 @@ const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
 const { runScript, clampTimeout } = require('./script-runner')
+const { tccFixOneLine } = require('./tcc-notice')
 const { ensureChromiumInstalled, chromiumInstalled } = require('../lib/playwright-setup')
 const { execSync, spawn } = require('child_process')
 const fs = require('fs')
@@ -1221,10 +1222,10 @@ LIMIT ${limit}
               if (err) {
                 const msg = (stderr || err.message || '').trim()
                 if (msg.includes('unable to open') || msg.includes('authorization denied')) {
-                  return reject(new Error(
-                    'Cannot read Calendar.sqlitedb. Grant Full Disk Access to the daemon process ' +
-                    'in System Settings > Privacy & Security > Full Disk Access.'
-                  ))
+                  // "Grant Full Disk Access to the daemon process" named no binary and no
+                  // steps, so it was read as "grant it to Terminal", which does nothing here
+                  // (#184935). tccFixOneLine names the executable launchd actually runs.
+                  return reject(new Error(`Cannot read Calendar.sqlitedb — ${tccFixOneLine()}`))
                 }
                 return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
               }
@@ -1789,10 +1790,7 @@ LIMIT ${limit}
               if (err) {
                 const msg = (stderr || err.message || '').trim()
                 if (msg.includes('unable to open') || msg.includes('authorization denied')) {
-                  return reject(new Error(
-                    'Cannot read chat.db. Grant Full Disk Access to the daemon process ' +
-                    'in System Settings > Privacy & Security > Full Disk Access.'
-                  ))
+                  return reject(new Error(`Cannot read chat.db — ${tccFixOneLine()}`))
                 }
                 return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
               }
@@ -1885,10 +1883,7 @@ LIMIT ${limit}
               if (err) {
                 const msg = (stderr || err.message || '').trim()
                 if (msg.includes('unable to open') || msg.includes('authorization denied')) {
-                  return reject(new Error(
-                    'Cannot read Mail Envelope Index. Grant Full Disk Access to the daemon process ' +
-                    'in System Settings > Privacy & Security > Full Disk Access.'
-                  ))
+                  return reject(new Error(`Cannot read Mail Envelope Index — ${tccFixOneLine()}`))
                 }
                 return reject(new Error(`sqlite3: ${msg.slice(0, 300)}`))
               }

@@ -3,6 +3,20 @@ REAL_SCRIPT="$0"
 [ -L "$REAL_SCRIPT" ] && REAL_SCRIPT="$(readlink "$REAL_SCRIPT")"
 BRIDGE_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
 IRIS_CONFIG="$HOME/.iris/config.json"
+BRIDGE_PORT="${BRIDGE_PORT:-3200}"
+
+# ONE LOG CONTRACT, because there were two and the reader picked the wrong one.
+# launchd (the supervised, normal path) sends the daemon's streams to ~/.iris/logs/ via
+# StandardOutPath/StandardErrorPath in io.heyiris.daemon.plist. The unsupervised nohup
+# fallback below used to write $BRIDGE_DIR/daemon.log instead, and `logs` tailed THAT — so
+# on a launchd-managed machine `iris-daemon logs` followed a stale 3.4KB file while the real
+# 3.4MB log grew somewhere the operator was never told about, and `iris hive doctor`'s TCC
+# scanner read the near-empty one and reported "no denials" (#184929). Both writers now use
+# the plist's paths; the legacy file is still READ so old installs stay diagnosable.
+IRIS_LOG_DIR="$HOME/.iris/logs"
+DAEMON_STDOUT_LOG="$IRIS_LOG_DIR/daemon.stdout.log"
+DAEMON_STDERR_LOG="$IRIS_LOG_DIR/daemon.stderr.log"
+LEGACY_DAEMON_LOG="$BRIDGE_DIR/daemon.log"
 
 # Does this machine have a HIVE NODE key — not "is the user logged in".
 #
@@ -20,6 +34,54 @@ IRIS_CONFIG="$HOME/.iris/config.json"
 has_node_key() {
     [ -f "$IRIS_CONFIG" ] && grep -q '"node_api_key"' "$IRIS_CONFIG" 2>/dev/null && return 0
     return 1
+}
+
+# WAIT FOR READY, NOT FOR "LAUNCHED". `launchctl bootstrap` returns as soon as launchd has
+# ACCEPTED the job, which is seconds before the daemon serves anything. `start` printed
+# "Daemon started (launchd)" after a flat `sleep 2`, and `iris-daemon status` run immediately
+# after said "Not running" — for another 3-5s, on a daemon that was fine (#184928).
+#
+# Probe /health in a LOOP and accept only 200. A single probe is not enough: the daemon
+# BLOCKS its event loop during startup scans (Obsidian vault, session sweep, Discord
+# autostart), so for 10-30s the port answers 000 (not bound yet) or a bare Express 404
+# (listening, route not mounted). Either reading, taken once, calls a healthy daemon dead.
+#
+# NOT `lsof -ti :3200`. Without -sTCP:LISTEN that matches outbound CLIENT sockets too, so any
+# running `iris` process makes the port look bound — the defect that had bridgectl silently
+# no-op and exit 0 (#184826). A bound port is also not readiness; a served request is.
+wait_ready() {
+    _limit="${1:-45}"
+    _i=0
+    while [ "$_i" -lt "$_limit" ]; do
+        # No `|| echo 000` fallback here: curl ALREADY writes 000 for a refused connection
+        # and then exits non-zero, so the fallback appended a second 000 and the variable
+        # held "000000". That compares equal to nothing, so report_not_ready took its
+        # "something is listening" branch for a port with nothing on it — a diagnostic
+        # that confidently described the wrong failure. Caught in test, 2026-09-13.
+        _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+                    "http://127.0.0.1:$BRIDGE_PORT/health" 2>/dev/null)
+        _code="${_code:-000}"
+        [ "$_code" = "200" ] && return 0
+        _i=$((_i + 1))
+        sleep 1
+    done
+    _READY_LAST_CODE="$_code"
+    return 1
+}
+
+# Say what was actually observed. "Timed out" without the last reading is unactionable, and
+# the two readings mean different things: 000 = nothing listening on the port, anything else
+# = something is listening but not serving /health yet.
+report_not_ready() {
+    echo "Daemon did not answer http://127.0.0.1:$BRIDGE_PORT/health within ${1}s" \
+         "(last HTTP ${_READY_LAST_CODE:-000})." >&2
+    if [ "${_READY_LAST_CODE:-000}" = "000" ]; then
+        echo "  Nothing is listening on port $BRIDGE_PORT — it probably exited during startup." >&2
+    else
+        echo "  Something is listening but /health is not up yet — startup scans (Obsidian" >&2
+        echo "  vault, session sweep) block the event loop and can take longer on a cold cache." >&2
+    fi
+    echo "  Check:  iris-daemon status   then   iris-daemon logs" >&2
 }
 
 case "${1:-status}" in
@@ -87,20 +149,27 @@ case "${1:-status}" in
         if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
             if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
                || launchctl load "$PLIST" 2>/dev/null; then
-                sleep 2
-                echo "Daemon started (launchd)"
-                exit 0
+                echo "Handed to launchd — waiting for the daemon to serve /health..."
+                if wait_ready 45; then
+                    echo "Daemon started (launchd)"
+                    exit 0
+                fi
+                report_not_ready 45
+                exit 1
             fi
         fi
 
-        nohup node "$BRIDGE_DIR/daemon.js" > "$BRIDGE_DIR/daemon.log" 2>&1 &
-        sleep 3
-        if [ -S "$SOCK" ]; then
-            echo "Hive daemon started (PID: $!)"
+        mkdir -p "$IRIS_LOG_DIR"
+        nohup node "$BRIDGE_DIR/daemon.js" \
+            >> "$DAEMON_STDOUT_LOG" 2>> "$DAEMON_STDERR_LOG" &
+        _NOHUP_PID=$!
+        echo "Started unsupervised (PID: $_NOHUP_PID) — waiting for /health..."
+        if wait_ready 45; then
+            echo "Hive daemon started (PID: $_NOHUP_PID)"
             echo "Your machine is now a compute node in IRIS Hive."
         else
-            echo "Daemon failed to start. Check logs: iris-daemon logs"
-            tail -5 "$BRIDGE_DIR/daemon.log" 2>/dev/null
+            report_not_ready 45
+            tail -5 "$DAEMON_STDERR_LOG" 2>/dev/null
             exit 1
         fi ;;
     stop)
@@ -128,7 +197,12 @@ case "${1:-status}" in
             sleep 1
         fi
 
-        PIDS=$(lsof -ti :3200 2>/dev/null || true)
+        # -sTCP:LISTEN IS LOAD-BEARING. `lsof -ti :3200` alone also matches outbound CLIENT
+        # sockets, so every running `iris` process talking to the bridge lands in this list —
+        # and this list gets `kill`ed. The same missing flag made bridgectl no-op and exit 0
+        # (#184826); here it was worse than a no-op, because `stop` would SIGTERM unrelated
+        # iris processes. Only the process holding the listening socket is the daemon.
+        PIDS=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null || true)
         PIDS="$PIDS $(pgrep -f "$BRIDGE_DIR/daemon.js" 2>/dev/null || true)"
         PIDS=$(echo $PIDS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')
 
@@ -174,9 +248,16 @@ case "${1:-status}" in
         PLIST="$HOME/Library/LaunchAgents/$LBL.plist"
         if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
             if launchctl kickstart -k "gui/$(id -u)/$LBL" 2>/dev/null; then
-                sleep 2
-                echo "Daemon restarted (launchd)"
-                exit 0
+                # Same race as `start` (#184928): kickstart returns when launchd has
+                # relaunched the job, not when the new process serves. Wait for readiness,
+                # or `restart` hands back a prompt and a status command that disagree.
+                echo "Relaunched by launchd — waiting for the daemon to serve /health..."
+                if wait_ready 45; then
+                    echo "Daemon restarted (launchd)"
+                    exit 0
+                fi
+                report_not_ready 45
+                exit 1
             fi
         fi
 
@@ -193,7 +274,27 @@ case "${1:-status}" in
         if [ -S "$SOCK" ]; then
             node "$BRIDGE_DIR/daemon.js" --status 2>/dev/null || echo "Not running. Start with: iris-daemon start"
         else echo "Not running. Start with: iris-daemon start"; fi ;;
-    logs) tail -f "$BRIDGE_DIR/daemon.log" ;;
+    logs)
+        # Follow whatever the daemon is ACTUALLY writing. This tailed only
+        # $BRIDGE_DIR/daemon.log, which under launchd — the normal install — nothing has
+        # written since the last unsupervised start, so it sat at a few KB and looked idle
+        # while ~/.iris/logs/daemon.stderr.log grew to megabytes (#184929). Tail every
+        # candidate that exists, and NAME the empty-handed case instead of blocking forever
+        # on a `tail -f` of nothing.
+        LOG_TARGETS=""
+        for _c in "$DAEMON_STDERR_LOG" "$DAEMON_STDOUT_LOG" "$LEGACY_DAEMON_LOG"; do
+            [ -f "$_c" ] && LOG_TARGETS="$LOG_TARGETS $_c"
+        done
+        if [ -z "$(echo $LOG_TARGETS | tr -d ' ')" ]; then
+            echo "No daemon log found. Looked in:" >&2
+            echo "  $DAEMON_STDERR_LOG" >&2
+            echo "  $DAEMON_STDOUT_LOG" >&2
+            echo "  $LEGACY_DAEMON_LOG  (legacy, pre-#184929)" >&2
+            echo "The daemon has never written a log here — has it ever started?" >&2
+            exit 1
+        fi
+        # shellcheck disable=SC2086
+        tail -f $LOG_TARGETS ;;
     register)
         if [ ! -f "$HOME/.iris/sdk/.env" ] || [ -z "$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)" ]; then
             if command -v iris-login >/dev/null 2>&1; then
