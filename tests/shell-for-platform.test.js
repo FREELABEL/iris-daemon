@@ -72,3 +72,50 @@ test('a non-ENOENT failure is NOT relabelled as a missing shell', () => {
     'an EACCES is a permission problem, not a missing interpreter')
   assert.match(msg, /EACCES/, 'keep the real error code visible')
 })
+
+// ---------------------------------------------------------------------------
+// scriptFor: `iris hive run` does NOT take the bash -c path.
+//
+// It produces task type `sandbox_execute`, which writes the command to
+// task-script.sh and spawns `/bin/bash <script>`. So fixing only the free-form
+// `default` case left the actual Windows failure in place — found by running a
+// real dispatch, which a unit test of the wrong function could never reveal.
+//
+// A .sh file is not executable by cmd.exe. The EXTENSION has to change with the
+// platform too, not just the interpreter.
+// ---------------------------------------------------------------------------
+
+const { scriptFor } = require('../lib/shell-for-platform')
+
+test('posix script: .sh run by bash', () => {
+  const s = scriptFor('/tmp/wk', 'echo hi', 'darwin')
+  assert.match(s.scriptPath, /\.sh$/, 'posix scripts are .sh')
+  assert.strictEqual(s.cmd, '/bin/bash')
+  assert.deepStrictEqual(s.args, [s.scriptPath])
+  assert.strictEqual(s.content, 'echo hi', 'posix content is passed through unchanged')
+  assert.strictEqual(s.mode, '755', 'posix needs the exec bit')
+})
+
+test('win32 script: a .cmd run by cmd.exe — NOT a .sh run by bash', () => {
+  const s = scriptFor('C:\\wk', 'echo hi', 'win32')
+  assert.doesNotMatch(s.scriptPath, /\.sh$/,
+    'a .sh file is not runnable by cmd.exe — the extension must change with the platform')
+  assert.match(s.scriptPath, /\.cmd$/)
+  assert.notStrictEqual(s.cmd, '/bin/bash')
+  assert.match(s.cmd, /cmd\.exe$/i)
+  assert.strictEqual(s.args[s.args.length - 1], s.scriptPath, 'the script is the final argument')
+  assert.strictEqual(s.mode, null, 'Windows has no exec bit to set; chmod would be a no-op or throw')
+})
+
+test('win32 script suppresses command echo', () => {
+  // Without @echo off, cmd.exe prints every line of the script before running it,
+  // so the task output is double the size and interleaved with the commands.
+  const s = scriptFor('C:\\wk', 'echo hi', 'win32')
+  assert.match(s.content, /^@echo off/, 'cmd.exe echoes each line unless told not to')
+  assert.match(s.content, /echo hi/, 'the command itself must survive')
+})
+
+test('scriptFor places the script inside the workspace it was given', () => {
+  const s = scriptFor('/tmp/wk-abc', 'echo hi', 'linux')
+  assert.ok(s.scriptPath.startsWith('/tmp/wk-abc'), 'must not write outside the task workspace')
+})

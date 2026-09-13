@@ -42,7 +42,7 @@ try {
 // Single local admission-control authority (idempotency + resource exclusion).
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
-const { shellFor, pathDelimiterFor, describeSpawnFailure } = require('../lib/shell-for-platform')
+const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure } = require('../lib/shell-for-platform')
 
 /**
  * Task types whose `prompt` is NOT a shell command.
@@ -1926,12 +1926,17 @@ class TaskExecutor {
           break
 
         case 'sandbox_execute': {
-          // Execute a shell script
-          cmd = '/bin/bash'
-          const scriptPath = path.join(workspace.dir, 'task-script.sh')
-          fs.writeFileSync(scriptPath, task.prompt, 'utf-8')
-          fs.chmodSync(scriptPath, '755')
-          args = [scriptPath]
+          // Execute a shell script. THIS is the path `iris hive run <node> "<cmd>"`
+          // takes, and the one that died on the Windows node with
+          // `spawn /bin/bash ENOENT` (#185143, #184733) — not the free-form
+          // `default` case below. A .sh file is also not executable by cmd.exe and
+          // Windows has no exec bit, so the interpreter, the extension and the
+          // chmod all have to follow the platform together.
+          const script = scriptFor(workspace.dir, task.prompt)
+          fs.writeFileSync(script.scriptPath, script.content, 'utf-8')
+          if (script.mode) fs.chmodSync(script.scriptPath, script.mode)
+          cmd = script.cmd
+          args = script.args
           break
         }
 
