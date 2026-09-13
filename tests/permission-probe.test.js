@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test')
 const assert = require('node:assert/strict')
-const { probePermissions, probeFullDiskAccess, probeBrowser, SQLITE_MAGIC } = require('../daemon/permission-probe')
+const { probePermissions, probeFullDiskAccess, probeBrowser, probeRuntime, SQLITE_MAGIC } = require('../daemon/permission-probe')
 
 /**
  * S1.2 — permissions detected by ATTEMPTING the access, never by checking a path exists.
@@ -117,7 +117,7 @@ describe('isolation (S2.2)', () => {
 describe('probePermissions', () => {
   it('advertises every probe with a timestamp', async () => {
     const out = await probePermissions(io())
-    for (const key of ['full-disk-access', 'browser', 'network', 'isolation']) {
+    for (const key of ['full-disk-access', 'browser', 'network', 'isolation', 'python3', 'node', 'bash']) {
       assert.ok(key in out, `${key} must be reported`)
       assert.equal(out[key].checked_at, '2026-08-27T00:00:00Z')
     }
@@ -144,5 +144,57 @@ describe('probePermissions', () => {
     const out = await probePermissions(io({ platform: () => 'linux' }))
     assert.equal(out['full-disk-access'].available, null)
     assert.notEqual(out['full-disk-access'].available, true)
+  })
+})
+
+/**
+ * #184757 — the fleet could not EXPRESS "this node has Python", so `requires=python3` matched
+ * nothing and a .py script routed anywhere. `scripts doctor` ticked a Windows box with no
+ * interpreter. The routing gate was never broken; it had nothing to check against.
+ */
+describe('interpreters', () => {
+  // Only the binaries named in the map exist; everything else is ENOENT, as on a real machine.
+  const withBins = (map) => io({
+    exec: (bin) => {
+      if (!(bin in map)) { const e = new Error('nope'); e.code = 'ENOENT'; throw e }
+      return map[bin]
+    }
+  })
+
+  it('python3 is available when the interpreter reports Python 3', () => {
+    const r = probeRuntime('python3')(withBins({ python3: 'Python 3.12.2' }))
+    assert.equal(r.available, true)
+    assert.match(r.detail, /Python 3\./)
+  })
+
+  it('PYTHON 2 DOES NOT SATISFY python3', () => {
+    // A .py script pushed with --runtime python is invoked as python3. A box with only
+    // Python 2 must read as cannot-run, not as "python is present".
+    const r = probeRuntime('python3')(withBins({ python: 'Python 2.7.18' }))
+    assert.equal(r.available, false)
+    assert.match(r.reason, /2\.7/)
+  })
+
+  it('A SHIM THAT RUNS AND PRINTS NOTHING IS NOT AN INTERPRETER', () => {
+    // The Windows Store python shim: on PATH, exits, silent. Every existence check passes it.
+    const r = probeRuntime('python3')(withBins({ python3: '' }))
+    assert.equal(r.available, false)
+    assert.match(r.reason, /printed no version/)
+  })
+
+  it('falls through python and py -3 before giving up', () => {
+    assert.equal(probeRuntime('python3')(withBins({ py: 'Python 3.11.9' })).available, true)
+  })
+
+  it('node and bash report their own versions', () => {
+    assert.equal(probeRuntime('node')(withBins({ node: 'v22.11.0' })).available, true)
+    assert.equal(probeRuntime('bash')(withBins({ bash: 'GNU bash, version 5.2.15(1)-release' })).available, true)
+  })
+
+  it('a missing interpreter says so plainly, and bash names the Windows case', () => {
+    const r = probeRuntime('bash')(withBins({}))
+    assert.equal(r.available, false)
+    assert.match(r.reason, /no bash on PATH/)
+    assert.match(r.reason, /Windows/)
   })
 })

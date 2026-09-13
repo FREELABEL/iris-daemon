@@ -142,6 +142,74 @@ async function probeNetwork (io = defaultIo) {
 }
 
 /**
+ * Interpreters — the thing a script is written IN.
+ *
+ * Until these existed the fleet could not express "this node has Python", so `requires=python3`
+ * matched nothing and a .py script routed anywhere: `scripts doctor` ticked a Windows box with
+ * no interpreter, dispatch sent the task, and the node failed at run time (#184757). The gate
+ * was never broken — it had nothing to check against, which is the harder failure to see.
+ *
+ * RUN the interpreter; do not look for the binary. `which python3` is the same mistake as
+ * `existsSync` for Full Disk Access: on Windows a bare `python` is often the Microsoft Store
+ * shim, which is present, exits non-zero, and prints nothing — and on older boxes it is
+ * Python 2, which is not what a `--runtime python` script was written for. So each candidate is
+ * executed and its VERSION STRING is matched. Python 2 writes its version to stderr, which this
+ * io deliberately discards, so it fails the match rather than passing as "python".
+ *
+ * Names match what a script declares (`# iris: requires=python3`) and land in the same
+ * permissions map the routing gate already reads, so no gate change is needed.
+ */
+const RUNTIMES = {
+  python3: {
+    candidates: [['python3', ['--version']], ['python', ['--version']], ['py', ['-3', '--version']]],
+    expect: /Python 3\./,
+    missing: 'no python3 on PATH'
+  },
+  node: {
+    candidates: [['node', ['--version']]],
+    expect: /^v?\d+\./,
+    missing: 'no node on PATH'
+  },
+  bash: {
+    candidates: [['bash', ['--version']]],
+    expect: /version \d+/i,
+    missing: 'no bash on PATH (expected on Windows outside Git Bash/WSL)'
+  }
+}
+
+function probeRuntime (name) {
+  const spec = RUNTIMES[name]
+
+  return (io = defaultIo) => {
+    const errors = []
+    for (const [bin, args] of spec.candidates) {
+      let out
+      try {
+        out = io.exec(bin, args, 4000)
+      } catch (e) {
+        const code = e && e.code
+        // ENOENT is the ordinary "not installed" and is not worth reporting per candidate —
+        // the summary below says it once. Anything else (EACCES, a non-zero exit from a shim)
+        // is a different problem and the operator needs to see it.
+        if (code !== 'ENOENT') errors.push(`${bin}: ${code || (e && e.message) || 'failed'}`)
+        continue
+      }
+      const text = (out || '').trim()
+      if (!text) {
+        // Ran, exited, said nothing. The Store shim and Python 2 both land here.
+        errors.push(`${bin}: ran but printed no version`)
+        continue
+      }
+      const first = text.split('\n')[0].trim()
+      if (spec.expect.test(first)) return yes(first.slice(0, 60))
+      errors.push(`${bin}: reported "${first.slice(0, 40)}"`)
+    }
+
+    return no(errors.length ? errors.join('; ').slice(0, 160) : spec.missing)
+  }
+}
+
+/**
  * Run every probe. Returns the map the heartbeat advertises.
  *
  * A probe that THROWS becomes `unknown` with the error, never a silent omission and never
@@ -164,6 +232,9 @@ async function probePermissions (io = defaultIo) {
   await run('browser', probeBrowser)
   await run('network', probeNetwork)
   await run('isolation', probeIsolation)
+  await run('python3', probeRuntime('python3'))
+  await run('node', probeRuntime('node'))
+  await run('bash', probeRuntime('bash'))
 
   return out
 }
@@ -196,4 +267,4 @@ const defaultIo = {
   }
 }
 
-module.exports = { probePermissions, probeFullDiskAccess, probeBrowser, probeNetwork, probeIsolation, defaultIo, SQLITE_MAGIC }
+module.exports = { probePermissions, probeFullDiskAccess, probeBrowser, probeNetwork, probeIsolation, probeRuntime, RUNTIMES, defaultIo, SQLITE_MAGIC }
