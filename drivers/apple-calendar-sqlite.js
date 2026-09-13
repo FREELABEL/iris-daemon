@@ -25,6 +25,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { execFile } = require('child_process')
+const { tccDenialMessage } = require('../daemon/tcc-notice')
 
 /** Core Data stores dates as seconds since 2001-01-01, not the Unix epoch. */
 const APPLE_EPOCH_OFFSET = 978307200
@@ -57,7 +58,7 @@ function query(sql) {
     try {
       fs.accessSync(db, fs.constants.R_OK)
     } catch {
-      return reject(new Error('No permission to read the Calendar store — grant Full Disk Access in System Settings › Privacy'))
+      return reject(new Error(tccDenialMessage('the Calendar store')))
     }
 
     execFile(

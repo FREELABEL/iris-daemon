@@ -15,6 +15,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { execFile } = require('child_process')
+const { tccDenialMessage } = require('../daemon/tcc-notice')
 
 /** Apple stores message dates as NANOseconds since 2001-01-01 (older rows: seconds). */
 const APPLE_EPOCH_OFFSET = 978307200
@@ -40,7 +41,7 @@ function query(sql) {
     try {
       fs.accessSync(db, fs.constants.R_OK)
     } catch {
-      return reject(new Error('No permission to read Messages — grant Full Disk Access in System Settings › Privacy'))
+      return reject(new Error(tccDenialMessage('Messages')))
     }
     execFile('/usr/bin/sqlite3', ['-json', `file:${db}?immutable=1`, sql],
       { timeout: 20000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {

@@ -19,6 +19,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { execFile } = require('child_process')
+const { tccDenialMessage } = require('../daemon/tcc-notice')
 
 function storePath() {
   if (process.env.IRIS_MAIL_DB) return process.env.IRIS_MAIL_DB
@@ -44,7 +45,7 @@ function query(sql) {
     try {
       fs.accessSync(db, fs.constants.R_OK)
     } catch {
-      return reject(new Error('No permission to read Mail — grant Full Disk Access in System Settings › Privacy'))
+      return reject(new Error(tccDenialMessage('Mail')))
     }
     execFile('/usr/bin/sqlite3', ['-json', `file:${db}?immutable=1`, sql],
       { timeout: 20000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
