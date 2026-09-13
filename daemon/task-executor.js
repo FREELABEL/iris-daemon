@@ -3696,7 +3696,18 @@ exit 1
             return
           }
 
-          const msgBody = JSON.stringify({ message: task.prompt }).replace(/'/g, "'\\''")
+          // PROVENANCE (#182785). An injected message is otherwise indistinguishable from one the
+          // operator typed — same role, same styling, no marker. Someone reading their own
+          // transcript cannot tell which lines came from another machine, and an agent acting on
+          // the message cannot tell either. Carry a sender label so the bridge can mark it.
+          // `config.from` is set by the sender; fall back to the originating node id, and finally
+          // to a generic label rather than dropping the marker entirely — an unlabelled injection
+          // is the thing we are fixing.
+          const senderLabel = String(
+            sessionConfig.from || sessionConfig.sender || task.node_id || 'another machine'
+          ).slice(0, 64)
+
+          const msgBody = JSON.stringify({ message: task.prompt, from: senderLabel }).replace(/'/g, "'\\''")
           const curlCmd = `curl -sS -f -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
 
           cmd = '/bin/bash'

@@ -3162,13 +3162,43 @@ app.post('/api/sessions/opencode', async (req, res) => {
 function sessionServerCandidates() {
   const seen = new Set()
   const out = []
-  for (const u of [process.env.IRIS_SERVER, process.env.OPENCODE_SERVER, 'http://127.0.0.1:4096']) {
-    if (!u) continue
+  const add = (u) => {
+    if (!u) return
     const t = String(u).replace(/\/+$/, '')
-    if (seen.has(t)) continue
+    if (seen.has(t)) return
     seen.add(t)
     out.push(t)
   }
+
+  add(process.env.IRIS_SERVER)
+  add(process.env.OPENCODE_SERVER)
+
+  // DISCOVER the loopback ports iris is actually listening on.
+  //
+  // Session servers bind an EPHEMERAL port (:60824, :51477 — different every start) unless
+  // someone ran `iris serve --port 4096`. Assuming 4096 meant this endpoint worked only on a
+  // machine that happened to be running the documented default, and refused everywhere else
+  // with a message about the session not being open — which is indistinguishable from the
+  // session genuinely not being open.
+  //
+  // This is a subprocess on a delivery path, which is the thing being deleted elsewhere in this
+  // file. It earns its place: there is no in-process way to enumerate listeners portably, the
+  // alternative is a registry file with its own format, lifecycle and staleness, and this costs
+  // ~50ms on a path that previously spawned a 180-second model turn. Failure is non-fatal — the
+  // env vars and the documented default still stand behind it.
+  try {
+    const listeners = require('child_process')
+      .execSync("lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i iris | awk '{print $9}'", {
+        encoding: 'utf8',
+        timeout: 3000,
+      })
+      .split('\n')
+      .map((l) => l.trim().split(':').pop())
+      .filter((p) => /^\d+$/.test(p))
+    for (const port of [...new Set(listeners)]) add(`http://127.0.0.1:${port}`)
+  } catch { /* no lsof, or nothing listening — fall through to the default */ }
+
+  add('http://127.0.0.1:4096')
   return out
 }
 
@@ -3188,7 +3218,7 @@ async function findLiveSessionServer(sid, timeoutMs = 1500) {
 }
 
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
-  const { message, submit } = req.body
+  const { message, submit, from } = req.body
   const sid = req.params.id
 
   const base = await findLiveSessionServer(sid)
@@ -3208,9 +3238,19 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   try {
     // NOTIFY by default. `submit` omits noReply, which makes the receiving agent take a turn —
     // that spends THEIR tokens and interrupts what they were doing, so it is opt-in per call.
+    // PROVENANCE (#182785). Mark a message that arrived from somewhere else. Without this it is
+    // indistinguishable from one the operator typed — same role, same rendering — so neither the
+    // human reading the transcript nor the agent acting on it can tell where it came from.
+    //
+    // A visible prefix rather than a metadata field, deliberately: the field would need the
+    // prompt schema, the stored message schema, and every renderer changed before anyone could
+    // see it, and no consumer has asked to FILTER on provenance yet. The prefix delivers the
+    // actual requirement — a reader can tell — in every renderer today, and greps cleanly.
+    const text = from ? `[via iris \u00b7 ${String(from).slice(0, 64)}] ${message}` : message
+
     const body = submit
-      ? { parts: [{ type: 'text', text: message }] }
-      : { noReply: true, parts: [{ type: 'text', text: message }] }
+      ? { parts: [{ type: 'text', text }] }
+      : { noReply: true, parts: [{ type: 'text', text }] }
 
     console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
     const r = await fetch(`${base}/session/${encodeURIComponent(sid)}/message`, {
