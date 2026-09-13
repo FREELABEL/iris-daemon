@@ -20,6 +20,7 @@
  */
 
 const { spawn, execSync, execFileSync, exec: execAsync } = require('child_process')
+const { requireGit } = require('../lib/require-git')
 const { OutputStreamer } = require('./output-streamer')
 const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
@@ -1263,6 +1264,9 @@ class TaskExecutor {
         const repoUrl = task.config.repo_url
         const branch = task.config.branch_name || `exchange/${taskId.substring(0, 8)}`
         exchangeRepoDir = path.join(workspace.dir, 'repo')
+        // An exchange task is git work by definition — clone, branch, commit, push.
+        // Fail with the prerequisite named instead of `Command failed: git clone ...`.
+        requireGit('This exchange task')
         console.log(`[exchange] Cloning ${repoUrl} → ${exchangeRepoDir} (branch: ${branch})`)
         try {
           execSync(`git clone --depth 50 "${repoUrl.replace(/"/g, '')}" "${exchangeRepoDir}"`, {
