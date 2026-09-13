@@ -3139,25 +3139,106 @@ app.post('/api/sessions/opencode', async (req, res) => {
   }
 })
 
+
+// ── Live delivery into a running session (#184783, #184804) ──────────────────────────────────
+//
+// THE DEFECT THIS REPLACES. This endpoint used to spawn `OPENCODE_BIN run -s <sid>`. Two things
+// were wrong with that, stacked:
+//
+//   1. OPENCODE_BIN defaults to /opt/homebrew/bin/opencode — UPSTREAM opencode, a DIFFERENT
+//      product installed by Homebrew. It cannot resolve an IRIS session, so the call hung until
+//      the 180s cap and delivered nothing: 0 messages, HTTP 500 to the caller.
+//   2. Even with the right binary, `run -s` executes in a SEPARATE process. It writes the
+//      transcript but emits nothing on the event bus the TUI renders from, so the human watching
+//      that session sees nothing. It forks the conversation instead of joining it.
+//
+// The session server is already listening on loopback on THIS machine, and this daemon runs on
+// the same machine. Spawning a CLI to talk to a process that is already listening was the whole
+// defect. `POST /session/:id/message` with noReply persists a real user message AND fires
+// message.updated on the bus, in milliseconds, with no model turn and no tokens.
+function sessionServerCandidates() {
+  const seen = new Set()
+  const out = []
+  for (const u of [process.env.IRIS_SERVER, process.env.OPENCODE_SERVER, 'http://127.0.0.1:4096']) {
+    if (!u) continue
+    const t = String(u).replace(/\/+$/, '')
+    if (seen.has(t)) continue
+    seen.add(t)
+    out.push(t)
+  }
+  return out
+}
+
+// Asserts on the BODY, never the status: unknown paths on these servers return HTTP 200 with the
+// web UI's HTML, so a status check calls any open port a session server. Requiring the returned
+// id to match also rules out a 200 describing somebody else's session.
+async function findLiveSessionServer(sid, timeoutMs = 1500) {
+  for (const base of sessionServerCandidates()) {
+    try {
+      const r = await fetch(`${base}/session/${encodeURIComponent(sid)}`, { signal: AbortSignal.timeout(timeoutMs) })
+      if (!r.ok) continue
+      const b = await r.json()
+      if (b && typeof b === 'object' && b.id === sid) return base
+    } catch { /* unreachable, non-JSON, or timed out — try the next */ }
+  }
+  return null
+}
+
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
-  const { message } = req.body
+  const { message, submit } = req.body
   const sid = req.params.id
 
-  try {
-    const args = ['run', message, '-s', sid, '--format', 'json']
+  const base = await findLiveSessionServer(sid)
+  if (!base) {
+    // Say which of the two things is true, because they have different fixes: the session is not
+    // running on this node, or no session server is reachable here at all. Never fall back to the
+    // old subprocess — it delivers to nobody, so "falling back" would only restore a silent
+    // failure that reports success.
+    console.log(`[opencode] No live server on this node holds ${sid}`)
+    return res.status(404).json({
+      error: `No live session server on this node is running ${sid}. It is not open here; use the Hive inbox for a message that should wait.`,
+      session_id: sid,
+      tried: sessionServerCandidates()
+    })
+  }
 
-    console.log(`[opencode] Message to session ${sid}`)
-    const raw = await runCLI(OPENCODE_BIN, args, { timeoutMs: 180000 })
-    const parsed = parseOpenCodeOutput(raw)
+  try {
+    // NOTIFY by default. `submit` omits noReply, which makes the receiving agent take a turn —
+    // that spends THEIR tokens and interrupts what they were doing, so it is opt-in per call.
+    const body = submit
+      ? { parts: [{ type: 'text', text: message }] }
+      : { noReply: true, parts: [{ type: 'text', text: message }] }
+
+    console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
+    const r = await fetch(`${base}/session/${encodeURIComponent(sid)}/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      // A notification returns as soon as it is persisted. A submit runs the recipient's model
+      // turn synchronously, so it needs a turn-length budget or it reports failure on success.
+      signal: AbortSignal.timeout(submit ? 180000 : 8000)
+    })
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => '')
+      console.error(`[opencode] Live delivery failed: HTTP ${r.status} ${t.slice(0, 200)}`)
+      return res.status(502).json({ error: `live delivery to ${base} failed: HTTP ${r.status}`, session_id: sid })
+    }
 
     res.json({
-      response: parsed.response,
-      model: parsed.model,
+      session_id: sid,
+      status: 'delivered',
+      via: 'live',
+      server: base,
+      // Kept for callers that read these. A notification runs no model turn, so there is no
+      // response and no spend — reporting a fabricated one would be worse than reporting none.
+      response: null,
+      model: null,
       tokens_used: 0
     })
   } catch (err) {
     console.error(`[opencode] Message failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: err.message, session_id: sid })
   }
 })
 

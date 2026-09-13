@@ -3677,9 +3677,27 @@ exit 1
           const bridgePort = parseInt(process.env.A2A_PORT || process.env.BRIDGE_PORT || '3200', 10)
           const providerSlug = sessionProvider === 'claude_code' ? 'claude-code' : sessionProvider
 
-          // Build a script that uses curl to send the message to the local bridge
+          // Build a script that uses curl to send the message to the local bridge.
+          //
+          // THE BRIDGE REQUIRES AUTH. Without X-Bridge-Key every one of these returned
+          // 401 "missing or invalid X-Bridge-Key header" — and `curl -s` alone exits 0 on an
+          // HTTP error, so the task was marked COMPLETED while nothing was delivered. The CLI
+          // then printed "✓ sent" with a task id. Three green signals over a message that
+          // reached nobody (#184783).
+          //
+          // -f makes an HTTP >=400 a non-zero exit so the task FAILS, and --show-error prints
+          // why. A task that cannot report failure is not a task, it is a wish.
+          const bridgeTokenPath = path.join(os.homedir(), '.iris', 'bridge-token')
+          const bridgeToken = fs.existsSync(bridgeTokenPath)
+            ? fs.readFileSync(bridgeTokenPath, 'utf8').trim()
+            : ''
+          if (!bridgeToken) {
+            reject(new Error(`session_message needs the bridge token at ${bridgeTokenPath} — without it the bridge returns 401 and the message is silently dropped`))
+            return
+          }
+
           const msgBody = JSON.stringify({ message: task.prompt }).replace(/'/g, "'\\''")
-          const curlCmd = `curl -s -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -d '${msgBody}'`
+          const curlCmd = `curl -sS -f -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
 
           cmd = '/bin/bash'
           args = ['-c', curlCmd]
