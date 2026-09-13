@@ -41,7 +41,7 @@ fi
 
 case "${1:-status}" in
     start)
-        PID=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
+        PID=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null | tr '\n' ' ' || true)
         if [ -n "$PID" ]; then echo "Bridge already running (PID: $PID)"; exit 0; fi
         nohup node "$BRIDGE_DIR/index.js" > "$BRIDGE_DIR/bridge.log" 2>&1 &
         sleep 2
@@ -50,6 +50,12 @@ case "${1:-status}" in
         else
             echo "Failed to start. Check: cat $BRIDGE_DIR/bridge.log"; exit 1
         fi ;;
+# -sTCP:LISTEN IS LOAD-BEARING on every one of these. `lsof -ti :3200` alone also matches
+# outbound CLIENT sockets, so every running `iris` process connected to the bridge landed in
+# this list — and `stop` pipes the list to `xargs kill` and then `kill -9`. Measured with one
+# client socket held open: bare returned 11679 54775 54781 (daemon + client); with the flag,
+# 11679 alone. With nothing connected both agree, which is why it survived a previous review
+# of this same defect (#184826 fixed the no-op half in `start` and left these).
     stop)
         # `kill "$PID"` was WRONG whenever more than one process held the port:
         # lsof prints one PID per line, the quotes made that a single argument
@@ -57,20 +63,20 @@ case "${1:-status}" in
         # /dev/null, and the script printed "Stopped" having killed nothing. A
         # restart then reported success while the old code kept serving — which
         # is how a fixed mail endpoint sat on disk for hours still returning 400.
-        PIDS=$(lsof -ti :3200 2>/dev/null || true)
+        PIDS=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null || true)
         if [ -z "$PIDS" ]; then echo "Not running"; exit 0; fi
         echo "$PIDS" | xargs kill 2>/dev/null || true
         # Verify rather than assume: wait for the port to actually free, then
         # escalate. Reporting "Stopped" is a claim about the world, not a wish.
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             sleep 0.3
-            [ -z "$(lsof -ti :3200 2>/dev/null || true)" ] && break
+            [ -z "$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null || true)" ] && break
         done
-        LEFT=$(lsof -ti :3200 2>/dev/null || true)
+        LEFT=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null || true)
         if [ -n "$LEFT" ]; then
             echo "$LEFT" | xargs kill -9 2>/dev/null || true
             sleep 0.5
-            LEFT=$(lsof -ti :3200 2>/dev/null || true)
+            LEFT=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null || true)
         fi
         if [ -n "$LEFT" ]; then
             echo "FAILED to stop — still holding :3200: $(echo "$LEFT" | tr '\n' ' ')" >&2
@@ -83,7 +89,7 @@ case "${1:-status}" in
             # The health endpoint is the real check and it already passed; lsof only
             # decorates. It lives in /usr/sbin, which is absent from some minimal PATHs, and
             # printing "Running (PID: )" makes a healthy daemon look broken.
-            _pid=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
+            _pid=$(lsof -ti :3200 -sTCP:LISTEN 2>/dev/null | tr '\n' ' ' || true)
             if [ -n "${_pid// /}" ]; then echo "Running (PID: ${_pid% })"; else echo "Running"; fi
         else echo "Not running"; fi ;;
     logs) tail -f "$BRIDGE_DIR/bridge.log" ;;
