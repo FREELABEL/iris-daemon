@@ -328,8 +328,26 @@ case "${1:-status}" in
                    echo "$RESP" | sed -n 's/.*"node_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         if [ -n "$NODE_KEY" ] && [ "$NODE_KEY" != "null" ]; then
             mkdir -p "$HOME/.iris"
-            printf '{"node_api_key":"%s","user_id":%s,"api_url":"https://freelabel.net"}\n' "$NODE_KEY" "${USER_ID:-0}" > "$IRIS_CONFIG"
-            chmod 600 "$IRIS_CONFIG"
+            # MERGE, never truncate. A `printf ... > "$IRIS_CONFIG"` here destroyed
+            # every field outside the three it wrote — including node_id, this
+            # node's own identity — and reverted a custom api_url (#185145).
+            #
+            # The patch goes in on STDIN, not argv: the node key would otherwise be
+            # readable in `ps` output by anyone else on the machine.
+            #
+            # api_url is deliberately NOT sent. Registration has no opinion about
+            # which endpoint this node talks to; the previous hardcoded value
+            # silently overwrote it. It is set below only when absent.
+            if ! printf '{"node_api_key":"%s","user_id":"%s"}' "$NODE_KEY" "${USER_ID}" \
+                 | node "$BRIDGE_DIR/lib/config-merge.js" "$IRIS_CONFIG"; then
+                echo "Registration obtained a node key but could NOT save it — config.json is unchanged." >&2
+                echo "  Nothing was lost. Fix the error above and re-run: iris-daemon register" >&2
+                exit 1
+            fi
+            # Seed api_url only if this config has never had one.
+            if ! node -e 'const c=require(process.argv[1]);process.exit(c.api_url?0:1)' "$IRIS_CONFIG" 2>/dev/null; then
+                printf '{"api_url":"https://freelabel.net"}' | node "$BRIDGE_DIR/lib/config-merge.js" "$IRIS_CONFIG" >/dev/null
+            fi
             echo "Registered! Node key saved to ~/.iris/config.json"
             echo "Start with: iris-daemon start"
         else
@@ -343,5 +361,11 @@ case "${1:-status}" in
             esac
             echo "  Manual setup: https://web.heyiris.io/dashboard/hive"
         fi ;;
-    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs}" ;;
+    doctor)
+        # Shared with iris-bridge on purpose: iris-daemon and iris-bridge are two
+        # control surfaces over ONE process, and neither knew anything about the
+        # other (#185142). A self-check that lives in only one of them is a
+        # self-check half the operators never run.
+        exec node "$BRIDGE_DIR/lib/daemon-doctor-cli.js" "$@" ;;
+    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor}" ;;
 esac

@@ -35,7 +35,11 @@ setInterval(() => {
   const staleMs = (Date.now() - origin) - last
   if (staleMs < thresholdMs) return
 
-  const msg = `[watchdog] MAIN THREAD BLOCKED for ${Math.round(staleMs / 1000)}s — it answered nothing while stuck. Killing pid ${pid} so the supervisor restarts it. (#182371)\n`
+  // The ISO timestamp is load-bearing, not decoration: without it a kill count
+  // read from this log cannot be bounded to the current boot, so 54 historical
+  // kills and 54 kills today are indistinguishable — and `iris-daemon doctor`
+  // would stay red forever after a fix that worked.
+  const msg = `[watchdog] ${new Date().toISOString()} MAIN THREAD BLOCKED for ${Math.round(staleMs / 1000)}s — it answered nothing while stuck. Killing pid ${pid} so the supervisor restarts it. (#182371)\n`
 
   // writeSync, NOT console.error. console.error buffers, and SIGKILL a microsecond later
   // discards the buffer — measured in production: the process restarted every ~100s with

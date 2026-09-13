@@ -93,5 +93,11 @@ case "${1:-status}" in
             if [ -n "${_pid// /}" ]; then echo "Running (PID: ${_pid% })"; else echo "Running"; fi
         else echo "Not running"; fi ;;
     logs) tail -f "$BRIDGE_DIR/bridge.log" ;;
-    *) echo "Usage: iris-bridge {start|stop|restart|status|logs}" ;;
+    doctor)
+        # Shared with iris-bridge on purpose: iris-daemon and iris-bridge are two
+        # control surfaces over ONE process, and neither knew anything about the
+        # other (#185142). A self-check that lives in only one of them is a
+        # self-check half the operators never run.
+        exec node "$BRIDGE_DIR/lib/daemon-doctor-cli.js" "$@" ;;
+    *) echo "Usage: iris-bridge {start|stop|restart|status|logs|doctor}" ;;
 esac
