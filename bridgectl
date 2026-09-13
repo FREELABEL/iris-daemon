@@ -1,47 +1,8 @@
 #!/usr/bin/env bash
-# Resolve the REAL script location through any symlinks before computing BRIDGE_DIR.
-# iris-bridge is a symlink at ~/.iris/bin/iris-bridge → ~/.iris/bridge/bridgectl; using
-# "$0" directly would resolve BRIDGE_DIR to ~/.iris/bin and run ~/.iris/bin/index.js
-# (which does not exist), so `iris-bridge start/restart` took the bridge down with no
-# recovery (#136550). This portable loop follows the link chain (no GNU readlink -f).
-SOURCE="${BASH_SOURCE[0]:-$0}"
-while [ -h "$SOURCE" ]; do
-    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-    SOURCE="$(readlink "$SOURCE")"
-    [ "${SOURCE#/}" = "$SOURCE" ] && SOURCE="$DIR/$SOURCE"
-done
-BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-# Preflight: name the missing dependency instead of exiting 1 with nothing.
-#
-# The daemon needs node and tmux and checked for neither. When either was absent it exited
-# code 1 silently, and the only way to learn why was to read its logs — which is exactly what
-# a client had to do on 2026-08-31, twice in one session, once for each dependency.
-#
-# "exited with code 1" is not a diagnosis. This turns it into one.
-missing_deps=""
-command -v node >/dev/null 2>&1 || missing_deps="$missing_deps node"
-command -v tmux >/dev/null 2>&1 || missing_deps="$missing_deps tmux"
-# git is used 10x by the bridge (clone/pull for self-update). On macOS the binary exists as a
-# stub that PROMPTS for Xcode Command Line Tools, so "git is there" is not the same as "git
-# works" — `git --version` is the check that distinguishes them.
-git --version >/dev/null 2>&1 || missing_deps="$missing_deps git"
-if [ -n "$missing_deps" ]; then
-    echo "ERROR: the Hive daemon cannot start — missing:$missing_deps" >&2
-    case "$missing_deps" in
-        *node*) echo "  node: re-run the installer (curl -fsSL https://heyiris.io/install-code | bash)" >&2 ;;
-    esac
-    case "$missing_deps" in
-        *tmux*) echo "  tmux: brew install tmux    (macOS)  |  sudo apt-get install tmux  (Linux)" >&2 ;;
-    esac
-    case "$missing_deps" in
-        *git*) echo "  git:  xcode-select --install (macOS)  |  sudo apt-get install git   (Linux)" >&2 ;;
-    esac
-    exit 1
-fi
-
+BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-status}" in
     start)
-        PID=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
+        PID=$(lsof -ti :3200 2>/dev/null || true)
         if [ -n "$PID" ]; then echo "Bridge already running (PID: $PID)"; exit 0; fi
         nohup node "$BRIDGE_DIR/index.js" > "$BRIDGE_DIR/bridge.log" 2>&1 &
         sleep 2
@@ -51,40 +12,13 @@ case "${1:-status}" in
             echo "Failed to start. Check: cat $BRIDGE_DIR/bridge.log"; exit 1
         fi ;;
     stop)
-        # `kill "$PID"` was WRONG whenever more than one process held the port:
-        # lsof prints one PID per line, the quotes made that a single argument
-        # like "1874\n1875\n84450", kill could not parse it, the failure went to
-        # /dev/null, and the script printed "Stopped" having killed nothing. A
-        # restart then reported success while the old code kept serving — which
-        # is how a fixed mail endpoint sat on disk for hours still returning 400.
-        PIDS=$(lsof -ti :3200 2>/dev/null || true)
-        if [ -z "$PIDS" ]; then echo "Not running"; exit 0; fi
-        echo "$PIDS" | xargs kill 2>/dev/null || true
-        # Verify rather than assume: wait for the port to actually free, then
-        # escalate. Reporting "Stopped" is a claim about the world, not a wish.
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 0.3
-            [ -z "$(lsof -ti :3200 2>/dev/null || true)" ] && break
-        done
-        LEFT=$(lsof -ti :3200 2>/dev/null || true)
-        if [ -n "$LEFT" ]; then
-            echo "$LEFT" | xargs kill -9 2>/dev/null || true
-            sleep 0.5
-            LEFT=$(lsof -ti :3200 2>/dev/null || true)
-        fi
-        if [ -n "$LEFT" ]; then
-            echo "FAILED to stop — still holding :3200: $(echo "$LEFT" | tr '\n' ' ')" >&2
-            exit 1
-        fi
-        echo "Stopped (PID: $(echo "$PIDS" | tr '\n' ' '))" ;;
-    restart) "$0" stop || exit 1; sleep 1; "$0" start ;;
+        PID=$(lsof -ti :3200 2>/dev/null || true)
+        if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; echo "Stopped (PID: $PID)"
+        else echo "Not running"; fi ;;
+    restart) "$0" stop; sleep 1; "$0" start ;;
     status)
         if curl -s "http://localhost:3200/health" > /dev/null 2>&1; then
-            # The health endpoint is the real check and it already passed; lsof only
-            # decorates. It lives in /usr/sbin, which is absent from some minimal PATHs, and
-            # printing "Running (PID: )" makes a healthy daemon look broken.
-            _pid=$(lsof -ti :3200 2>/dev/null | tr '\n' ' ' || true)
-            if [ -n "${_pid// /}" ]; then echo "Running (PID: ${_pid% })"; else echo "Running"; fi
+            echo "Running (PID: $(lsof -ti :3200 2>/dev/null || true))"
         else echo "Not running"; fi ;;
     logs) tail -f "$BRIDGE_DIR/bridge.log" ;;
     *) echo "Usage: iris-bridge {start|stop|restart|status|logs}" ;;

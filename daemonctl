@@ -4,9 +4,20 @@ REAL_SCRIPT="$0"
 BRIDGE_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
 IRIS_CONFIG="$HOME/.iris/config.json"
 
+# Does this machine have a HIVE NODE key — not "is the user logged in".
+#
+# This used to return true whenever IRIS_API_KEY was set. That is the ACCOUNT key: it proves
+# who you are, and it is what `iris auth whoami` reads. The node key is a DIFFERENT credential,
+# issued per machine by /hive/register-node and stored as node_api_key in ~/.iris/config.json.
+#
+# Conflating them meant that as soon as someone logged in, node registration was skipped — so
+# the daemon came up with no valid node key and reported "HTTP 401 Invalid API key" while
+# `iris auth whoami` happily returned the user's email. A client hit exactly that on
+# 2026-08-27: authenticated, and the daemon offline, with nothing to connect the two.
+#
+# The bridge .env check went the same way: having a bridge configured says nothing about
+# whether THIS machine is a registered node.
 has_node_key() {
-    [ -n "${IRIS_API_KEY:-}" ] && return 0
-    [ -f "$BRIDGE_DIR/.env" ] && return 0
     [ -f "$IRIS_CONFIG" ] && grep -q '"node_api_key"' "$IRIS_CONFIG" 2>/dev/null && return 0
     return 1
 }
