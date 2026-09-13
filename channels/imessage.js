@@ -384,7 +384,18 @@ class IMessageChannel extends EventEmitter {
     // so an enable with dm_policy=pairing, group_policy=closed, empty allowlist (which
     // should process nothing) still auto-replied to everyone who said @heyiris (#137256).
     // Fail closed: an unrecognized policy value blocks rather than blasts.
-    const dmPolicy = (this.config.dmPolicy || 'open').toLowerCase()
+    // DEFAULT IS 'pairing', NOT 'open'. The gate below honours the allow-list,
+    // but under dm_policy=open an EMPTY allow-list admits everyone — so the old
+    // default meant "enable the channel and it answers any stranger who happens
+    // to type the wake word". That is #137256's blast radius reachable from a
+    // clean config, and it gets worse the moment the channel routes structured
+    // commands (#184811) rather than chat: "@heyiris inbox read" from an unknown
+    // number would read the operator's Hive inbox back to them.
+    //
+    // An allow-list is only worth the identity it checks, and an empty one checks
+    // nothing. Pairing makes the empty case admit NOBODY, which is the direction
+    // a default should fail.
+    const dmPolicy = (this.config.dmPolicy || 'pairing').toLowerCase()
     const groupPolicy = (this.config.groupPolicy || 'closed').toLowerCase()
     const allowlist = Array.isArray(this.config.allowlist) ? this.config.allowlist : []
     const allowed = this._isAllowlisted(event, allowlist)
@@ -402,6 +413,19 @@ class IMessageChannel extends EventEmitter {
     } else {
       // dm_policy: 'open' = anyone; 'pairing' = only allowlisted/paired contacts;
       // 'closed' = never auto-reply in DMs.
+      // Enumerate what IS allowed, rather than listing what is refused and
+      // falling through on anything else. The comment above has claimed
+      // "an unrecognized policy value blocks rather than blasts" since the
+      // #137256 fix, and for DMs it was not true: 'closed', 'pairing' and
+      // 'open' each returned early, and any OTHER string — a typo, a renamed
+      // policy, a value from a newer config — matched none of them, reached
+      // the end of the function, and replied. The group branch got this right
+      // (`groupPolicy !== 'open'`); the DM branch did not. Caught by
+      // tests/imessage-dm-policy-default.test.js, not by reading it.
+      if (!['closed', 'pairing', 'open'].includes(dmPolicy)) {
+        console.log(`[imessage] dm_policy=${dmPolicy} is not a policy I know — refusing to reply to ${event.sender_id}`)
+        return false
+      }
       if (dmPolicy === 'closed') {
         console.log(`[imessage] dm_policy=closed — skip DM reply to ${event.sender_id}`)
         return false
@@ -410,9 +434,17 @@ class IMessageChannel extends EventEmitter {
         console.log(`[imessage] dm_policy=pairing and ${event.sender_id} not paired/allowlisted — skip`)
         return false
       }
-      if (dmPolicy === 'open' && allowlist.length > 0 && !allowed) {
-        console.log(`[imessage] ${event.sender_id} not in allowlist — skip`)
-        return false
+      if (dmPolicy === 'open') {
+        if (allowlist.length > 0 && !allowed) {
+          console.log(`[imessage] ${event.sender_id} not in allowlist — skip`)
+          return false
+        }
+        // Reachable only by an explicit dm_policy=open with an empty allow-list.
+        // Say out loud what that means, every time, so it is a decision someone
+        // made rather than a default nobody read.
+        if (allowlist.length === 0) {
+          console.log(`[imessage] dm_policy=open with an EMPTY allowlist — replying to ${event.sender_id}, a sender nobody vetted`)
+        }
       }
     }
 
@@ -833,7 +865,7 @@ class IMessageChannel extends EventEmitter {
       messages_processed: this.messageCount,
       errors: this.errorCount,
       policies: {
-        dm_policy: this.config.dmPolicy || 'open',
+        dm_policy: this.config.dmPolicy || 'pairing',
         group_policy: this.config.groupPolicy || 'closed',
         allowlist_size: this.config.allowlist?.length || 0
       }

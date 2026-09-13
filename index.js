@@ -1648,7 +1648,8 @@ app.post('/api/providers/imessage', async (req, res) => {
           ...(chat_db_path && { chatDbPath: chat_db_path })
         }
       }),
-      dmPolicy: dm_policy || 'open',
+      // Fail closed: an enable that names no policy admits no strangers (#184811).
+      dmPolicy: dm_policy || 'pairing',
       groupPolicy: group_policy || 'closed',
       allowlist: allowlist || [],
       apiBaseUrl: api_base_url || 'http://localhost:8000'
@@ -4390,7 +4391,7 @@ async function autoStartBots () {
               pollInterval: parseInt(env.IMESSAGE_POLL_INTERVAL) || 3000
             }
           }),
-          dmPolicy: env.IMESSAGE_DM_POLICY || 'open',
+          dmPolicy: env.IMESSAGE_DM_POLICY || 'pairing',
           groupPolicy: env.IMESSAGE_GROUP_POLICY || 'closed',
           allowlist: env.IMESSAGE_ALLOWLIST ? env.IMESSAGE_ALLOWLIST.split(',') : [],
           apiBaseUrl: env.IMESSAGE_API_BASE_URL || 'http://localhost:8000'
