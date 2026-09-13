@@ -1392,12 +1392,39 @@ class TaskExecutor {
         console.log('[executor] Launching YouTube re-auth browser...')
         const freelabelRoot = this.freelabelPath || findFreelabelPath()
         try {
-          execSync('npx playwright test tests/e2e/save-youtube-session.spec.ts --headed --timeout 600000', {
-            cwd: freelabelRoot,
-            stdio: 'inherit',
-            timeout: 10 * 60 * 1000
+          // NEVER execSync A BROWSER HERE (#182371). This is the daemon's own event loop.
+          //
+          // execSync holds it for the child's entire life, and this child was a HEADED browser
+          // with `--timeout 600000` and an execSync timeout of ten minutes. For that whole
+          // window the daemon answered nothing — no /health, no task dispatch, no heartbeat —
+          // so its watchdog killed it. Measured on the live node: 54 kills, stalls of 60s, 87s,
+          // 90s, 122s and 264s. The watchdog was never the fault; it was the only part behaving
+          // correctly.
+          //
+          // Detached + unref'd, so the re-auth window opens for the human and this process goes
+          // straight back to serving. We deliberately do NOT await it: nothing here can make a
+          // person finish a login, and pretending to wait is what cost us the event loop.
+          await new Promise((resolve, reject) => {
+            let child
+            try {
+              child = spawn(
+                'npx',
+                ['playwright', 'test', 'tests/e2e/save-youtube-session.spec.ts', '--headed', '--timeout', '600000'],
+                { cwd: freelabelRoot, stdio: 'ignore', detached: true },
+              )
+            } catch (spawnErr) {
+              reject(spawnErr)
+              return
+            }
+            // A spawn that fails asynchronously (npx missing, bad cwd) must still surface —
+            // otherwise "re-auth launched" becomes a claim nobody can check.
+            child.once('error', reject)
+            child.once('spawn', () => {
+              child.unref()
+              resolve()
+            })
           })
-          console.log('[executor] YouTube session saved! Retrying task...')
+          console.log('[executor] YouTube re-auth browser launched (detached) — complete the login, then re-run the task')
         } catch (authErr) {
           console.error(`[executor] Re-auth failed: ${authErr.message}`)
           await this.cloud.submitResult(taskId, {
