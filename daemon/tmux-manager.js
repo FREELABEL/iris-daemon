@@ -29,6 +29,45 @@ const MAX_LOG_SIZE = 50 * 1024 * 1024 // 50MB
 const ZOMBIE_AGE_MS = 2 * 60 * 60 * 1000 // 2 hours
 const MAX_LEDGER_LINES = 500
 
+/**
+ * Is tmux REQUIRED on this platform, or merely nice to have? (#184726)
+ *
+ * Measured 2026-09-12 on qb-host-vanguard, Windows Server 2025: a fully installed node — iris.exe
+ * on PATH, Node 24, Git, bridge cloned, installer reporting [5/5] Agent Bridge installed — started,
+ * failed `tmux -V`, and exited within seconds. tmux does not ship on Windows, so EVERY Windows
+ * machine was a permanently dead node. Worse, the remediation it printed was "brew install tmux
+ * (macOS) or sudo apt install tmux (Linux)" — neither command exists on the platform doing the
+ * printing — and the only escape hatch, IRIS_NO_TMUX=1, is labelled "CI only", so the documented
+ * answer for a real production node was a flag documented as not for production.
+ *
+ * tmux buys session persistence, panes and scrollback. It is not what makes a node able to work:
+ * task-executor.js calls it "an OPTIONAL accelerator", carries a null-object when the module will
+ * not load, and falls back to direct spawn. So a node without tmux is DEGRADED, not broken — and
+ * degraded beats dead, which is what refusing to start actually delivered.
+ *
+ * Pure on purpose: platform and env in, decision out, so the Windows path can be tested from a Mac.
+ */
+function tmuxPolicy (platform = process.platform, env = process.env) {
+  if (env.IRIS_NO_TMUX === '1') {
+    return { required: false, mode: 'disabled', note: 'IRIS_NO_TMUX=1 — tmux disabled' }
+  }
+
+  if (platform === 'win32') {
+    return {
+      required: false,
+      mode: 'unsupported',
+      note: 'tmux does not exist on Windows — continuing WITHOUT session persistence. Tasks run via direct spawn; long-running sessions will not survive a daemon restart. Install Git Bash or WSL if you want them.'
+    }
+  }
+
+  // Only name the installer that exists on the platform being told to run it.
+  return {
+    required: true,
+    mode: 'required',
+    install: platform === 'darwin' ? 'brew install tmux' : 'sudo apt install tmux   (or your distro equivalent)'
+  }
+}
+
 class TmuxManager {
   constructor () {
     this.sessions = new Map() // sessionName -> { taskId, type, source, userId, outputFile, created }
@@ -803,4 +842,4 @@ class TmuxManager {
   }
 }
 
-module.exports = { TmuxManager }
+module.exports = { TmuxManager, tmuxPolicy }

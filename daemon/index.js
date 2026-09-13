@@ -25,6 +25,7 @@ const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
 const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
+const { tmuxPolicy } = require('./tmux-manager')
 const { detectTailscaleIp } = require('./tailscale-address')
 const { deriveSessionStatus } = require('./session-status')
 const { sessionLabel } = require('./session-label')
@@ -158,18 +159,25 @@ class Daemon {
       }
     } catch { /* status file missing or corrupted — fine */ }
 
-    // Step 0a: Verify tmux (required for session persistence)
+    // Step 0a: Verify tmux — REQUIRED only on platforms that have it (#184726).
+    //
+    // This used to exit(1) on any platform, which made every Windows machine a permanently dead
+    // node: installed, registered, reporting "Hive daemon starting", gone seconds later. tmux is
+    // an optional accelerator (task-executor falls back to direct spawn), so a node without it is
+    // degraded, not broken.
+    const tmux = tmuxPolicy()
     try {
       this.executor.tmux.verify()
       // Clean up stale sessions from previous daemon runs
       this.executor.tmux.cleanupAll()
     } catch (tmuxErr) {
-      if (process.env.IRIS_NO_TMUX === '1') {
-        console.log('[daemon] tmux disabled (IRIS_NO_TMUX=1)')
+      if (!tmux.required) {
+        console.warn(`[daemon] ${tmux.note || 'tmux unavailable'}`)
+        console.warn('[daemon] Session persistence and panes are off; everything else works.')
       } else {
         console.error(`[daemon] tmux verification failed: ${tmuxErr.message}`)
-        console.error('[daemon] Install tmux: brew install tmux (macOS) or sudo apt install tmux (Linux)')
-        console.error('[daemon] Or set IRIS_NO_TMUX=1 to disable (CI only)')
+        console.error(`[daemon] Install tmux: ${tmux.install}`)
+        console.error('[daemon] Or set IRIS_NO_TMUX=1 to run without session persistence')
         process.exit(1)
       }
     }
