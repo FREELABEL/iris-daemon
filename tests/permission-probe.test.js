@@ -198,3 +198,53 @@ describe('interpreters', () => {
     assert.match(r.reason, /Windows/)
   })
 })
+
+/**
+ * #184794 — a probe that TIMED OUT measured nothing. Recording that as false makes the node
+ * refuse work it can do (the gate treats not-true as unsatisfied) and hands the operator a
+ * diagnosis nobody established. Measured live: Chrome answers in 0.28s and docker info in
+ * 0.67s, yet both timed out once under launchd and advertised ABSENT.
+ */
+describe('a timeout is not a measurement', () => {
+  const { probeIsolation } = require('../daemon/permission-probe')
+  const timesOut = () => { const e = new Error('timed out'); e.code = 'ETIMEDOUT'; throw e }
+  const killed = () => { const e = new Error('killed'); e.killed = true; e.signal = 'SIGTERM'; throw e }
+
+  it('BROWSER: a timeout is unknown, never absent', () => {
+    const r = probeBrowser(io({ exec: timesOut }))
+    assert.equal(r.available, null)
+    assert.match(r.reason, /2500ms/)
+  })
+
+  it('ISOLATION: A TIMEOUT MUST NOT CLAIM THE RUNTIME IS STOPPED', () => {
+    // The exact false statement from the field: Docker was running the whole time.
+    const r = probeIsolation(io({ exec: timesOut }))
+    assert.equal(r.available, null)
+    assert.doesNotMatch(r.reason, /not running/)
+    assert.match(r.reason, /not measured/)
+  })
+
+  it('ISOLATION: a real non-zero exit still reads as stopped', () => {
+    // The distinction the fix turns on — here docker ANSWERED, and the answer was no.
+    const r = probeIsolation(io({ exec: () => { const e = new Error('cannot connect'); e.code = 1; throw e } }))
+    assert.equal(r.available, false)
+    assert.match(r.reason, /not running/)
+  })
+
+  it('INTERPRETER: a slow python3 is not a missing python3', () => {
+    const r = probeRuntime('python3')(io({ exec: timesOut }))
+    assert.equal(r.available, null)
+    assert.doesNotMatch(r.reason, /no python3 on PATH/)
+  })
+
+  it('a SIGTERM kill counts as unmeasured too', () => {
+    assert.equal(probeRuntime('node')(io({ exec: killed })).available, null)
+  })
+
+  it('nothing measured is never rendered as granted', async () => {
+    const out = await probePermissions(io({ exec: timesOut }))
+    for (const k of ['browser', 'isolation', 'python3', 'node', 'bash']) {
+      assert.notEqual(out[k].available, true, `${k} must not be true when nothing was measured`)
+    }
+  })
+})

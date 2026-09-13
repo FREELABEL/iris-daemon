@@ -89,6 +89,7 @@ const BROWSER_CANDIDATES = [
 
 function probeBrowser (io = defaultIo) {
   const errors = []
+  const unmeasured = []
   for (const bin of BROWSER_CANDIDATES) {
     try {
       const out = io.exec(bin, ['--version'], 2500)
@@ -98,9 +99,15 @@ function probeBrowser (io = defaultIo) {
       errors.push(`${path.basename(bin)}: ran but reported no version`)
     } catch (e) {
       const code = e && e.code
+      if (isUnmeasured(e)) {
+        unmeasured.push(`${path.basename(bin)}: did not answer --version within 2500ms`)
+        continue
+      }
       if (code !== 'ENOENT') errors.push(`${path.basename(bin)}: ${code || (e && e.message)}`)
     }
   }
+  // A browser we failed to TIME is not a browser we found to be absent (#184794).
+  if (unmeasured.length) return unknown(unmeasured.join('; ').slice(0, 160))
   return no(errors.length ? errors.join('; ').slice(0, 160) : 'no browser executable responded to --version')
 }
 
@@ -122,6 +129,9 @@ function probeIsolation (io = defaultIo) {
   } catch (e) {
     const code = e && e.code
     if (code === 'ENOENT') return no('no container runtime installed')
+    // A TIMEOUT ESTABLISHED NOTHING. "installed but not running" is a diagnosis, and on a machine
+    // where Docker IS running it sends an operator to start something already started (#184794).
+    if (isUnmeasured(e)) return unknown('docker info did not return within 5000ms — the runtime was not measured, not found stopped')
     // A non-zero exit from `docker info` is almost always "daemon not running", and saying so
     // is more useful than the raw stderr, which is a paragraph about a socket path.
     return no('container runtime installed but not running (start Docker/OrbStack)')
@@ -182,12 +192,19 @@ function probeRuntime (name) {
 
   return (io = defaultIo) => {
     const errors = []
+    const unmeasured = []
     for (const [bin, args] of spec.candidates) {
       let out
       try {
         out = io.exec(bin, args, 4000)
       } catch (e) {
         const code = e && e.code
+        // A timeout is not an answer about the interpreter (#184794) — without this an
+        // overloaded machine reports "no python3 on PATH" about a python3 that is installed.
+        if (isUnmeasured(e)) {
+          unmeasured.push(`${bin}: did not answer ${args.join(' ')} within 4000ms`)
+          continue
+        }
         // ENOENT is the ordinary "not installed" and is not worth reporting per candidate —
         // the summary below says it once. Anything else (EACCES, a non-zero exit from a shim)
         // is a different problem and the operator needs to see it.
@@ -205,6 +222,10 @@ function probeRuntime (name) {
       errors.push(`${bin}: reported "${first.slice(0, 40)}"`)
     }
 
+    // Unmeasured outranks not-found: if any candidate never answered, we do not know whether
+    // this interpreter is here, and saying "absent" would refuse work the node may well be
+    // able to do (#184794).
+    if (unmeasured.length) return unknown(unmeasured.join('; ').slice(0, 160))
     return no(errors.length ? errors.join('; ').slice(0, 160) : spec.missing)
   }
 }
@@ -246,6 +267,20 @@ async function probePermissions (io = defaultIo) {
 const yes = (detail = null) => ({ available: true, reason: null, detail })
 const no = (reason) => ({ available: false, reason })
 const unknown = (reason) => ({ available: null, reason })
+
+/**
+ * Did this probe FAIL, or did it never finish? (#184794)
+ *
+ * Node kills the child when the timeout expires, so a timeout never arrives as a clean non-zero
+ * exit: it comes back ETIMEDOUT, or killed/SIGTERM depending on platform and version. Recording
+ * that as `false` is the whole bug — the gate treats anything not exactly true as unsatisfied, so
+ * the node silently refuses work it can do, and the reason names a problem nobody diagnosed.
+ *
+ * Measured on this fleet: Chrome answers --version in 0.28s and `docker info` in 0.67s, yet both
+ * probes timed out once inside launchd's environment at daemon start and advertised absent. The
+ * sibling machine, same code and same minute, advertised both as present.
+ */
+const isUnmeasured = (e) => !!e && (e.code === 'ETIMEDOUT' || e.killed === true || e.signal === 'SIGTERM')
 
 const defaultIo = {
   platform: () => process.platform,
