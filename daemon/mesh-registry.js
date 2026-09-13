@@ -14,6 +14,10 @@ const PEERS_FILE = path.join(os.homedir(), '.iris', 'mesh-peers.json')
  */
 class MeshRegistry {
   constructor ({ ownNodeName }) {
+    // Named peers whose /capacity is currently unreadable — so the warning is
+    // emitted once per outage instead of once per 15s poll. Deliberately NOT on the
+    // peer object: it must not be persisted into mesh-peers.json.
+    this._capacityWarned = new Set()
     this.ownNodeName = ownNodeName
     this.peers = new Map() // name → peer record
     this._healthInterval = null
@@ -89,22 +93,49 @@ class MeshRegistry {
     }
   }
 
+  // Liveness is /health, and ONLY /health.
+  //
+  // This used to assign `peer.status = 'online'` and then request /capacity
+  // inside the SAME try block. When /capacity failed — a 404 on a peer whose
+  // prefix does not serve it, a timeout, non-JSON — the catch saw the 'online'
+  // this very iteration had just written, read it as a down-transition, logged
+  // "went offline", and marked a reachable peer offline. Every poll. Forever.
+  //
+  // Measured before the fix: 61,860 "went offline" lines in daemon.stdout.log,
+  // 44,002 of them for one peer, at a 15s interval — not flapping, every single
+  // poll for a week. And the cost was not the log: anything routing by
+  // peer.status refused to dispatch to a node that was up and answering.
+  //
+  // Capacity is a SCHEDULING HINT. Failing to read it means we do not know how
+  // busy the peer is; it does not mean the peer is gone.
   async _pollAll () {
     for (const peer of this.peers.values()) {
+      const pfx = peer.prefix ?? ''
+      const wasOnline = peer.status === 'online'
+
       try {
-        const pfx = peer.prefix ?? ''
         const health = await this._httpGet(peer.host, peer.port, pfx + '/health')
         peer.status = 'online'
         peer.last_seen = new Date().toISOString()
         peer.node_id = health.node_id || peer.node_id
-
-        const capacity = await this._httpGet(peer.host, peer.port, pfx + '/capacity')
-        peer.capacity = capacity
       } catch {
-        if (peer.status === 'online') {
+        // Compare against the status BEFORE this poll, so the transition is real.
+        if (wasOnline) {
           console.log(`[mesh-registry] Peer ${peer.name} went offline`)
         }
         peer.status = 'offline'
+        continue
+      }
+
+      try {
+        peer.capacity = await this._httpGet(peer.host, peer.port, pfx + '/capacity')
+        this._capacityWarned.delete(peer.name)
+      } catch (err) {
+        // Say it once per outage, not once per poll — and say what it does NOT mean.
+        if (!this._capacityWarned.has(peer.name)) {
+          console.warn(`[mesh-registry] Peer ${peer.name} is online but ${pfx}/capacity did not answer (${err.message}) — keeping last known capacity. This is a scheduling hint, NOT liveness; the peer stays online.`)
+          this._capacityWarned.add(peer.name)
+        }
       }
     }
   }

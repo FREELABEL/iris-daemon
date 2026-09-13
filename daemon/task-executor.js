@@ -42,6 +42,7 @@ try {
 // Single local admission-control authority (idempotency + resource exclusion).
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
+const { shellFor, pathDelimiterFor, describeSpawnFailure } = require('../lib/shell-for-platform')
 
 /**
  * Task types whose `prompt` is NOT a shell command.
@@ -4272,8 +4273,11 @@ exit 1
             return
           }
           // Free-form types keep the legacy behaviour: the prompt IS a shell command.
-          cmd = '/bin/bash'
-          args = ['-c', task.prompt]
+          // The shell it runs in is the PLATFORM's, not POSIX's. Hardcoding
+          // /bin/bash here made every hive dispatch to the Windows node die with
+          // `spawn /bin/bash ENOENT` (#185143, #184733) — a message that reads as a
+          // failed command rather than a node that has no shell to run one with.
+          ;({ cmd, args } = shellFor(task.prompt))
       }
 
       console.log(`[executor] Running: ${cmd} ${args.slice(0, 2).join(' ')}...`)
@@ -4281,7 +4285,9 @@ exit 1
       // Prepend Node 18+ and IRIS CLI to PATH for spawned processes
       const irisPath = path.join(os.homedir(), '.iris', 'bin')
       const basePath = process.env.PATH || '/usr/local/bin:/usr/bin:/bin'
-      const spawnPath = [_node18BinDir, irisPath, basePath].filter(Boolean).join(':')
+      // ';' on Windows. Joining with ':' produced one unusable PATH entry per
+      // spawned process there — the same platform assumption as the shell above.
+      const spawnPath = [_node18BinDir, irisPath, basePath].filter(Boolean).join(pathDelimiterFor())
 
       const spawnEnv = {
         ...process.env,
@@ -4517,6 +4523,12 @@ exit 1
 
       child.on('error', (err) => {
         clearTimeout(timer)
+        // An ENOENT here is the SHELL missing, not the command — nothing ran. The bare
+        // error said "spawn /bin/bash ENOENT", which reads as a failed task and got
+        // filed twice as one (#185143, #184733). Say which shell, on which platform.
+        if (err && err.code === 'ENOENT') {
+          err.message = describeSpawnFailure(err, cmd, process.platform)
+        }
         reject(err)
       })
     })
