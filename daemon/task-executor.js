@@ -3774,9 +3774,12 @@ exit 1
           // `config.from` is set by the sender; fall back to the originating node id, and finally
           // to a generic label rather than dropping the marker entirely — an unlabelled injection
           // is the thing we are fixing.
-          const senderLabel = String(
-            sessionConfig.from || sessionConfig.sender || task.node_id || 'another machine'
-          ).slice(0, 64)
+          // NO fallback to node_id. A sender label is only worth printing if it names something
+          // a person recognises; the fallback put a raw node UUID into somebody's terminal —
+          //   [via iris · 01a09d2c-2076-72e5-9292-7f69c00e8407] [room · ops] deploy is green
+          // — unreadable, and a SECOND marker on a line the sender had already labelled. An
+          // absent `from` now means "this text is already labelled, pass it through".
+          const senderLabel = String(sessionConfig.from || sessionConfig.sender || '').slice(0, 64)
 
           const msgBody = JSON.stringify({ message: task.prompt, from: senderLabel }).replace(/'/g, "'\\''")
           const curlCmd = `curl -sS -f -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
