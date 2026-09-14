@@ -30,3 +30,53 @@ jobs:
 
       - name: Verify npm-script-backed tasks are shippable (catches missing discover/som scripts)
         run: node test/check-task-scripts.js
+
+  # The Windows leg. Separate job, not a matrix entry, because it answers a different
+  # question and has different steps.
+  #
+  # WHY THIS EXISTS: `iris hive run <node> "<cmd>"` failed on EVERY dispatch to the Windows
+  # node with `spawn /bin/bash ENOENT` (#185143, and #184733 before it). The interpreter,
+  # the script extension and the chmod were all hardcoded POSIX. It was filed twice and
+  # diagnosed neither time, because nothing in this repo ever executed that path on Windows.
+  #
+  # The unit tests for lib/shell-for-platform.js already cover the win32 branch FROM A MAC —
+  # the platform is a parameter there precisely so that is possible. What they cannot answer
+  # is whether the thing it returns actually runs: whether cmd.exe accepts the file, whether
+  # the extension matters, whether CRLF matters, whether the exit code and stdout come back.
+  # Those only answer on the real OS.
+  #
+  # A GitHub Windows runner is free and takes ~2 minutes, which is the whole argument for
+  # doing it here instead of on a client's machine. The alternative that was actually on the
+  # table was rebooting a client's QuickBooks server to load the fix — with QBW.EXE open and
+  # a company file written minutes earlier. This job is why that is not necessary.
+  windows-sandbox-execute:
+    name: sandbox_execute actually runs on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Which platform is this, really?
+        # Assert the runner is what this job exists to test. A silently-Linux runner would
+        # make every assertion below pass for the wrong reason, and the negative control
+        # would skip — leaving a green job that proves nothing.
+        shell: pwsh
+        run: |
+          node -e "if (process.platform !== 'win32') { console.error('expected win32, got ' + process.platform); process.exit(1) }"
+          node -e "console.log('platform=' + process.platform + ' arch=' + process.arch + ' node=' + process.version)"
+          Write-Host "ComSpec = $env:ComSpec"
+
+      - name: Syntax-check every daemon JS file (Windows path handling)
+        shell: pwsh
+        run: Get-ChildItem -Path daemon -Filter *.js -Recurse | ForEach-Object { node --check $_.FullName }
+
+      - name: sandbox_execute end-to-end, with the /bin/bash negative control
+        shell: pwsh
+        run: node --test tests/sandbox-execute-runs-on-this-platform.test.js
+
+      - name: shell-for-platform unit tests
+        shell: pwsh
+        run: node --test tests/shell-for-platform.test.js
