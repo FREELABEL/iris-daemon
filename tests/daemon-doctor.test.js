@@ -19,6 +19,8 @@ function healthy () {
     launchdPid: 4242,
     portHolderPid: 4242,
     bridgeProcessPids: [4242],
+    executorPids: [4242],
+    monitorPids: [],
     processStartedMs: Date.parse('2026-09-13T19:00:00Z'),
     newestCodeMs: Date.parse('2026-09-13T18:00:00Z'),
     healthStatus: 200,
@@ -43,7 +45,7 @@ test('every check is exercised by at least one failing fixture', () => {
   // whole file is about.
   const broken = {
     launchd_pid_is_port_holder: { ...healthy(), launchdPid: 1, portHolderPid: 2, bridgeProcessPids: [1, 2] },
-    single_executor: { ...healthy(), bridgeProcessPids: [4242, 5555] },
+    single_executor: { ...healthy(), bridgeProcessPids: [4242, 5555], executorPids: [4242, 5555], monitorPids: [] },
     running_code_is_current: { ...healthy(), newestCodeMs: Date.parse('2026-09-13T20:00:00Z') },
     health_responds: { ...healthy(), healthStatus: 503 },
     config_valid: { ...healthy(), config: { parsed: false, mode: 0o600, keys: [] } },
@@ -145,5 +147,52 @@ test('untimestamped kills cannot be bounded, so they are not silently forgiven',
   const c = byId(res, 'watchdog_quiet')
   assert.strictEqual(c.status, 'unknown', 'unbounded is unknown, never pass')
   assert.match(c.detail, /timestamp/i, 'must say WHY it cannot answer')
+  assert.strictEqual(res.ok, false)
+})
+
+// ---------------------------------------------------------------------------
+// An ATTACHED MONITOR is not a second executor.
+//
+// `node index.js` started while the real bridge holds :3200 does not bind and does not
+// start an executor — measured: it prints "Bridge already running on :3200 — attaching as
+// monitor" and its log contains ZERO daemon boot markers (no "Ready — waiting for tasks",
+// no watchdog, no cloud auth, no mounted daemon endpoints). It is a status display.
+//
+// The first version of single_executor counted any index.js process as an executor and so
+// reported FAIL on a harmless monitor. That is a cry-wolf check, and a check that cries
+// wolf gets muted — strictly worse than no check, because it also blocks the pipeline.
+//
+// The discriminator is ownership of a mutex: a real executor holds :3200 (index.js) or
+// ~/.iris/daemon.sock (daemon.js). A monitor holds neither.
+// ---------------------------------------------------------------------------
+
+test('an attached monitor does NOT fail single_executor', () => {
+  const res = evaluate({
+    ...healthy(),
+    bridgeProcessPids: [4242, 9001],
+    executorPids: [4242],
+    monitorPids: [9001]
+  })
+  const c = byId(res, 'single_executor')
+  assert.strictEqual(c.status, 'pass', 'a monitor holds no mutex and runs no executor')
+  assert.match(c.detail, /monitor/i, 'but it must still be VISIBLE, not silently ignored')
+  assert.match(c.detail, /9001/, 'and named, so an unexpected one can be chased')
+})
+
+test('two processes that BOTH hold a mutex still fail', () => {
+  // The other direction — the monitor exemption must not swallow the real case.
+  const res = evaluate({
+    ...healthy(),
+    bridgeProcessPids: [4242, 5555],
+    executorPids: [4242, 5555],
+    monitorPids: []
+  })
+  assert.strictEqual(byId(res, 'single_executor').status, 'fail')
+  assert.strictEqual(res.ok, false)
+})
+
+test('zero executors is unknown, not a pass, even with monitors attached', () => {
+  const res = evaluate({ ...healthy(), bridgeProcessPids: [9001], executorPids: [], monitorPids: [9001] })
+  assert.strictEqual(byId(res, 'single_executor').status, 'unknown')
   assert.strictEqual(res.ok, false)
 })
