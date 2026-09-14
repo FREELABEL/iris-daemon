@@ -145,20 +145,112 @@ class OBSChannel extends EventEmitter {
 
   // ── Markers ──
 
+  /**
+   * Record a marker as a SPAN on a durable timeline.
+   *
+   * OBS has no native marker API, so this used to build a marker object, return it in the
+   * HTTP response, and stop. The comment said "we log it for post-production" and nothing
+   * was ever written — the marker died with the terminal scrollback. A command whose entire
+   * purpose is to mark a moment for later cannot be the one that forgets it.
+   *
+   * A marker is the cheapest span there is: free, timestamped at the moment, and judged by a
+   * human who was watching. It is only worth anything if it outlives the call.
+   *
+   * ON THE TIME FIELD, WHICH IS THE PART THAT CAN LIE. `t0` is an OFFSET INTO THE RECORDING,
+   * in seconds. When nothing is recording there is no offset — the old code fell back to a
+   * wall-clock ISO string, and writing that into the same field would produce spans whose
+   * times mean two different things with nothing to tell them apart. So when there is no
+   * recording, `t0` is null and `unanchored` is true. A span that cannot say when it happened
+   * must say so, not guess.
+   */
   async createMarker(description) {
-    // OBS doesn't have a native marker API — we log it for post-production
     const streamStatus = await this.getStreamStatus().catch(() => null)
     const recordStatus = await this.getRecordStatus().catch(() => null)
-    const timecode = streamStatus?.timecode || recordStatus?.timecode || new Date().toISOString()
+
+    const active = recordStatus?.active || streamStatus?.active || false
+    // outputDuration is milliseconds since this output started — the true timeline position.
+    const durationMs = recordStatus?.active
+      ? recordStatus?.duration
+      : streamStatus?.active
+        ? streamStatus?.duration
+        : null
+    const t0 = typeof durationMs === 'number' ? Math.round((durationMs / 1000) * 10) / 10 : null
+
+    const now = new Date()
+
+    // Session key = when this output started, CACHED for the life of the recording.
+    //
+    // Computing it fresh each time as (now - duration) looks equivalent and is not: the key is
+    // truncated to whole seconds, so a second of clock jitter or rounding drift splits one
+    // recording's markers across two timeline files. Caught by a unit test where two markers on
+    // the same recording produced two sessions — which would have surfaced in production as
+    // "half my markers are missing" rather than as an error.
+    //
+    // A recording RESTART is detected by duration going backwards; that legitimately starts a
+    // new session.
+    let session
+    if (t0 === null) {
+      this._markerSession = null
+      this._markerLastDuration = null
+      session = 'unanchored-' + now.toISOString().slice(0, 10)
+    } else {
+      const restarted = typeof this._markerLastDuration === 'number' && durationMs < this._markerLastDuration
+      if (!this._markerSession || restarted) {
+        this._markerSession = new Date(now.getTime() - durationMs).toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      }
+      this._markerLastDuration = durationMs
+      session = this._markerSession
+    }
+
+    const span = {
+      t0,
+      t1: t0,
+      kind: 'marker',
+      label: description || 'Marker',
+      source: 'marker',
+      confidence: 1.0,
+      unanchored: t0 === null,
+      evidence: {
+        timecode: recordStatus?.timecode || streamStatus?.timecode || null,
+        wall_clock: now.toISOString(),
+        record_active: recordStatus?.active || false,
+        stream_active: streamStatus?.active || false,
+      },
+    }
+
+    let timeline = null
+    let persisted = false
+    let persistError = null
+    try {
+      const fs = require('fs')
+      const path = require('path')
+      const dir = path.join(process.env.HOME || '', '.iris', 'timelines')
+      fs.mkdirSync(dir, { recursive: true })
+      timeline = path.join(dir, session + '.jsonl')
+      fs.appendFileSync(timeline, JSON.stringify(span) + '\n')
+      persisted = true
+    } catch (e) {
+      // Report the failure instead of returning ok:true over a marker that went nowhere —
+      // which is the exact bug this method is fixing.
+      persistError = e.message
+    }
 
     return {
-      ok: true,
+      ok: persisted,
+      persisted,
+      persist_error: persistError,
+      timeline,
+      session,
+      span,
+      // Back-compat: callers (and the CLI's printer) still read `marker`.
       marker: {
-        description: description || 'Marker',
-        timecode,
-        timestamp: new Date().toISOString(),
-        stream_active: streamStatus?.active || false,
-        record_active: recordStatus?.active || false,
+        description: span.label,
+        timecode: span.evidence.timecode,
+        timestamp: span.evidence.wall_clock,
+        t0,
+        unanchored: span.unanchored,
+        stream_active: span.evidence.stream_active,
+        record_active: span.evidence.record_active,
       },
     }
   }
