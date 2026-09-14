@@ -48,6 +48,7 @@ const fs = require('fs')
 const os = require('os')
 const net = require('net')
 const socketGuard = require('./daemon/socket-guard')
+const { wireIpcConnection } = require('./lib/ipc-connection')
 
 const IRIS_DIR = path.join(os.homedir(), '.iris')
 const CONFIG_FILE = path.join(IRIS_DIR, 'config.json')
@@ -528,16 +529,15 @@ function startDaemon () {
     } catch { /* bridge not available — daemon-only mode */ }
 
     // ─── IPC Server: Handle commands from CLI ─────────────────
-    const ipcServer = net.createServer((conn) => {
-      conn.on('data', (data) => {
-        try {
-          const msg = JSON.parse(data.toString().trim())
-          handleIpcMessage(msg, conn, daemon)
-        } catch {
-          conn.end(JSON.stringify({ status: 'error', message: 'Invalid JSON' }) + '\n')
-        }
-      })
-    })
+    // #185157 — this used to attach only a 'data' listener. handleIpcMessage
+    // replies with conn.end(...) from ~20 branches, and any client that had
+    // already exited turned one of those writes into an 'error' event on a socket
+    // with nobody listening, which node promotes to an uncaught exception. The
+    // daemon died and launchd restarted it: 14 times in 15 minutes. A
+    // crash-looping daemon still reports ONLINE and heartbeats, so work sent to
+    // it hung to timeout rather than failing fast.
+    const ipcServer = net.createServer((conn) =>
+      wireIpcConnection(conn, (msg, c) => handleIpcMessage(msg, c, daemon)))
 
     // Clear a STALE socket before binding. A leftover file with no listener makes bind fail
     // with EADDRINUSE forever; a socket someone is actually using must be left alone, so
