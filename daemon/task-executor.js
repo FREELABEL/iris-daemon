@@ -42,7 +42,7 @@ try {
 // Single local admission-control authority (idempotency + resource exclusion).
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
-const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure } = require('../lib/shell-for-platform')
+const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure, interpreterFor, generatedScriptFor, posixScriptPlan } = require('../lib/shell-for-platform')
 
 /**
  * Task types whose `prompt` is NOT a shell command.
@@ -2011,10 +2011,14 @@ class TaskExecutor {
           break
         }
 
-        case 'test_run':
-          cmd = '/bin/bash'
-          args = ['-c', task.prompt]
+        case 'test_run': {
+          // Free-form command: resolve the shell from the platform this daemon is
+          // running on, rather than asserting bash exists.
+          const plan = shellFor(task.prompt)
+          cmd = plan.cmd
+          args = plan.args
           break
+        }
 
         case 'comms_sync': {
           // DISABLED on this node: comms_sync (Pulse WhatsApp/iMessage/Gmail ingest)
@@ -2844,8 +2848,14 @@ async function call(method, p, body) {
           fs.writeFileSync(scriptPath, scriptContent, 'utf-8')
           fs.chmodSync(scriptPath, '755')
 
-          cmd = '/bin/bash'
-          args = [scriptPath]
+          {
+            // Bash we generated; a Windows node has no interpreter for it. Refuse by
+            // name instead of spawning a shell that is not there.
+            const plan = posixScriptPlan(scriptPath, 'remotion_carousel')
+            if (plan.unsupported) { reject(new Error(plan.reason)); return }
+            cmd = plan.cmd
+            args = plan.args
+          }
           workspace.projectDir = remotionRoot
           break
         }
@@ -3622,8 +3632,14 @@ exit 1
           fs.writeFileSync(scriptPath, pollScript)
           fs.chmodSync(scriptPath, '755')
 
-          cmd = '/bin/bash'
-          args = [scriptPath]
+          {
+            // Bash we generated; a Windows node has no interpreter for it. Refuse by
+            // name instead of spawning a shell that is not there.
+            const plan = posixScriptPlan(scriptPath, 'discover')
+            if (plan.unsupported) { reject(new Error(plan.reason)); return }
+            cmd = plan.cmd
+            args = plan.args
+          }
           break
         }
 
@@ -3658,12 +3674,18 @@ exit 1
 
           lines.push('echo "Workspace scaffolded successfully"')
 
-          const scaffoldScript = path.join(workspace.dir, 'scaffold.sh')
-          fs.writeFileSync(scaffoldScript, lines.join('\n'), 'utf-8')
-          fs.chmodSync(scaffoldScript, '755')
-
-          cmd = '/bin/bash'
-          args = [scaffoldScript]
+          {
+            // echo/cd/npm only — simple enough to translate faithfully, unlike the
+            // pm2 and curl-retry scripts elsewhere in this switch. On Windows this
+            // becomes a .ps1 with $ErrorActionPreference AND an explicit
+            // $LASTEXITCODE check after every line, because the Stop preference
+            // does not catch a native exe returning non-zero.
+            const gen = generatedScriptFor(workspace.dir, 'scaffold', lines)
+            fs.writeFileSync(gen.scriptPath, gen.content, 'utf-8')
+            if (gen.mode) fs.chmodSync(gen.scriptPath, gen.mode)
+            cmd = gen.cmd
+            args = gen.args
+          }
           break
         }
 
@@ -3695,8 +3717,14 @@ exit 1
           fs.writeFileSync(pm2ScriptPath, pm2Script, 'utf-8')
           fs.chmodSync(pm2ScriptPath, '755')
 
-          cmd = '/bin/bash'
-          args = [pm2ScriptPath]
+          {
+            // Bash we generated; a Windows node has no interpreter for it. Refuse by
+            // name instead of spawning a shell that is not there.
+            const plan = posixScriptPlan(pm2ScriptPath, 'run_persistent')
+            if (plan.unsupported) { reject(new Error(plan.reason)); return }
+            cmd = plan.cmd
+            args = plan.args
+          }
           break
         }
 
@@ -3747,8 +3775,11 @@ exit 1
           const msgBody = JSON.stringify({ message: task.prompt, from: senderLabel }).replace(/'/g, "'\\''")
           const curlCmd = `curl -sS -f -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
 
-          cmd = '/bin/bash'
-          args = ['-c', curlCmd]
+          {
+            const plan = shellFor(curlCmd)
+            cmd = plan.cmd
+            args = plan.args
+          }
           break
         }
 
@@ -3852,8 +3883,14 @@ exit 1
             const syncScript = path.join(workspace.dir, 'deploy.sh')
             fs.writeFileSync(syncScript, lines.join('\n'), 'utf-8')
             fs.chmodSync(syncScript, '755')
-            cmd = '/bin/bash'
-            args = [syncScript]
+            {
+              // Bash we generated; a Windows node has no interpreter for it. Refuse by
+              // name instead of spawning a shell that is not there.
+              const plan = posixScriptPlan(syncScript, 'deploy_project (client sync)')
+              if (plan.unsupported) { reject(new Error(plan.reason)); return }
+              cmd = plan.cmd
+              args = plan.args
+            }
             workspace.projectDir = workspace.dir
             console.log(`[executor] Client sync: ${processName} → ${pConfig.client_repo}`)
             break
@@ -3899,8 +3936,14 @@ exit 1
           fs.writeFileSync(deployScript, lines.join('\n'), 'utf-8')
           fs.chmodSync(deployScript, '755')
 
-          cmd = '/bin/bash'
-          args = [deployScript]
+          {
+            // Bash we generated; a Windows node has no interpreter for it. Refuse by
+            // name instead of spawning a shell that is not there.
+            const plan = posixScriptPlan(deployScript, 'deploy_project')
+            if (plan.unsupported) { reject(new Error(plan.reason)); return }
+            cmd = plan.cmd
+            args = plan.args
+          }
           workspace.projectDir = workspace.dir
           console.log(`[executor] Deploy project: ${processName} (${isRedeploy ? 'redeploy' : 'fresh'})`)
           break
@@ -3916,8 +3959,11 @@ exit 1
           }
 
           const stopName = sanitizeProcessName(stopNameRaw)
-          cmd = '/bin/bash'
-          args = ['-c', `pm2 delete "${stopName}" && pm2 save && echo "Process ${stopName} stopped"`]
+          {
+            const plan = shellFor(`pm2 delete "${stopName}" && pm2 save && echo "Process ${stopName} stopped"`)
+            cmd = plan.cmd
+            args = plan.args
+          }
           console.log(`[executor] Stop project: ${stopName}`)
           break
         }
@@ -4042,7 +4088,7 @@ exit 1
             timeout: execPlan.timeoutMs,
             encoding: 'utf-8',
             maxBuffer: 5 * 1024 * 1024,
-            shell: '/bin/bash'
+            shell: shellFor('').cmd
           }, (err, stdout, stderr) => {
             const out = (stdout && stdout.toString()) || ''
             const errOut = (stderr && stderr.toString()) || ''
@@ -4106,9 +4152,12 @@ exit 1
 
           // Auto-detect interpreter by extension
           const ext = path.extname(fullScriptPath).toLowerCase()
-          const interpreters = { '.py': 'python3', '.js': 'node', '.ts': 'npx ts-node' }
-          cmd = interpreters[ext] || '/bin/bash'
-          args = [fullScriptPath, ...(task.config?.args || [])]
+          {
+            const interp = interpreterFor(ext)
+            if (interp.unsupported) { reject(new Error(interp.reason)); return }
+            cmd = interp.cmd
+            args = [...interp.args, fullScriptPath, ...(task.config?.args || [])]
+          }
 
           // Optional cwd override (also sandboxed)
           if (task.config?.cwd) {
@@ -4706,7 +4755,9 @@ exit 1
     // Resolve terminal-notifier once and cache (undefined = unchecked).
     if (this._tnPath === undefined) {
       try {
-        this._tnPath = execFileSync('command', ['-v', 'terminal-notifier'], { shell: '/bin/bash', encoding: 'utf-8' }).trim() || null
+        // POSIX_ONLY_OK: terminal-notifier is a macOS binary for macOS notifications;
+        // this branch is unreachable off darwin.
+        this._tnPath = execFileSync('command', ['-v', 'terminal-notifier'], { shell: '/bin/bash', encoding: 'utf-8' }).trim() || null // POSIX_ONLY_OK
       } catch { this._tnPath = null }
     }
     try {
@@ -5190,9 +5241,10 @@ exit 1
       } catch { /* continue */ }
     }
 
-    // Fall back to bash for now
-    console.warn('[executor] iris-code not found — falling back to bash')
-    return '/bin/bash'
+    // Fall back to the platform's own shell. Returning '/bin/bash' here handed a
+    // path that does not exist on Windows back to the caller.
+    console.warn('[executor] iris-code not found — falling back to the platform shell')
+    return shellFor('').cmd
   }
 
   /**
