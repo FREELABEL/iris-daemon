@@ -1798,7 +1798,11 @@ class TaskExecutor {
   // the direct-invocation tests, and any other call site, working unchanged.
   runProcess (task, workspace, outputLines, outputStream = null) {
     return new Promise(async (resolve, reject) => {
-      let cmd, args
+      // spawnOptions travels WITH cmd/args. Declared together so a branch that
+      // sets a command and forgets the platform's spawn options reads as
+      // incomplete rather than as working code (#185143's first patch fixed a
+      // function the failing path never called; this is the same trap).
+      let cmd, args, spawnOptions
 
       // Type-collapse remap — iris-api's NodeTaskController has historically classified
       // some chained tasks under the wrong `type` (e.g. inbox_scan dispatched as type=leadgen,
@@ -2017,6 +2021,7 @@ class TaskExecutor {
           const plan = shellFor(task.prompt)
           cmd = plan.cmd
           args = plan.args
+          spawnOptions = plan.spawnOptions
           break
         }
 
@@ -3685,6 +3690,7 @@ exit 1
             if (gen.mode) fs.chmodSync(gen.scriptPath, gen.mode)
             cmd = gen.cmd
             args = gen.args
+            spawnOptions = gen.spawnOptions
           }
           break
         }
@@ -3779,6 +3785,7 @@ exit 1
             const plan = shellFor(curlCmd)
             cmd = plan.cmd
             args = plan.args
+            spawnOptions = plan.spawnOptions
           }
           break
         }
@@ -3963,6 +3970,7 @@ exit 1
             const plan = shellFor(`pm2 delete "${stopName}" && pm2 save && echo "Process ${stopName} stopped"`)
             cmd = plan.cmd
             args = plan.args
+            spawnOptions = plan.spawnOptions
           }
           console.log(`[executor] Stop project: ${stopName}`)
           break
@@ -4502,7 +4510,11 @@ exit 1
       const child = spawn(cmd, args, {
         cwd: workspace.projectDir,
         env: spawnEnv,
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // On Windows this carries windowsVerbatimArguments. Dropping it means node
+        // re-escapes the command with MSVCRT rules that cmd.exe does not use, and
+        // cmd runs something other than what was asked for — silently.
+        ...(spawnOptions || {})
       })
 
       child._startedAt = Date.now()
@@ -4594,7 +4606,11 @@ exit 1
    */
   runRuntimeProcess (task, runtime, workspace, outputLines) {
     return new Promise((resolve, reject) => {
-      let cmd, args
+      // spawnOptions travels WITH cmd/args. Declared together so a branch that
+      // sets a command and forgets the platform's spawn options reads as
+      // incomplete rather than as working code (#185143's first patch fixed a
+      // function the failing path never called; this is the same trap).
+      let cmd, args, spawnOptions
 
       switch (runtime) {
         case 'claude_code':
@@ -4653,13 +4669,20 @@ exit 1
         env: {
           ...process.env,
           ...loadProjectEnv(),
-          PATH: `${irisPathRuntime}:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
+          // ':' and /usr/bin are meaningless on Windows — the delimiter is ';' and
+          // every spawned process was inheriting one unusable PATH entry.
+          PATH: [irisPathRuntime, process.env.PATH || (process.platform === 'win32' ? '' : '/usr/local/bin:/usr/bin:/bin')]
+            .filter(Boolean).join(pathDelimiterFor()),
           TASK_ID: task.id,
           TASK_TYPE: task.type,
           RUNTIME: runtime,
           ...(task.config?.env_vars || {})
         },
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // Carries windowsVerbatimArguments on Windows. Without it node re-escapes
+        // the command with MSVCRT rules cmd.exe does not use, and cmd runs
+        // something other than what was asked for — without erroring.
+        ...(spawnOptions || {})
       })
 
       child._startedAt = Date.now()

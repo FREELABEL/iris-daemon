@@ -144,3 +144,99 @@ test('the source tree has no bare /bin/bash left in the typed task paths', () =>
   assert.deepStrictEqual(bare.map(([n]) => n), [],
     'these lines still hardcode bash:\n' + bare.map(([n, l]) => `  ${n}: ${l.trim()}`).join('\n'))
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cmd.exe quoting — the bug that only exists on the platform we cannot run on.
+//
+// spawn('cmd.exe', ['/d','/s','/c', command]) does NOT do what it looks like.
+// Node escapes arguments on Windows using MSVCRT rules; cmd.exe parses its
+// command line with its OWN rules, and the two disagree exactly when the command
+// contains quotes. Node sets windowsVerbatimArguments automatically when you pass
+// `shell:`, but NOT when you name cmd.exe yourself — which is what this code does.
+//
+// The consequence is not "it errors". It is that cmd.exe receives a DIFFERENT
+// command than the operator typed, which is the worst outcome in this whole bug
+// family: it runs, and it runs something else.
+//
+// `/s` is what makes the safe form work: with /s, cmd.exe strips the first and
+// last quote of the trailing string and treats everything between as the command
+// verbatim, instead of counting quotes and guessing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('win32 spawns must ask for VERBATIM arguments', () => {
+  const plan = shellFor('echo hi', 'win32')
+  assert.ok(plan.spawnOptions, 'the plan must carry the options its spawn needs')
+  assert.strictEqual(plan.spawnOptions.windowsVerbatimArguments, true,
+    'without this node re-escapes the command and cmd.exe misreads it')
+})
+
+test('posix plans do not smuggle a Windows-only spawn option', () => {
+  for (const p of POSIX) {
+    const o = shellFor('echo hi', p).spawnOptions || {}
+    assert.notStrictEqual(o.windowsVerbatimArguments, true, `${p} must not set it`)
+  }
+})
+
+test('win32 wraps the command so /s strips exactly one layer of quotes', () => {
+  const { args } = shellFor('echo hi', 'win32')
+  const last = args[args.length - 1]
+  assert.ok(last.startsWith('"') && last.endsWith('"'),
+    'the /s contract is that the command is the quoted trailing argument')
+  assert.strictEqual(last.slice(1, -1), 'echo hi')
+})
+
+test('win32 survives a command that CONTAINS quotes — the case that breaks', () => {
+  // git commit -m "a message" is the everyday command that exposes this.
+  const cmd = 'git commit -m "fix: a thing"'
+  const { args } = shellFor(cmd, 'win32')
+  const last = args[args.length - 1]
+  assert.strictEqual(last.slice(1, -1), cmd,
+    'the inner quotes must survive untouched — /s only removes the outer pair')
+})
+
+test('win32 script invocation is verbatim too', () => {
+  const s = scriptFor('C:\\ws', 'echo hi', 'win32')
+  assert.strictEqual((s.spawnOptions || {}).windowsVerbatimArguments, true,
+    'the script path can contain spaces (C:\\Users\\Some Name\\...)')
+})
+
+test('a script path containing a space is quoted', () => {
+  const s = scriptFor('C:\\Users\\Some Name\\ws', 'echo hi', 'win32')
+  const last = s.args[s.args.length - 1]
+  assert.ok(last.startsWith('"') && last.endsWith('"'),
+    'an unquoted path with a space becomes two arguments and cmd runs the wrong file')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The spawn sites themselves.
+//
+// A plan that carries the right options is worth nothing if the caller drops
+// them. #185143's first patch was exactly this shape — it fixed a function the
+// failing path never called, and the unit tests could not tell. So these assert
+// the SOURCE at the two spawn sites, not the helper.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EXEC_SRC = () => fs.readFileSync(path.join(__dirname, '..', 'daemon', 'task-executor.js'), 'utf8')
+
+test('every spawn of a task passes the plan spawnOptions through', () => {
+  const src = EXEC_SRC()
+  const spawns = [...src.matchAll(/const child = spawn\(cmd, args, \{([\s\S]{0,1200}?)\n      \}\)/g)]
+  assert.ok(spawns.length >= 2, `expected the task spawn sites, found ${spawns.length}`)
+  for (const [i, m] of spawns.entries()) {
+    assert.match(m[1], /spawnOptions/,
+      `spawn site ${i + 1} drops spawnOptions — on Windows that loses ` +
+      'windowsVerbatimArguments and cmd.exe silently receives a different command')
+  }
+})
+
+test('no task spawn builds PATH with a hardcoded POSIX delimiter', () => {
+  const bad = EXEC_SRC().split('\n')
+    .map((l, i) => [i + 1, l])
+    .filter(([, l]) => !/^\s*(\/\/|\*)/.test(l))
+    // A PATH built with ':' and POSIX default dirs is unusable on Windows, where
+    // the delimiter is ';' — every spawned process inherits one broken entry.
+    .filter(([, l]) => /PATH:\s*`[^`]*\$\{[^}]+\}:/.test(l))
+  assert.deepStrictEqual(bad.map(([n]) => n), [],
+    'these build PATH with ":" instead of pathDelimiterFor():\n' +
+    bad.map(([n, l]) => `  ${n}: ${l.trim()}`).join('\n'))
+})

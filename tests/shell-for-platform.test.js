@@ -12,6 +12,12 @@ const assert = require('node:assert')
 const path = require('path')
 const { shellFor, pathDelimiterFor, describeSpawnFailure } = require('../lib/shell-for-platform')
 
+// Windows plans quote the trailing argument. With windowsVerbatimArguments node
+// escapes nothing for us, so the quoting is ours and cmd.exe's /s strips exactly
+// one layer back off. These tests assert the INTENT — the command/script is the
+// final argument — rather than the pre-quoting literal spelling.
+const unwrap = (a) => (a.startsWith('"') && a.endsWith('"') ? a.slice(1, -1) : a)
+
 test('posix platforms get bash -c', () => {
   for (const p of ['darwin', 'linux', 'freebsd']) {
     const { cmd, args } = shellFor('echo hi', p)
@@ -24,7 +30,7 @@ test('win32 gets a shell that EXISTS on Windows, never /bin/bash', () => {
   const { cmd, args } = shellFor('echo hi', 'win32')
   assert.notStrictEqual(cmd, '/bin/bash', 'the whole bug: /bin/bash is not on Windows')
   assert.match(cmd, /cmd\.exe$/i, 'cmd.exe is the only shell present on every Windows install')
-  assert.strictEqual(args[args.length - 1], 'echo hi', 'the command must be the final argument')
+  assert.strictEqual(unwrap(args[args.length - 1]), 'echo hi', 'the command must be the final argument')
   assert.ok(args.includes('/c'), 'cmd.exe needs /c to run a command string')
 })
 
@@ -103,7 +109,7 @@ test('win32 script: a .cmd run by cmd.exe — NOT a .sh run by bash', () => {
   assert.match(s.scriptPath, /\.cmd$/)
   assert.notStrictEqual(s.cmd, '/bin/bash')
   assert.match(s.cmd, /cmd\.exe$/i)
-  assert.strictEqual(s.args[s.args.length - 1], s.scriptPath, 'the script is the final argument')
+  assert.strictEqual(unwrap(s.args[s.args.length - 1]), s.scriptPath, 'the script is the final argument')
   assert.strictEqual(s.mode, null, 'Windows has no exec bit to set; chmod would be a no-op or throw')
 })
 
