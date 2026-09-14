@@ -49,6 +49,42 @@ has_node_key() {
 # NOT `lsof -ti :3200`. Without -sTCP:LISTEN that matches outbound CLIENT sockets too, so any
 # running `iris` process makes the port look bound — the defect that had bridgectl silently
 # no-op and exit 0 (#184826). A bound port is also not readiness; a served request is.
+# The pid currently LISTENING on the bridge port, or empty.
+#
+# -sTCP:LISTEN is load-bearing: without it lsof also matches outbound CLIENT connections
+# (any running `iris` process), which is how `stop` once got a multi-line pid list and
+# killed nothing while reporting success (#184826).
+port_holder_pid() {
+    lsof -ti ":$BRIDGE_PORT" -sTCP:LISTEN 2>/dev/null | head -1
+}
+
+# Wait for a restart to be REAL: a listener that is a DIFFERENT process from the one we
+# started with, and serving.
+#
+# /health alone cannot answer this. Measured repeatedly on 2026-09-13: `launchctl kickstart
+# -k` returned 0 and /health returned 200 while the process holding the port never changed,
+# because an unsupervised orphan owned it and launchd's own child could not bind. Every
+# check downstream then measured the OLD code, and a fix was "verified live" against a
+# process that had never loaded it (#185150).
+#
+# So the assertion is IDENTITY, not liveness. $1 = the pid seen before the restart.
+wait_replaced() {
+    _old="$1"
+    _limit="${2:-45}"
+    _i=0
+    while [ "$_i" -lt "$_limit" ]; do
+        _now="$(port_holder_pid)"
+        if [ -n "$_now" ] && [ "$_now" != "$_old" ]; then
+            wait_ready $((_limit - _i)) && { _REPLACED_PID="$_now"; return 0; }
+            return 1
+        fi
+        _i=$((_i + 1))
+        sleep 1
+    done
+    _REPLACED_PID="$_now"
+    return 1
+}
+
 wait_ready() {
     _limit="${1:-45}"
     _i=0
@@ -84,8 +120,36 @@ report_not_ready() {
     echo "  Check:  iris-daemon status   then   iris-daemon logs" >&2
 }
 
+# ─── Log rotation ───────────────────────────────────────────────
+# Rotates daemon logs before each start. Keeps last 5 archives per
+# log file. No-op when logs are under 10MB (avoids rotating on
+# every tiny restart). Archives are gzipped to save disk.
+_rotate_logs() {
+    local KEEP=5
+    local MIN_BYTES=$((10 * 1024 * 1024))  # 10MB
+    local TS
+    TS=$(date +%Y%m%d-%H%M%S)
+    for _logfile in "$DAEMON_STDERR_LOG" "$DAEMON_STDOUT_LOG" "$LEGACY_DAEMON_LOG"; do
+        [ -f "$_logfile" ] || continue
+        local _size
+        _size=$(wc -c < "$_logfile" 2>/dev/null || echo 0)
+        [ "$_size" -lt "$MIN_BYTES" ] && continue
+        local _archive="${_logfile}.${TS}"
+        mv "$_logfile" "$_archive"
+        gzip "$_archive" 2>/dev/null || true
+        # Prune: keep only $KEEP most recent archives per log
+        local _prefix
+        _prefix=$(basename "$_logfile")
+        local _dir
+        _dir=$(dirname "$_logfile")
+        # shellcheck disable=SC2012
+        ls -1t "${_dir}/${_prefix}".*.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs rm -f 2>/dev/null || true
+    done
+}
+
 case "${1:-status}" in
     start)
+        _rotate_logs
         # Auto-update daemon code before starting
         if [ -d "$BRIDGE_DIR/.git" ]; then
             (cd "$BRIDGE_DIR" && git pull --quiet 2>/dev/null && npm install --production --silent 2>/dev/null) || true
@@ -246,15 +310,28 @@ case "${1:-status}" in
         # the running process holds a credential that is now invalid, so it MUST be replaced.
         LBL="io.heyiris.daemon"
         PLIST="$HOME/Library/LaunchAgents/$LBL.plist"
+        # Snapshot the listener BEFORE kickstart, so "did it change" is answerable after.
+        # Without this, wait_replaced gets an empty $_old, accepts ANY pid as a change, and
+        # becomes a check that cannot fail - the defect it exists to catch.
+        _RESTART_OLD_PID="$(port_holder_pid)"
         if [ -f "$PLIST" ] && command -v launchctl >/dev/null 2>&1; then
             if launchctl kickstart -k "gui/$(id -u)/$LBL" 2>/dev/null; then
                 # Same race as `start` (#184928): kickstart returns when launchd has
                 # relaunched the job, not when the new process serves. Wait for readiness,
                 # or `restart` hands back a prompt and a status command that disagree.
-                echo "Relaunched by launchd — waiting for the daemon to serve /health..."
-                if wait_ready 45; then
-                    echo "Daemon restarted (launchd)"
+                echo "Relaunched by launchd - waiting for a NEW process to serve /health..."
+                if wait_replaced "$_RESTART_OLD_PID" 45; then
+                    echo "Daemon restarted (launchd) - pid ${_RESTART_OLD_PID:-none} -> ${_REPLACED_PID}"
                     exit 0
+                fi
+                # Distinguish the two failures; they need opposite responses.
+                _now="$(port_holder_pid)"
+                if [ -n "$_now" ] && [ "$_now" = "$_RESTART_OLD_PID" ]; then
+                    echo "RESTART DID NOT HAPPEN: pid $_now still holds :$BRIDGE_PORT after kickstart returned 0." >&2
+                    echo "  launchd replaced a different process; this one survived and is not its child." >&2
+                    echo "  /health may answer 200 - from this same old process. That is not a restart." >&2
+                    echo "  Fix: kill $_now, then run 'iris-daemon restart' again. Diagnose: iris-daemon doctor" >&2
+                    exit 1
                 fi
                 report_not_ready 45
                 exit 1
