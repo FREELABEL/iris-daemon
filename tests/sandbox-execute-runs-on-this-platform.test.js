@@ -70,7 +70,26 @@ test('the sandbox_execute path runs a command and returns its output on this pla
       assert.strictEqual(script.mode, '755')
     }
 
-    const r = await run(script.cmd, script.args, { cwd: dir })
+    // spawnOptions IS PART OF THE CONTRACT and must be passed through.
+    //
+    // The first version of this test dropped it, and a real windows-latest runner rejected
+    // the result:
+    //     '"C:\...\task-script.cmd"' is not recognized as an internal or external command
+    // On Windows the returned args already contain an explicitly quoted path, paired with
+    // cmd.exe's /s, which strips exactly the first and last quote. Without
+    // windowsVerbatimArguments Node re-quotes the already-quoted argument, so cmd.exe sees
+    // `""C:\...""` and takes the quotes as part of the command NAME.
+    //
+    // So the production code was right and the test was wrong — it exercised something the
+    // executor never does. daemon/task-executor.js threads spawnOptions into spawn (it
+    // spreads `...(spawnOptions || {})`), and a test that omits half the contract is testing
+    // a different program.
+    assert.ok(script.spawnOptions, 'the contract must carry spawnOptions')
+    if (IS_WIN) {
+      assert.strictEqual(script.spawnOptions.windowsVerbatimArguments, true,
+        'Windows needs windowsVerbatimArguments, or Node re-quotes the quoted path')
+    }
+    const r = await run(script.cmd, script.args, { cwd: dir, ...script.spawnOptions })
 
     assert.strictEqual(r.spawnError, null,
       `the interpreter itself failed to start: ${r.spawnError && r.spawnError.message}`)
