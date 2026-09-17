@@ -172,4 +172,34 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
   }
 }
 
-module.exports = { runBrowserUseTask, parsePrompt, validate, FUNCTIONS }
+/**
+ * Can this machine run browser_use right now? Advertised on every heartbeat as
+ * task_capabilities.browser_use so the cloud routes these tasks ONLY to nodes that can run
+ * them. Without it the dispatcher picked any online node, and a node whose daemon predates
+ * this type ran "render_check url=..." as a shell command: exit 127 (observed on
+ * AlexMaysnow1063 the first time an agent called the tool).
+ *
+ * Checks what the script needs, not what the daemon version says: the script itself, a
+ * Chrome, and browser-use or uvx on the PATH the script builds. Cached — it runs every 30s.
+ */
+let _capCache = null
+function browserUseCapability () {
+  if (_capCache && Date.now() - _capCache.at < 5 * 60 * 1000) return _capCache.value
+  let value = false
+  try {
+    if (process.platform !== 'win32' && scriptPath()) {
+      const dirs = ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local', 'bin'),
+        ...String(process.env.PATH || '').split(path.delimiter)]
+      const onPath = (bin) => dirs.some(d => d && fs.existsSync(path.join(d, bin)))
+      const chrome = [process.env.CHROME_BIN,
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium'].some(p => p && fs.existsSync(p)) ||
+        ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'].some(onPath)
+      value = chrome && (onPath('browser-use') || onPath('uvx'))
+    }
+  } catch { value = false }
+  _capCache = { at: Date.now(), value }
+  return value
+}
+
+module.exports = { runBrowserUseTask, parsePrompt, validate, FUNCTIONS, browserUseCapability }

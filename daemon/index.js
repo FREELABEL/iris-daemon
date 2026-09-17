@@ -405,6 +405,16 @@ class Daemon {
       // the daemon can serve. Bump it when capabilities change, so the cloud can answer "is
       // this node new enough for X" without string-comparing release numbers.
       capability_schema: 2,
+      // Structured task types this node can RUN, not merely parse. The cloud mirrors these
+      // into capabilities and routes the type only to nodes that report it true.
+      task_capabilities: (() => {
+        try {
+          return { browser_use: require('./browser-use-task').browserUseCapability() }
+        } catch (e) {
+          console.error(`[heartbeat] task capability probe failed: ${e.message}`)
+          return null
+        }
+      })(),
       bridge_capabilities: (() => {
         try {
           return require('./bridge-registry').capabilities()

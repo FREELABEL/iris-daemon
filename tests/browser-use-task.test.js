@@ -124,3 +124,14 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
     assert.equal(r.data.measured, false)
   })
 })
+
+describe('browser_use: routing capability', () => {
+  const index = fs.readFileSync(path.join(ROOT, 'daemon/index.js'), 'utf8')
+  it('the heartbeat advertises task_capabilities.browser_use from the real probe', () => {
+    assert.match(index, /task_capabilities:[\s\S]{0,200}browserUseCapability\(\)/)
+  })
+  it('the probe answers a boolean and never throws', () => {
+    const { browserUseCapability } = require('../daemon/browser-use-task')
+    assert.equal(typeof browserUseCapability(), 'boolean')
+  })
+})
