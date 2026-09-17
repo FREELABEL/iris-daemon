@@ -3101,7 +3101,9 @@ app.get('/api/sessions/claude-code/:id/history', (req, res) => {
       project_path: cwd,
       git_branch: gitBranch,
       created_at: stat.birthtime.toISOString(),
-      updated_at: stat.mtime.toISOString(),
+      // When it last SPOKE — see lib/session-times.js and the list route.
+      updated_at: lastMessageAtFromChunk(content),
+      touched_at: stat.mtime.toISOString(),
       total_cost_usd: totalCostUsd,
       summary: {
         total_messages: messages.filter(m => m.type === 'text').length,
@@ -3680,6 +3682,8 @@ app.delete('/api/sessions/ollama/:id', (req, res) => {
  */
 // Tested in isolation — see lib/claude-session-name.js for what counts as a real first message.
 const { extractSessionName } = require('./lib/claude-session-name')
+// When a session last SPOKE. The file's mtime is NOT that — measured up to 721 minutes apart.
+const { readLastMessageAt, lastMessageAtFromChunk } = require('./lib/session-times')
 
 /**
  * Reconstruct project path from Claude Code's directory name.
@@ -3878,6 +3882,15 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           // Generate meaningful name from first user message
           const sessionName = extractSessionName(headLines, projectPath)
 
+          // WHEN IT LAST SPOKE, not when the file was last touched. Measured 2026-09-17 across 12
+          // real transcripts: the two differ by up to 721 MINUTES, because Claude Code appends
+          // attachment / system / ai-title / mode / atis-latch / bridge-session lines that move the
+          // mtime and say nothing. The fleet strip read mtime, so a session whose last message was
+          // twelve hours ago showed as "now" with a live dot, then opened on a transcript that
+          // ended hours earlier. Null when the tail holds no message: "cannot tell" is not "just
+          // now" (lib/session-times.js).
+          const lastMessageAt = readLastMessageAt(fs, file.path, stat.size)
+
           sessions.push({
             session_id: sessionId,
             name: sessionName,
@@ -3885,7 +3898,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
             git_branch: gitBranch,
             model,
             created_at: stat.birthtime.toISOString(),
-            updated_at: file.mtime.toISOString(),
+            updated_at: lastMessageAt,
+            // The file's own clock, kept: it answers "is anything writing to this at all?"
+            touched_at: file.mtime.toISOString(),
             message_count: messageCount,
             provider: 'claude_code'
           })
@@ -3895,8 +3910,10 @@ app.get('/api/sessions/claude-code', async (req, res) => {
       }
     }
 
-    // Sort by most recent update and limit
-    sessions.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+    // Most recently SPOKEN first. `updated_at` is null when the tail held no message, and a null
+    // must sort LAST rather than poison the comparator (NaN makes the order arbitrary).
+    const spokenAt = (s) => { const t = Date.parse(s.updated_at || ''); return Number.isNaN(t) ? -Infinity : t }
+    sessions.sort((a, b) => spokenAt(b) - spokenAt(a))
     res.json({ sessions: sessions.slice(0, limit) })
   } catch (err) {
     console.log(`[claude-code] List sessions failed: ${err.message}`)
