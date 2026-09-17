@@ -3159,7 +3159,17 @@ app.post('/api/sessions/opencode', async (req, res) => {
 // the same machine. Spawning a CLI to talk to a process that is already listening was the whole
 // defect. `POST /session/:id/message` with noReply persists a real user message AND fires
 // message.updated on the bus, in milliseconds, with no model turn and no tokens.
-function sessionServerCandidates() {
+const IRIS_LISTENER_CMD = "lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i iris | awk '{print $9}'"
+
+function parseListenerPorts(stdout) {
+  return [...new Set(String(stdout || '')
+    .split('\n')
+    .map((l) => l.trim().split(':').pop())
+    .filter((p) => /^\d+$/.test(p)))]
+}
+
+// Env overrides first, discovered loopback listeners next, the documented default last.
+function sessionServerCandidatesFrom(ports) {
   const seen = new Set()
   const out = []
   const add = (u) => {
@@ -3169,10 +3179,14 @@ function sessionServerCandidates() {
     seen.add(t)
     out.push(t)
   }
-
   add(process.env.IRIS_SERVER)
   add(process.env.OPENCODE_SERVER)
+  for (const port of ports) add(`http://127.0.0.1:${port}`)
+  add('http://127.0.0.1:4096')
+  return out
+}
 
+function sessionServerCandidates() {
   // DISCOVER the loopback ports iris is actually listening on.
   //
   // Session servers bind an EPHEMERAL port (:60824, :51477 — different every start) unless
@@ -3186,20 +3200,22 @@ function sessionServerCandidates() {
   // alternative is a registry file with its own format, lifecycle and staleness, and this costs
   // ~50ms on a path that previously spawned a 180-second model turn. Failure is non-fatal — the
   // env vars and the documented default still stand behind it.
+  let ports = []
   try {
-    const listeners = require('child_process')
-      .execSync("lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i iris | awk '{print $9}'", {
-        encoding: 'utf8',
-        timeout: 3000,
-      })
-      .split('\n')
-      .map((l) => l.trim().split(':').pop())
-      .filter((p) => /^\d+$/.test(p))
-    for (const port of [...new Set(listeners)]) add(`http://127.0.0.1:${port}`)
+    ports = parseListenerPorts(require('child_process').execSync(IRIS_LISTENER_CMD, { encoding: 'utf8', timeout: 3000 }))
   } catch { /* no lsof, or nothing listening — fall through to the default */ }
+  return sessionServerCandidatesFrom(ports)
+}
 
-  add('http://127.0.0.1:4096')
-  return out
+// The same discovery WITHOUT blocking. The live-activity check (step 4b) runs on every session
+// refresh — roughly every 30s — so a synchronous subprocess there would stall the event loop the
+// watchdog measures, on a cadence, for a status nicety. Delivery keeps the sync form above.
+function sessionServerCandidatesAsync() {
+  return new Promise((resolve) => {
+    require('child_process').exec(IRIS_LISTENER_CMD, { encoding: 'utf8', timeout: 3000 }, (err, stdout) => {
+      resolve(sessionServerCandidatesFrom(err ? [] : parseListenerPorts(stdout)))
+    })
+  })
 }
 
 // Asserts on the BODY, never the status: unknown paths on these servers return HTTP 200 with the
@@ -3954,7 +3970,7 @@ app.get('/api/sessions/opencode', async (req, res) => {
         if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
         return r.json()
       }
-      const live = await opencodeActivity({ sessions: page, servers: sessionServerCandidates(), fetchJson })
+      const live = await opencodeActivity({ sessions: page, servers: await sessionServerCandidatesAsync(), fetchJson })
       for (const s of page) s.activity = live.activity[s.session_id] || null
       return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors } })
     }

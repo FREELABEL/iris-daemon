@@ -38,3 +38,12 @@ test('the refresh uses it, and asks opencode — only opencode — for live stat
   assert.match(SRC, /const live = slug === 'opencode' \? '&live=1' : ''/)
   assert.match(SRC, /\.\.\.sessionActivity\(s\)/)
 })
+
+test('the live status path discovers servers WITHOUT blocking the event loop', () => {
+  // It runs on every session refresh (~30s); the watchdog kills a main thread blocked for 60s.
+  const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
+  assert.match(SRC, /servers: await sessionServerCandidatesAsync\(\)/)
+  const asyncFn = SRC.slice(SRC.indexOf('function sessionServerCandidatesAsync'), SRC.indexOf('// Asserts on the BODY, never the status'))
+  assert.ok(asyncFn.length > 0 && !/execSync/.test(asyncFn), 'the async discovery must not call execSync')
+  assert.match(asyncFn, /child_process'\)\.exec\(/)
+})
