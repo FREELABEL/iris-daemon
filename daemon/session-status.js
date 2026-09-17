@@ -43,4 +43,33 @@ function deriveSessionStatus (updatedAt, now = Date.now()) {
   return 'stale'
 }
 
-module.exports = { deriveSessionStatus, ACTIVE_MS, IDLE_MS }
+/**
+ * How many sessions the daemon asks each provider for. One constant, used by both the fetch and
+ * the truncation check, so "hit the cap" cannot drift from the cap itself.
+ */
+const SESSIONS_PER_PROVIDER_LIMIT = 25
+
+/**
+ * The session fields of a heartbeat (epic #185632, step 1).
+ *
+ * The list alone cannot say whether it is complete. Measured: two live Macs reported exactly 50
+ * — 25 per provider × 2 — and the platform had no way to tell that from a real count, because
+ * the daemon knew which providers it had cut or could not reach and only logged it.
+ *
+ * Presence rules, which the server relies on:
+ *   - not reportable  → {} — "no update, keep what you have". No truncation facts either: they
+ *                        would describe a list that was not refreshed.
+ *   - reportable      → the list AND both provider lists, [] meaning "checked, none". Omitting
+ *                        them would read as an older daemon that cannot tell.
+ */
+function sessionReportFields ({ reportable, sessions, truncated, unreachable } = {}) {
+  if (reportable !== true) return {}
+  return {
+    active_sessions: Array.isArray(sessions) ? sessions : [],
+    sessions_truncated: Array.isArray(truncated) ? [...truncated] : [],
+    sessions_unreachable: Array.isArray(unreachable) ? [...unreachable] : [],
+    sessions_limit_per_provider: SESSIONS_PER_PROVIDER_LIMIT
+  }
+}
+
+module.exports = { deriveSessionStatus, ACTIVE_MS, IDLE_MS, SESSIONS_PER_PROVIDER_LIMIT, sessionReportFields }

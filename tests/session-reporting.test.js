@@ -29,7 +29,7 @@ test('the heartbeat OMITS active_sessions when the refresh could not run', () =>
   // node that had stopped reporting keep showing fossils as live.
   assert.match(
     SRC,
-    /\.\.\.\(this\._sessionsReportable \? \{ active_sessions: this\._getLocalSessions\(\) \} : \{\}\)/,
+    /\.\.\.sessionReportFields\(\{\s*reportable: this\._sessionsReportable === true,/,
     'active_sessions must be conditionally spread, not unconditionally set',
   )
 })

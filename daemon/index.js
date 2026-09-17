@@ -27,7 +27,7 @@ const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { tmuxPolicy } = require('./tmux-manager')
 const { detectTailscaleIp } = require('./tailscale-address')
-const { deriveSessionStatus } = require('./session-status')
+const { deriveSessionStatus, sessionReportFields, SESSIONS_PER_PROVIDER_LIMIT } = require('./session-status')
 const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
@@ -371,7 +371,16 @@ class Daemon {
       // server uses: absent means "no update, preserve what you have", an explicit []
       // means "I looked, there are none". Sending [] on failure is what let a machine
       // that had stopped reporting keep showing 20 fossils as live (#183538).
-      ...(this._sessionsReportable ? { active_sessions: this._getLocalSessions() } : {}),
+      //
+      // And the list says whether it is COMPLETE: which providers hit the per-provider cap and
+      // which could not be asked (epic #185632). Both were computed and only logged, so a
+      // capped 50 was indistinguishable from a real 50.
+      ...sessionReportFields({
+        reportable: this._sessionsReportable === true,
+        sessions: this._sessionsReportable === true ? this._getLocalSessions() : [],
+        truncated: this._cachedSessionsTruncated,
+        unreachable: this._cachedSessionsUnreachable,
+      }),
       session_capabilities: this._getSessionCapabilities(),
       // Which LOCAL DATA SOURCES this machine can actually serve right now, with a
       // reason for every one it cannot. Reported on every heartbeat (30s) rather than
@@ -458,6 +467,8 @@ class Daemon {
 
     // Initial session cache population
     this._cachedSessions = []
+    this._cachedSessionsTruncated = []
+    this._cachedSessionsUnreachable = []
     // Starts false: until the first refresh succeeds this node has not confirmed anything,
     // and must not overwrite a good list with a hopeful empty one.
     this._sessionsReportable = false
@@ -2681,12 +2692,11 @@ LIMIT ${limit}
         { slug: 'ollama', name: 'ollama' }
       ]
 
-      const PER_PROVIDER_LIMIT = 25
       const sessions = []
       const truncated = []
       const unreachable = []
       for (const { slug, name } of providers) {
-        const data = await getJson(`/api/sessions/${slug}?limit=${PER_PROVIDER_LIMIT}&counts=0`)
+        const data = await getJson(`/api/sessions/${slug}?limit=${SESSIONS_PER_PROVIDER_LIMIT}&counts=0`)
 
         // null means we could NOT ASK — a non-200, a parse failure, a timeout. It does not
         // mean the provider has no sessions, and `(data && data.sessions) || []` silently
@@ -2704,7 +2714,7 @@ LIMIT ${limit}
         // sessions on every node — measured identically on two different machines with
         // different workloads, which is what a silent cap looks like from outside. A list
         // quietly cut cannot be told from a list that is complete.
-        if (rows.length >= PER_PROVIDER_LIMIT) truncated.push(name)
+        if (rows.length >= SESSIONS_PER_PROVIDER_LIMIT) truncated.push(name)
 
         for (const s of rows) {
           sessions.push({
@@ -2752,7 +2762,7 @@ LIMIT ${limit}
         console.warn(`[sessions] could not reach: ${unreachable.join(', ')} — their sessions are UNKNOWN, not zero`)
       }
       if (truncated.length) {
-        console.log(`[sessions] hit the ${PER_PROVIDER_LIMIT}-session cap for: ${truncated.join(', ')} — the fleet view is incomplete for those providers`)
+        console.log(`[sessions] hit the ${SESSIONS_PER_PROVIDER_LIMIT}-session cap for: ${truncated.join(', ')} — the fleet view is incomplete for those providers`)
       }
 
       this._cachedSessions = sessions
