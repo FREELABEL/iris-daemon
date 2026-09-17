@@ -56,3 +56,54 @@ test('the LAST messages are what matters, and each is bounded', () => {
   assert.strictEqual(out.omitted, 0)
   assert.deepStrictEqual(require('../lib/session-history-request').tailMessages('nope', 5), { messages: [], omitted: 0 })
 })
+
+/* ── The page must be the NEWEST page, and the count must be honest ──────────────────────────
+ * Measured 2026-09-17 on session 73d85563: the provider route sliced `messages.slice(0, 200)` —
+ * the OLDEST 200 — and the wrapper then took the tail of THAT. The response said it last spoke
+ * at 21:31:54Z while handing back messages that stopped at 19:16:26Z, 2h15m earlier, so the
+ * session list and the transcript disagreed about the same session. A response that contradicts
+ * itself is worse than one that admits it is truncated.
+ */
+
+const { newestMessages, omittedFrom, HISTORY_PAGE } = require('../lib/session-history-request')
+
+test('a page of history is the newest page, never the oldest', () => {
+    const msgs = Array.from({ length: 220 }, (_, i) => ({ role: 'user', type: 'text', text: `m${i}` }))
+    const page = newestMessages(msgs, 60)
+    assert.strictEqual(page.messages.length, 60)
+    assert.strictEqual(page.messages[0].text, 'm160')
+    assert.strictEqual(page.messages[59].text, 'm219', 'the LAST message in the session must be in the page')
+    assert.strictEqual(page.total, 220)
+    assert.strictEqual(page.omitted, 160)
+})
+
+test('a session shorter than the page omits nothing, and a junk list is empty not a crash', () => {
+    const three = [{ text: 'a' }, { text: 'b' }, { text: 'c' }]
+    assert.deepStrictEqual(newestMessages(three, 60), { messages: three, total: 3, omitted: 0 })
+    assert.deepStrictEqual(newestMessages(null, 60), { messages: [], total: 0, omitted: 0 })
+    assert.deepStrictEqual(newestMessages([], 60), { messages: [], total: 0, omitted: 0 })
+})
+
+test('a missing or nonsense limit falls back to a PAGE, never to the whole session', () => {
+    // `slice(-0)` is `slice(0)` — the entire array. A session with 4,000 messages would have been
+    // serialised in full to a phone by a caller that simply forgot the parameter.
+    const many = Array.from({ length: 250 }, (_, i) => ({ text: `m${i}` }))
+    for (const bad of [0, -5, NaN, undefined, null, 'sixty']) {
+        const page = newestMessages(many, bad)
+        assert.strictEqual(page.messages.length, HISTORY_PAGE, `limit ${String(bad)} must page at ${HISTORY_PAGE}`)
+        assert.strictEqual(page.messages[page.messages.length - 1].text, 'm249', 'and it is still the newest page')
+        assert.strictEqual(page.omitted, 50)
+    }
+})
+
+test('"earlier messages not shown" counts against the whole session, not against the page', () => {
+    // The old count was 140 — messages dropped from an already-truncated 200 — while the session
+    // actually held 1030 the reader could not see. A wrong number reads as a true one.
+    assert.strictEqual(omittedFrom(1030, 140, 60), 970);
+    // No total from the machine: fall back to what the slice knows, rather than inventing one.
+    assert.strictEqual(omittedFrom(undefined, 140, 60), 140);
+    assert.strictEqual(omittedFrom('lots', 140, 60), 140);
+    // A total smaller than what was shown is not believable; the slice wins.
+    assert.strictEqual(omittedFrom(10, 140, 60), 140);
+    assert.strictEqual(omittedFrom(60, 0, 60), 0);
+})

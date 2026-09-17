@@ -2933,7 +2933,7 @@ app.post('/api/sessions/claude-code/:id/message', async (req, res) => {
 // provider's own history route is reused (it already parses transcripts); the first that has the
 // session answers. 404 from all of them is "not on this machine", which is a real answer.
 app.get('/api/sessions/history', async (req, res) => {
-  const { normalizeHistoryRequest, tailMessages } = require('./lib/session-history-request')
+  const { normalizeHistoryRequest, tailMessages, omittedFrom } = require('./lib/session-history-request')
   const asked = normalizeHistoryRequest(req.query)
   if (asked.error) return res.status(400).json({ error: asked.error })
 
@@ -2943,14 +2943,26 @@ app.get('/api/sessions/history', async (req, res) => {
 
   const tried = []
   for (const provider of asked.providers) {
-    const url = `http://127.0.0.1:${PORT}/api/sessions/${provider}/${encodeURIComponent(asked.id)}/history`
+    // Ask for the page we are going to show. Without this the provider route paged at its own
+    // default and the tail below was a tail of THAT page, not of the session.
+    const url = `http://127.0.0.1:${PORT}/api/sessions/${provider}/${encodeURIComponent(asked.id)}/history?limit=${asked.limit}`
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
       const body = await r.json().catch(() => null)
       if (r.status === 404 || !body || body.error) { tried.push(provider); continue }
 
       const { messages, omitted } = tailMessages(body.messages, asked.limit)
-      return res.json({ ...body, provider, session_id: asked.id, messages, messages_omitted: omitted, messages_returned: messages.length })
+      return res.json({
+        ...body,
+        provider,
+        session_id: asked.id,
+        messages,
+        // Against the whole session — "140 earlier messages not shown" was counted against an
+        // already-truncated page while ~1030 were actually unseen.
+        messages_omitted: omittedFrom(body.messages_total, omitted, messages.length),
+        messages_total: body.messages_total,
+        messages_returned: messages.length,
+      })
     } catch (err) {
       tried.push(provider)
       console.log(`[sessions] history ${provider}/${asked.id} failed: ${err.message}`)
@@ -3095,6 +3107,8 @@ app.get('/api/sessions/claude-code/:id/history', (req, res) => {
     }
 
     const stat = fs.statSync(filePath)
+    const { newestMessages, HISTORY_PAGE } = require('./lib/session-history-request')
+    const page = newestMessages(messages, parseInt(req.query.limit, 10) || HISTORY_PAGE)
 
     res.json({
       session_id: sessionId,
@@ -3114,7 +3128,11 @@ app.get('/api/sessions/claude-code/:id/history', (req, res) => {
         commands_run: commandsRun.slice(0, 50),
         tools_used: toolCounts
       },
-      messages: messages.slice(0, parseInt(req.query.limit) || 200)
+      // The NEWEST page. `slice(0, n)` here returned the OLDEST, so a caller taking a tail of it
+      // got a transcript that stopped hours before `updated_at` in this same response.
+      messages: page.messages,
+      messages_total: page.total,
+      messages_omitted: page.omitted
     })
   } catch (err) {
     console.error(`[claude-code] History read error: ${err.message}`)
