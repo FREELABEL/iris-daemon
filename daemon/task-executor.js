@@ -1192,7 +1192,8 @@ class TaskExecutor {
         })
         clearInterval(progressInterval)
       outputStream.stop().catch(() => {})
-        console.log(`[browser-use] ${task.prompt.split(' ')[0]} → ${payload.status}${payload.error ? ': ' + payload.error : ''}`)
+        const m = payload.metadata || {}
+        console.log(`[browser-use] ${task.prompt.split(' ')[0]} → ${payload.status}  run=${m.run_ms ?? '-'}ms  upload=${m.upload_ms ?? '-'}ms${payload.error ? '  ' + payload.error : ''}`)
         await this.cloud.submitResult(taskId, payload)
         return
       }

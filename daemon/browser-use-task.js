@@ -116,7 +116,9 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
 
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iris-browser-use-'))
   try {
+    const runStart = Date.now()
     const run = await runScript(script, args, outDir, timeoutMs)
+    const runMs = Date.now() - runStart
     const line = String(run.stdout || '').trim().split('\n').filter(l => l.startsWith('{')).pop()
     let data
     try { data = JSON.parse(line) } catch {
@@ -129,9 +131,11 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
       return { ...fail(`could not measure ${args.url}: ${data.error}`, { function: fn }), data, output: JSON.stringify(data) }
     }
 
+    let uploadMs = 0
     const shots = (data.screenshots || []).filter(p => fs.existsSync(p))
     data.screenshots = shots.map(p => ({ filename: path.basename(p) }))
     if (shots.length && upload) {
+      const uploadStart = Date.now()
       try {
         const urls = await upload(shots.map(p => ({
           filename: path.basename(p),
@@ -146,6 +150,7 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
         data.screenshots_uploaded = false
         data.upload_error = e.message
       }
+      uploadMs = Date.now() - uploadStart
     } else {
       data.screenshots_uploaded = false
     }
@@ -158,7 +163,9 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
       data,
       output: summary,
       duration_ms: Date.now() - started,
-      metadata: { browser_use: true, function: fn, ok: data.ok }
+      // Stage split: the script (browser) vs the screenshot upload (network). A slow task is
+      // one or the other, and the total alone cannot say which.
+      metadata: { browser_use: true, function: fn, ok: data.ok, run_ms: runMs, upload_ms: uploadMs }
     }
   } finally {
     fs.rmSync(outDir, { recursive: true, force: true })

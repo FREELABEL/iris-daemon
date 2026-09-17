@@ -46,18 +46,30 @@ done
 [ -n "$CHROME" ] || cant "no Chrome/Chromium found (set CHROME_BIN)"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/render-check.XXXXXX")"
-OUT="${OUT:-$WORK/shots}"; mkdir -p "$OUT"
+OUT="${OUT:-${TMPDIR:-/tmp}/render-check-shots/$(date +%Y%m%d-%H%M%S)-$$}"; mkdir -p "$OUT"   # outside $WORK: cleanup deletes $WORK
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
 export BU_NAME="rc$$" BU_CDP_URL="http://127.0.0.1:$PORT" BH_TAB_MARKER=0 BH_TELEMETRY=0 BH_RECORD=0 BH_OPEN_LIVE_URL=0
 
-"$CHROME" --headless=new --user-data-dir="$WORK/profile" --remote-debugging-port="$PORT" \
-  --no-first-run --no-default-browser-check --disable-extensions --hide-scrollbars about:blank \
-  >"$WORK/chrome.log" 2>&1 &
-CHROME_PID=$!
+CHROME_ARGS=(--headless=new --user-data-dir="$WORK/profile" --remote-debugging-port="$PORT"
+  --no-first-run --no-default-browser-check --disable-extensions --hide-scrollbars about:blank)
+case "$CHROME" in
+  /Applications/*.app/Contents/MacOS/*)
+    # Through LaunchServices, not as our child. The Hive daemon is a launchd Background job and
+    # a child inherits PRIO_DARWIN_BG, which it cannot shed (taskpolicy -B returns 0 and changes
+    # nothing): Chrome ran 34s under it vs 6.5s from a shell. `open -n` starts a fresh instance
+    # at app priority; it is found again for cleanup by its unique profile path.
+    open -na "${CHROME%%/Contents/MacOS/*}" --args "${CHROME_ARGS[@]}" >"$WORK/chrome.log" 2>&1
+    CHROME_PID="" ;;
+  *)
+    "$CHROME" "${CHROME_ARGS[@]}" >"$WORK/chrome.log" 2>&1 &
+    CHROME_PID=$! ;;
+esac
 cleanup() {
   "${BU[@]}" --reload >/dev/null 2>&1
-  kill "$CHROME_PID" 2>/dev/null; wait "$CHROME_PID" 2>/dev/null
-  rm -rf "$WORK/profile"
+  if [ -n "$CHROME_PID" ]; then kill "$CHROME_PID" 2>/dev/null; wait "$CHROME_PID" 2>/dev/null
+  else pkill -f -- "--user-data-dir=$WORK/profile" 2>/dev/null; fi
+  sleep 0.3
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 
