@@ -55,7 +55,7 @@ const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure, interpreter
  *
  * Add a type here whenever you add one that carries structured config.
  */
-const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call'])
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use'])
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -578,7 +578,7 @@ class TaskExecutor {
   // browser, which is the failure the gate exists to prevent. Caught by
   // tests/browser-agent-executor.test.js, which asserted membership from the day the executor
   // case was added and had been red ever since.
-  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover', 'browser_agent']
+  static BROWSER_TYPES = ['som_batch', 'som', 'inbox_scan', 'enrich_batch', 'venue_enrich', 'custom_playwright', 'discover', 'browser_agent', 'browser_use']
 
   // comms_sync auto-retries once on "instant death" (Bun spawn crash). Default
   // OFF — a failed comms_sync just fails instead of retrying. Flip on with the
@@ -1175,6 +1175,25 @@ class TaskExecutor {
             metadata: { bridge_provider: provider, bridge_function: fnName },
           })
         }
+        return
+      }
+
+      // ── Short-circuit: browser_use — fixed browser checks in a throwaway Chrome ──
+      //
+      // Logic lives in browser-use-task.js so its tests run the SAME code this calls.
+      // task.prompt = "render_check url=https://... viewports=... schemes=light,dark"
+      if (task.type === 'browser_use') {
+        const { runBrowserUseTask } = require('./browser-use-task')
+        const payload = await runBrowserUseTask(task, {
+          upload: async (files) => {
+            const r = await this.cloud.post(`/api/v6/node-agent/tasks/${taskId}/artifacts`, { files })
+            return (r && r.cdn_urls) || []
+          }
+        })
+        clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
+        console.log(`[browser-use] ${task.prompt.split(' ')[0]} → ${payload.status}${payload.error ? ': ' + payload.error : ''}`)
+        await this.cloud.submitResult(taskId, payload)
         return
       }
 
