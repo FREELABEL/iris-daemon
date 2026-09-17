@@ -3640,42 +3640,8 @@ app.delete('/api/sessions/ollama/:id', (req, res) => {
  * Extract a meaningful session name from the first user message in JSONL.
  * Falls back to the project directory name if no user message found.
  */
-function extractSessionName (lines, projectPath) {
-  for (const line of lines) {
-    const evt = tryJSON(line)
-    if (!evt) continue
-    if (evt.type === 'user' && evt.message && evt.message.role === 'user') {
-      const content = typeof evt.message.content === 'string'
-        ? evt.message.content
-        : Array.isArray(evt.message.content)
-          ? evt.message.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
-          : ''
-      if (content.trim()) {
-        // Clean up: remove command markup, system injections, trim to 80 chars
-        const cleaned = content
-          .replace(/<[^>]+>/g, '') // strip HTML/XML tags
-          .replace(/\s+/g, ' ')   // collapse whitespace
-          .trim()
-        // Skip system-injected messages (not real user input)
-        if (!cleaned ||
-            cleaned.startsWith('Caveat:') ||
-            cleaned.startsWith('clear') ||
-            cleaned.startsWith('/clear') ||
-            cleaned.length < 3) {
-          continue
-        }
-        if (cleaned.length > 80) return cleaned.slice(0, 77) + '...'
-        return cleaned
-      }
-    }
-  }
-  // Fallback: use last segment of project path
-  if (projectPath) {
-    const segments = projectPath.replace(/\/+$/, '').split('/')
-    return segments[segments.length - 1] || 'Coding Session'
-  }
-  return 'Coding Session'
-}
+// Tested in isolation — see lib/claude-session-name.js for what counts as a real first message.
+const { extractSessionName } = require('./lib/claude-session-name')
 
 /**
  * Reconstruct project path from Claude Code's directory name.
