@@ -26,6 +26,18 @@ const FUNCTIONS = new Set(['render_check'])
 // so capturing it would publish what the gate exists to keep private. Refuse, and say why.
 const CREDENTIAL_PARAMS = /^(atlas_token|atlas_session|token|access_token|auth|otp|code|key|api_key|apikey|sig|signature|session|password|jwt)$/i
 
+// Hosts an AGENT may not point the browser at. The node runs on someone's own machine and the
+// screenshots are uploaded to a public CDN, so "check this page" aimed at localhost, a LAN box or
+// the cloud metadata address would publish an internal surface — a model-driven SSRF with a
+// picture attached. The skill/CLI runs render-check.sh directly and is unaffected; a local caller
+// that means it passes config.allow_private.
+const PRIVATE_HOST = [
+  /^(localhost|127\.|0\.0\.0\.0$|\[?::1\]?$)/i,
+  /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./,
+  /^169\.254\./,                       // link-local, incl. 169.254.169.254 metadata
+  /^(.+\.)?(local|internal|intranet|lan|home|corp)$/i,
+]
+
 const VIEWPORTS_RE = /^[a-z]+:\d{3,4}x\d{3,4}(,[a-z]+:\d{3,4}x\d{3,4}){0,3}$/
 const SCHEMES = new Set(['light', 'dark'])
 
@@ -62,6 +74,12 @@ function validate (fn, raw) {
   }
   if (!/^https?:$/.test(url.protocol)) throw new Error(`render_check only checks http(s) pages, got ${url.protocol}`)
   if (url.username || url.password) throw new Error('refusing a url with embedded credentials — screenshots are uploaded to a public CDN')
+  if (!raw.allow_private && PRIVATE_HOST.some(re => re.test(url.hostname))) {
+    throw new Error(
+      `refusing to load ${url.hostname} — it is on this machine or its private network, and ` +
+      'screenshots are uploaded to a public CDN. Check a public url instead.'
+    )
+  }
   const cred = [...url.searchParams.keys()].find(k => CREDENTIAL_PARAMS.test(k))
   if (cred) {
     throw new Error(
@@ -109,7 +127,9 @@ async function runBrowserUseTask (task, { upload, timeoutMs = 180000 } = {}) {
   const rawArgs = { ...parsed.args, ...((task.config && task.config.args) || {}) }
 
   let args
-  try { args = validate(fn, rawArgs) } catch (e) { return fail(e.message, { function: fn }) }
+  try {
+    args = validate(fn, { ...rawArgs, allow_private: (task.config && task.config.allow_private) === true })
+  } catch (e) { return fail(e.message, { function: fn }) }
 
   const script = scriptPath()
   if (!script) return fail('render-check.sh is missing from this node — update the IRIS bridge.', { function: fn })

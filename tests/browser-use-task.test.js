@@ -36,6 +36,15 @@ describe('browser_use: refusals explain themselves', () => {
     assert.throws(() => validate('render_check', { url: 'https://heyiris.io/p/x?atlas_token=abc' }), /atlas_token/)
     assert.throws(() => validate('render_check', { url: 'https://u:p@heyiris.io/p/x' }), /embedded credentials/)
   })
+  it('refuses a private, loopback or link-local host — the agent path is not an SSRF with a picture', () => {
+    for (const u of ['http://127.0.0.1:8765/x', 'http://localhost:3000', 'http://192.168.1.50/admin',
+      'http://10.0.0.5/', 'http://172.16.4.4/', 'http://169.254.169.254/latest/meta-data/', 'http://printer.local/']) {
+      assert.throws(() => validate('render_check', { url: u }), /private network|on this machine/, u)
+    }
+    // a local caller that means it still can
+    assert.ok(validate('render_check', { url: 'http://127.0.0.1:8765/x', allow_private: true }).url)
+  })
+
   it('refuses malformed viewports and schemes rather than passing them to a shell', () => {
     assert.throws(() => validate('render_check', { url: 'https://x.test', viewports: 'desktop:1280x900;rm -rf' }), /viewports/)
     assert.throws(() => validate('render_check', { url: 'https://x.test', schemes: 'sepia' }), /schemes/)
@@ -93,8 +102,14 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
 
   const uploaded = []
   const upload = async (files) => { uploaded.push(...files); return files.map(f => ({ filename: f.filename, url: `https://cdn.test/${f.filename}` })) }
-  const run = (prompt) => runBrowserUseTask({ prompt }, { upload })
+  const run = (prompt) => runBrowserUseTask({ prompt, config: { allow_private: true } }, { upload })
   const expect_fail = (r) => { assert.equal(r.status, 'completed', r.error); assert.equal(r.data.ok, false) }
+
+  it('a dispatched task may opt into a private host only through config.allow_private', async () => {
+    const denied = await runBrowserUseTask({ prompt: `render_check url=${base}/good.html` }, { upload })
+    assert.equal(denied.status, 'failed')
+    assert.match(denied.error, /private network|on this machine/)
+  })
 
   it('a good page completes ok, with uploaded screenshot urls', { timeout: 120000 }, async () => {
     const r = await run(`render_check url=${base}/good.html`)
