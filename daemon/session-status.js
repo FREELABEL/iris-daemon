@@ -44,6 +44,22 @@ function deriveSessionStatus (updatedAt, now = Date.now()) {
 }
 
 /**
+ * A session's status and measured activity (epic #185632, step 4b).
+ *
+ * opencode's /session/status can say a session is WORKING (busy) or RETRYING — facts from the server
+ * running it (see lib/opencode-activity.js). Those make it `active` regardless of `updated_at`, which a
+ * long tool call does not touch. With no measurement the status stays derived from the timestamp and
+ * `activity` is null: "not measured", never "waiting" — absence from every status map proves nothing.
+ */
+function sessionActivity (s, now = Date.now()) {
+  const activity = s && (s.activity === 'working' || s.activity === 'retrying') ? s.activity : null
+  return {
+    status: activity ? 'active' : deriveSessionStatus(s && s.updated_at, now),
+    activity
+  }
+}
+
+/**
  * How many sessions the daemon asks each provider for. One constant, used by both the fetch and
  * the truncation check, so "hit the cap" cannot drift from the cap itself.
  */
@@ -72,4 +88,4 @@ function sessionReportFields ({ reportable, sessions, truncated, unreachable } =
   }
 }
 
-module.exports = { deriveSessionStatus, ACTIVE_MS, IDLE_MS, SESSIONS_PER_PROVIDER_LIMIT, sessionReportFields }
+module.exports = { deriveSessionStatus, sessionActivity, ACTIVE_MS, IDLE_MS, SESSIONS_PER_PROVIDER_LIMIT, sessionReportFields }

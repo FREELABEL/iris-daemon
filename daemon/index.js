@@ -27,7 +27,7 @@ const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { tmuxPolicy } = require('./tmux-manager')
 const { detectTailscaleIp } = require('./tailscale-address')
-const { deriveSessionStatus, sessionReportFields, SESSIONS_PER_PROVIDER_LIMIT } = require('./session-status')
+const { deriveSessionStatus, sessionActivity, sessionReportFields, SESSIONS_PER_PROVIDER_LIMIT } = require('./session-status')
 const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
@@ -2696,7 +2696,9 @@ LIMIT ${limit}
       const truncated = []
       const unreachable = []
       for (const { slug, name } of providers) {
-        const data = await getJson(`/api/sessions/${slug}?limit=${SESSIONS_PER_PROVIDER_LIMIT}&counts=0`)
+        // opencode can say which sessions are WORKING (step 4b); claude-code has no such endpoint.
+        const live = slug === 'opencode' ? '&live=1' : ''
+        const data = await getJson(`/api/sessions/${slug}?limit=${SESSIONS_PER_PROVIDER_LIMIT}&counts=0${live}`)
 
         // null means we could NOT ASK — a non-200, a parse failure, a timeout. It does not
         // mean the provider has no sessions, and `(data && data.sessions) || []` silently
@@ -2733,7 +2735,9 @@ LIMIT ${limit}
             // status — all of them, for opencode — was stamped active. Measured on the live
             // fleet: 40 sessions, ONE distinct status value, oldest 15 days old and still
             // reported as running. Absence was being recorded as activity.
-            status: deriveSessionStatus(s.updated_at),
+            // ...and overridden by a MEASURED activity when opencode reports the session working
+            // (step 4b): `status` + `activity` (working | retrying | null = not measured).
+            ...sessionActivity(s),
             project_path: s.project_path || null,
             git_branch: s.git_branch || null,
             model: s.model || null,

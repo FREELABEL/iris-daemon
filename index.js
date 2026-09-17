@@ -3940,7 +3940,26 @@ app.get('/api/sessions/opencode', async (req, res) => {
 
     // Sort by most recent update, limit
     sessions.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
-    res.json({ sessions: sessions.slice(0, limit) })
+    const page = sessions.slice(0, limit)
+
+    // `?live=1`: ask the servers RUNNING these sessions which are working right now (epic
+    // #185632, step 4b). `updated_at` can only say a file changed recently; opencode's
+    // /session/status says busy. A session absent from every answer stays `activity: null` —
+    // unmeasured, never "idle" — because only the server running a session reports it.
+    if (req.query.live === '1') {
+      const { opencodeActivity } = require('./lib/opencode-activity')
+      const fetchJson = async (url, timeoutMs) => {
+        const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+        // Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
+        if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
+        return r.json()
+      }
+      const live = await opencodeActivity({ sessions: page, servers: sessionServerCandidates(), fetchJson })
+      for (const s of page) s.activity = live.activity[s.session_id] || null
+      return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors } })
+    }
+
+    res.json({ sessions: page })
   } catch (err) {
     console.log(`[opencode] List sessions failed: ${err.message}`)
     res.json({ sessions: [], error: err.message })
