@@ -60,15 +60,22 @@ try:
   const nav = performance.getEntriesByType('navigation')[0] || {};
   const text = (document.body && document.body.innerText || '').slice(0, 4000);
   const generic = ['serif','sans-serif','monospace','system-ui','cursive','fantasy','ui-monospace','ui-sans-serif','ui-serif','-apple-system','ui-rounded','emoji','math','fangsong'];
-  const families = new Set();
+  // Remember WHERE each family is asked for: "font 'Inter' does not resolve" is not actionable
+  // without the element that declares it, and on a composed page the offender is usually one
+  // block, not the page.
+  const families = new Map();
   for (const el of document.querySelectorAll('h1,h2,h3,p,li,code,td,button')) {
     const first = getComputedStyle(el).fontFamily.split(',')[0].trim().replace(/^["']|["']$/g, '');
-    if (first) families.add(first);
+    if (!first || families.has(first)) continue;
+    const id = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+      (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.') : '');
+    families.set(first, { where: id, sample: (el.innerText || '').trim().slice(0, 40) });
   }
   const fonts = {};
+  const font_offenders = {};
   const c = document.createElement('canvas').getContext('2d');
   const probe = 'mmmmmmmmmwwwwwwwiiiiiii0123456789';
-  for (const fam of families) {
+  for (const [fam, site] of families) {
     if (generic.includes(fam.toLowerCase())) { fonts[fam] = true; continue; }
     try { await document.fonts.load('16px "' + fam + '"', 'Handgloves 0123'); } catch (e) { /* rejected → check stays false */ }
     // BOTH signals, because each misses a different failure. check() is false for a webfont
@@ -78,6 +85,7 @@ try:
     const w = f => { c.font = '72px ' + f; return c.measureText(probe).width; };
     const distinct = !(w('"' + fam + '", monospace') === w('monospace') && w('"' + fam + '", serif') === w('serif'));
     fonts[fam] = document.fonts.check('16px "' + fam + '"') && distinct;
+    if (!fonts[fam]) font_offenders[fam] = site;
   }
   return {
     href: location.href,
@@ -86,6 +94,7 @@ try:
     h1: [...document.querySelectorAll('h1')].map(h => h.innerText.trim().slice(0, 120)),
     looks_like_not_found: /\\b(404|page not found|not found)\\b/i.test(document.title + ' ' + text.slice(0, 400)),
     fonts,
+    font_offenders,
     html_class: document.documentElement.className,
   };
 })()""")
@@ -109,7 +118,9 @@ if not page["h1"]:
     result["failures"].append("no h1")
 for fam, ok in page["fonts"].items():
     if not ok:
-        result["failures"].append(f"font '{fam}' does not resolve — silently falling back")
+        site = (page.get("font_offenders") or {}).get(fam) or {}
+        where = f" (asked for by {site['where']}" + (f": \"{site['sample']}\")" if site.get("sample") else ")") if site.get("where") else ""
+        result["failures"].append(f"font '{fam}'{where} does not resolve — silently falling back")
 
 slug = "".join(ch if ch.isalnum() else "-" for ch in url.split("://", 1)[-1])[:60].strip("-")
 for name, width, height in viewports:
