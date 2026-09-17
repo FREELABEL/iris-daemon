@@ -88,6 +88,15 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
     // the font, and Chrome loads fonts lazily, so an earlier version called heyiris.io's working
     // Instrument Sans "falling back" in one run and fine in the next.
     '/webfont.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Webfont</title><style>@font-face{font-family:"Ghost Sans";src:url(/nope.woff2) format("woff2")} h1,p{font-family:"Ghost Sans",sans-serif}</style></head><body><h1>Blocked webfont</h1><p>Reported as falling back.</p></body></html>',
+    // Left: a nav clipped by 24px inside overflow:hidden — invisible to the scrollWidth test,
+    // because a clipping ancestor absorbs it (found on /p/fleet-layer, where a "Get Started"
+    // button was sliced and the page reported no overflow). Right: a marquee track 6x wider
+    // than its box, which is intentional and must NOT be reported.
+    '/clipped.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Clipped</title></head>' +
+      '<body style="margin:0;font-family:Georgia,serif"><h1>Clipped</h1>' +
+      '<div style="overflow:hidden;white-space:nowrap"><button style="margin-left:300px;width:104px">Get Started</button></div>' +
+      '<div style="overflow:hidden"><div style="display:flex;width:1800px"><span style="width:600px">MB logo</span><span style="width:600px">FL logo</span><span style="width:600px">CD logo</span></div></div>' +
+      '</body></html>',
     '/wide.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wide</title></head><body style="margin:0;font-family:Georgia,serif"><h1>Wide</h1><div id="slab" style="width:600px;height:20px"></div></body></html>'
   }
   before(async () => {
@@ -145,6 +154,15 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
 
     const good = await run(`render_check url=${base}/good.html`)
     assert.equal(good.data.ok, true, JSON.stringify(good.data.failures))
+  })
+
+  it('reports content CUT OFF inside a clipping ancestor, but not a marquee track', { timeout: 120000 }, async () => {
+    const r = await run(`render_check url=${base}/clipped.html viewports=narrow:360x800`)
+    expect_fail(r)
+    const cut = r.data.failures.filter(f => /cut off/.test(f))
+    assert.equal(cut.length, 1, r.data.failures.join(' | '))
+    assert.match(cut[0], /Get Started/)
+    assert.equal(r.data.viewports.narrow.overflow_x, false, 'the scrollWidth test alone would pass this page')
   })
 
   it('an unreachable page FAILS the task as unmeasured — never a pass', { timeout: 120000 }, async () => {

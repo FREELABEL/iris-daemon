@@ -134,8 +134,39 @@ for name, width, height in viewports:
         .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.right > vw + 1; })
         .slice(0, 5)
         .map(e => e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + (e.className && typeof e.className === 'string' ? '.' + e.className.trim().split(/\\s+/).slice(0,2).join('.') : ''));
+      // Content CUT OFF is invisible to the scrollWidth test — a clipping ancestor absorbs it, so
+      // the page "has no overflow" while a nav button is sliced in half (measured on /p/fleet-layer
+      // at 768px: the Get Started button was clipped and overflow_x was false). Look for text-
+      // bearing elements whose box runs past the viewport inside something that clips, and ignore
+      // legitimate horizontal scrollers — a carousel you can swipe is not a defect.
+      const clipped = [...document.querySelectorAll('body *')].filter(e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8 || r.right <= vw + 4) return false;
+        if (!(e.innerText || '').trim()) return false;
+        const cs = getComputedStyle(e);
+        if (cs.visibility === 'hidden' || cs.display === 'none' || cs.position === 'fixed') return false;
+        // Walk the WHOLE chain: a badge deep inside a marquee has a tight clipper of its own
+        // (a card with overflow hidden), so stopping at the first clipper called the marquee a
+        // defect — heyiris.io reported logos 1226px off a 390px viewport as "cut off".
+        let clipper = false, track = false;
+        for (let a = e.parentElement; a && a !== document.body; a = a.parentElement) {
+          const ov = getComputedStyle(a).overflowX;
+          if (ov === 'auto' || ov === 'scroll') return false;       // swipeable, not cut off
+          if (ov === 'hidden' || ov === 'clip') clipper = true;
+          if (a.scrollWidth > a.clientWidth * 1.5) track = true;    // a carousel/marquee track
+        }
+        // A real clipping defect is a NEAR MISS — a button sliced by 23px, not an item parked
+        // three screens to the right.
+        return clipper && !track && (r.right - vw) <= vw * 0.5
+      }).filter((e, _i, all) => !all.some(o => o !== e && e.contains(o)))   // innermost only
+        .slice(0, 5).map(e => ({
+        el: e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') +
+            (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\\s+/).slice(0, 2).join('.') : ''),
+        cut_off_px: Math.round(e.getBoundingClientRect().right - vw),
+        text: (e.innerText || '').trim().slice(0, 40),
+      }));
       return { scroll_width: document.documentElement.scrollWidth, viewport_width: vw,
-               overflow_x: overflow, offenders };
+               overflow_x: overflow, offenders, clipped };
     })()""")
     result["viewports"][name] = over
     if name != "desktop" and over["viewport_width"] > width + 1:
@@ -144,6 +175,11 @@ for name, width, height in viewports:
         result["failures"].append(f"{name} ({width}px): no responsive viewport meta — lays out at {over['viewport_width']}px")
     if over["overflow_x"]:
         result["failures"].append(f"{name} ({width}px): horizontal overflow, scrollWidth {over['scroll_width']}")
+    for c in over.get("clipped") or []:
+        result["failures"].append(
+            f"{name} ({width}px): {c['el']} is cut off at the right edge by {c['cut_off_px']}px"
+            + (f" (\"{c['text']}\")" if c['text'] else "")
+        )
     for scheme in schemes:
         cdp("Emulation.setEmulatedMedia", features=[{"name": "prefers-color-scheme", "value": scheme}])
         time.sleep(0.4)
