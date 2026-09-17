@@ -75,6 +75,10 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
   const pages = {
     '/good.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Good</title></head><body style="font-family:Georgia,serif"><h1>Good</h1></body></html>',
     '/broken.html': '<!doctype html><html><head><title>Broken</title><style>body{font-family:"Nonexistent Grotesk",sans-serif}</style></head><body><p>no heading</p><div id="slab" style="width:900px;height:20px"></div><script>throw new Error("boom from page")</script></body></html>',
+    // A webfont whose file 404s. The check must catch this: the computed font-family still names
+    // the font, and Chrome loads fonts lazily, so an earlier version called heyiris.io's working
+    // Instrument Sans "falling back" in one run and fine in the next.
+    '/webfont.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Webfont</title><style>@font-face{font-family:"Ghost Sans";src:url(/nope.woff2) format("woff2")} h1,p{font-family:"Ghost Sans",sans-serif}</style></head><body><h1>Blocked webfont</h1><p>Reported as falling back.</p></body></html>',
     '/wide.html': '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wide</title></head><body style="margin:0;font-family:Georgia,serif"><h1>Wide</h1><div id="slab" style="width:600px;height:20px"></div></body></html>'
   }
   before(async () => {
@@ -90,6 +94,7 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
   const uploaded = []
   const upload = async (files) => { uploaded.push(...files); return files.map(f => ({ filename: f.filename, url: `https://cdn.test/${f.filename}` })) }
   const run = (prompt) => runBrowserUseTask({ prompt }, { upload })
+  const expect_fail = (r) => { assert.equal(r.status, 'completed', r.error); assert.equal(r.data.ok, false) }
 
   it('a good page completes ok, with uploaded screenshot urls', { timeout: 120000 }, async () => {
     const r = await run(`render_check url=${base}/good.html`)
@@ -115,6 +120,16 @@ describe('browser_use: end to end (real Chrome)', { skip: !canRunBrowser() && 'n
     const r = await run(`render_check url=${base}/wide.html`)
     assert.equal(r.data.ok, false)
     assert.deepEqual(r.data.viewports.mobile.offenders, ['div#slab'])
+  })
+
+  it('catches a webfont that never arrives, and clears a working one', { timeout: 120000 }, async () => {
+    const bad = await run(`render_check url=${base}/webfont.html`)
+    expect_fail(bad)
+    assert.match(bad.data.failures.join(' | '), /Ghost Sans/)
+    assert.equal(bad.data.fonts['Ghost Sans'], false)
+
+    const good = await run(`render_check url=${base}/good.html`)
+    assert.equal(good.data.ok, true, JSON.stringify(good.data.failures))
   })
 
   it('an unreachable page FAILS the task as unmeasured — never a pass', { timeout: 120000 }, async () => {

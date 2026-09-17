@@ -68,8 +68,11 @@ cleanup() {
   "${BU[@]}" --reload >/dev/null 2>&1
   if [ -n "$CHROME_PID" ]; then kill "$CHROME_PID" 2>/dev/null; wait "$CHROME_PID" 2>/dev/null
   else pkill -f -- "--user-data-dir=$WORK/profile" 2>/dev/null; fi
-  sleep 0.3
-  rm -rf "$WORK"
+  sleep 0.5
+  # Chrome writes component-extension storage dirs with no owner-write bit, so a plain rm -rf
+  # fails with "Permission denied" and the work dir (with the profile inside) leaks.
+  chmod -R u+rwX "$WORK" 2>/dev/null
+  rm -rf "$WORK" 2>/dev/null || { sleep 1; chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK" 2>/dev/null; }
 }
 trap cleanup EXIT
 
@@ -80,7 +83,9 @@ RAW="$(RC_URL="$URL" RC_OUT="$OUT" RC_VIEWPORTS="$VIEWPORTS" RC_SCHEMES="$SCHEME
   "${BU[@]}" < "$HERE/render-check.py" 2>"$WORK/bu.err")"
 LINE="$(printf '%s\n' "$RAW" | grep '^RC_RESULT=' | tail -1)"
 if [ -z "$LINE" ]; then
-  cant "browser-use produced no result: $(tail -c 600 "$WORK/bu.err")"
+  # The LAST stderr line, not 600 characters of traceback tail: a caller needs the reason, and
+  # the reason is on the last line.
+  cant "browser-use failed: $(grep -v "^\s" "$WORK/bu.err" | tail -2 | tr "\n" " " | tail -c 300)"
 fi
 JSON="${LINE#RC_RESULT=}"
 echo "$JSON"

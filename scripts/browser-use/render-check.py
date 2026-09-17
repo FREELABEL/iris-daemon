@@ -31,29 +31,53 @@ cdp("Page.addScriptToEvaluateOnNewDocument", source="""
   const orig = console.error.bind(console);
   console.error = (...a) => { push(a.map(x => x && x.stack || x).join(' ')); orig(...a); };
 """)
-goto_url(url)
-wait_for_load(timeout=30)
+def unmeasured(msg):
+    """A page we could not measure is exit 2, never a pass — and it has to say WHY in one line.
+    Without this, a server that accepts the connection and never answers surfaced as 20 lines of
+    Python traceback tail, which tells nobody what happened."""
+    print("RC_RESULT=" + json.dumps({**result, "ok": False, "measured": False, "error": msg}))
+    raise SystemExit(0)
+
+
+try:
+    goto_url(url)
+    wait_for_load(timeout=30)
+except Exception as e:
+    unmeasured(f"page never finished loading ({type(e).__name__}: {str(e).splitlines()[0][:160]})")
 try:
     wait_for_network_idle(timeout=10)
 except Exception:
     pass  # long-polling pages never go idle; the load event already fired
 
-page = js("""(() => {
+# Fonts are checked by ASKING THE BROWSER TO LOAD each family, then document.fonts.check().
+# Measuring a canvas without loading first is what the earlier version did, and Chrome loads a
+# webfont lazily: heyiris.io's Instrument Sans measured as "falling back" in one run and as fine
+# in the next, on the same page. After an explicit load() the answer is stable, and it is also
+# right for system fonts (check() is true for an installed Futura) and for a blocked webfont
+# (load() rejects, check() stays false).
+try:
+    page = js("""(async () => {
   const nav = performance.getEntriesByType('navigation')[0] || {};
   const text = (document.body && document.body.innerText || '').slice(0, 4000);
-  // A family "resolves" if text set in it measures differently from BOTH generic fallbacks.
-  // Comparing computed font-family strings cannot tell: the string survives a silent fallback.
+  const generic = ['serif','sans-serif','monospace','system-ui','cursive','fantasy','ui-monospace','ui-sans-serif','ui-serif','-apple-system','ui-rounded','emoji','math','fangsong'];
+  const families = new Set();
+  for (const el of document.querySelectorAll('h1,h2,h3,p,li,code,td,button')) {
+    const first = getComputedStyle(el).fontFamily.split(',')[0].trim().replace(/^["']|["']$/g, '');
+    if (first) families.add(first);
+  }
+  const fonts = {};
   const c = document.createElement('canvas').getContext('2d');
   const probe = 'mmmmmmmmmwwwwwwwiiiiiii0123456789';
-  const w = f => { c.font = '72px ' + f; return c.measureText(probe).width; };
-  const fams = {};
-  for (const el of document.querySelectorAll('h1,h2,h3,p,li,code,td,button')) {
-    const first = getComputedStyle(el).fontFamily.split(',')[0].trim();
-    if (!first || fams[first] !== undefined) continue;
-    const bare = first.replace(/^["']|["']$/g, '');
-    const generic = ['serif','sans-serif','monospace','system-ui','cursive','fantasy','ui-monospace','ui-sans-serif','ui-serif','-apple-system'];
-    fams[bare] = generic.includes(bare) ? true
-      : !(w('"' + bare + '", monospace') === w('monospace') && w('"' + bare + '", serif') === w('serif'));
+  for (const fam of families) {
+    if (generic.includes(fam.toLowerCase())) { fonts[fam] = true; continue; }
+    try { await document.fonts.load('16px "' + fam + '"', 'Handgloves 0123'); } catch (e) { /* rejected → check stays false */ }
+    // BOTH signals, because each misses a different failure. check() is false for a webfont
+    // whose file never arrives, but TRUE for a family that needs no loading at all — a typo'd
+    // or uninstalled system font ("Nonexistent Grotesk") passed on check() alone. The width
+    // comparison catches that one: text set in it measures exactly like the generic fallback.
+    const w = f => { c.font = '72px ' + f; return c.measureText(probe).width; };
+    const distinct = !(w('"' + fam + '", monospace') === w('monospace') && w('"' + fam + '", serif') === w('serif'));
+    fonts[fam] = document.fonts.check('16px "' + fam + '"') && distinct;
   }
   return {
     href: location.href,
@@ -61,10 +85,12 @@ page = js("""(() => {
     title: document.title,
     h1: [...document.querySelectorAll('h1')].map(h => h.innerText.trim().slice(0, 120)),
     looks_like_not_found: /\\b(404|page not found|not found)\\b/i.test(document.title + ' ' + text.slice(0, 400)),
-    fonts: fams,
+    fonts,
     html_class: document.documentElement.className,
   };
 })()""")
+except Exception as e:
+    unmeasured(f"could not read the loaded page ({type(e).__name__}: {str(e).splitlines()[0][:160]})")
 result.update(page)
 
 # A page that never loaded is not a page that passed. Chrome shows its own error document
