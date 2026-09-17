@@ -122,6 +122,24 @@ const PROVIDERS = {
     },
   },
 
+  sessions: {
+    name: 'AI sessions',
+    description: 'Claude Code and opencode sessions on this machine — list and transcript, read-only',
+    available () {
+      // Either provider's storage is enough; a machine with neither has nothing to read.
+      const claude = path.join(os.homedir(), '.claude', 'projects')
+      const opencode = path.join(os.homedir(), '.local', 'share', 'opencode', 'storage', 'session')
+      if (exists(claude) || exists(opencode)) return { ok: true, detail: exists(claude) ? 'Claude Code' : 'opencode' }
+      return { ok: false, reason: 'No Claude Code or opencode session storage on this machine' }
+    },
+    functions: {
+      // Read-only by construction: these routes only read transcripts off disk. Sending a message
+      // into a live session is deliberately NOT here — see the epic's step 6.
+      list: { method: 'GET', path: '/api/sessions/claude-code' },
+      history: { method: 'GET', path: '/api/sessions/history' },
+    },
+  },
+
   imessage: {
     name: 'iMessage',
     description: 'Local iMessage history via the Messages chat.db',

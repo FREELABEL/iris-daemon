@@ -2922,6 +2922,44 @@ app.post('/api/sessions/claude-code/:id/message', async (req, res) => {
 
 // ─── Session History (reads JSONL from disk) ────────────────────
 
+// ── One session's transcript, over bridge_call (epic #185632) ────────────────────────────────
+//
+// A phone asks "what is happening in this session"; the platform reaches this through the node
+// rail, NOT the CLI. `run_iris_command` shells out through tmux and measured 2026-09-17 the same
+// command returned exit 1 with no output twice and exit 0 twice on one machine. Here there is no
+// shell, no PATH and no tmux — bridge_call runs in this process.
+//
+// Provider optional: bridge_call sends query strings, and the caller may only know the id. Each
+// provider's own history route is reused (it already parses transcripts); the first that has the
+// session answers. 404 from all of them is "not on this machine", which is a real answer.
+app.get('/api/sessions/history', async (req, res) => {
+  const { normalizeHistoryRequest, tailMessages } = require('./lib/session-history-request')
+  const asked = normalizeHistoryRequest(req.query)
+  if (asked.error) return res.status(400).json({ error: asked.error })
+
+  const token = (() => { try { return require('./lib/bridge-auth').getToken() } catch { return null } })()
+  const headers = { Accept: 'application/json' }
+  if (token) headers['x-bridge-key'] = token
+
+  const tried = []
+  for (const provider of asked.providers) {
+    const url = `http://127.0.0.1:${PORT}/api/sessions/${provider}/${encodeURIComponent(asked.id)}/history`
+    try {
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
+      const body = await r.json().catch(() => null)
+      if (r.status === 404 || !body || body.error) { tried.push(provider); continue }
+
+      const { messages, omitted } = tailMessages(body.messages, asked.limit)
+      return res.json({ ...body, provider, session_id: asked.id, messages, messages_omitted: omitted, messages_returned: messages.length })
+    } catch (err) {
+      tried.push(provider)
+      console.log(`[sessions] history ${provider}/${asked.id} failed: ${err.message}`)
+    }
+  }
+
+  return res.status(404).json({ error: `Session ${asked.id} was not found on this machine`, providers_tried: tried })
+})
+
 app.get('/api/sessions/claude-code/:id/history', (req, res) => {
   const sessionId = req.params.id
   const claudeDir = path.join(process.env.HOME, '.claude', 'projects')
