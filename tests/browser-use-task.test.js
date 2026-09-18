@@ -209,7 +209,9 @@ describe('agent_helpers: safe_click', { skip: !canRunBrowser() && 'no Chrome or 
     profile = fs.mkdtempSync(path.join(os.tmpdir(), 'safeclick-'))
     fs.mkdirSync(path.join(profile, 'ws'))
     fs.copyFileSync(path.join(ROOT, 'scripts/browser-use/agent_helpers.py'), path.join(profile, 'ws', 'agent_helpers.py'))
-    port = 9400 + (process.pid % 500)
+    // A FREE port, not a guess: `9400 + pid % 500` collided with a leftover listener and the
+    // test failed with no RESULT line and no reason.
+    port = await new Promise(r => { const t = require('net').createServer(); t.listen(0, '127.0.0.1', () => { const p = t.address().port; t.close(() => r(p)) }) })
     chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       ['--headless=new', `--user-data-dir=${path.join(profile, 'chrome')}`, `--remote-debugging-port=${port}`, '--no-first-run', 'about:blank'],
       { stdio: 'ignore' })
@@ -217,7 +219,13 @@ describe('agent_helpers: safe_click', { skip: !canRunBrowser() && 'no Chrome or 
   })
   after(() => {
     try { run('browser-use', ['--reload'], { env: env(), stdio: 'ignore' }) } catch {}
-    chrome.kill('SIGKILL'); server.close()
+    // Kill Chrome BY ITS PROFILE, not by pid: SIGKILL on the main process orphans its renderer
+    // helpers (parent becomes 1) and they keep running — this test leaked four of them.
+    chrome.kill('SIGKILL')
+    // `--` before the pattern: it starts with "--", and without the separator pkill reads it as
+    // one of its own options, fails, and the catch below swallows it — killing nothing.
+    try { run('pkill', ['-9', '-f', '--', `--user-data-dir=${path.join(profile, 'chrome')}`]) } catch { /* none left */ }
+    server.close()
     try { run('chmod', ['-R', 'u+rwX', profile]); fs.rmSync(profile, { recursive: true, force: true }) } catch {}
   })
 
@@ -248,10 +256,13 @@ print("RESULT=" + json.dumps(out))
       let out = '', err = ''
       const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('browser-use timed out: ' + err.slice(-300))) }, 90000)
       child.stdout.on('data', d => { out += d }); child.stderr.on('data', d => { err += d })
-      child.on('close', () => { clearTimeout(timer); resolve(out + '\n' + err) })
+      child.on('error', e => { clearTimeout(timer); resolve(`spawn error: ${e.message}\n` + out + err) })
+      child.on('close', code => { clearTimeout(timer); resolve(`exit ${code}\n` + out + '\n' + err) })
       child.stdin.end(script)
     })
-    const r = JSON.parse(res.split('\n').find(l => l.startsWith('RESULT=')).slice(7))
+    const line = res.split('\n').find(l => l.startsWith('RESULT='))
+    assert.ok(line, 'browser-use produced no RESULT line:\n' + res.slice(-800))
+    const r = JSON.parse(line.slice(7))
     assert.ok(r.lines >= 2, 'fixture link must actually wrap')
     assert.equal(r.wrapped.ok, true); assert.equal(r.wrapped.changed, true)
     assert.match(r.wrapped.url_after, /#wrapped$/)
