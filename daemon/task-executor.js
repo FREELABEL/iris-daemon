@@ -209,6 +209,25 @@ function resolveDaemonIdentity () {
   return _daemonIdentity
 }
 
+/**
+ * Give the scripts this daemon spawns THIS machine's own credential.
+ *
+ * SOM outreach, inbox scans and the leadgen specs read HEYIRIS_TOKEN. Until 2026-09-18 each one
+ * fell back to a hardcoded token when it was unset — the token was found public and rotated, and
+ * the fallbacks now throw. Without this, every scheduled outreach and inbox scan would start
+ * failing on its next run. Only fills an EMPTY variable: an explicitly configured token wins.
+ * Returns what it did, for tests and logs.
+ */
+function ensureScriptToken () {
+  if (process.env.HEYIRIS_TOKEN) return 'already-set'
+  try {
+    process.env.HEYIRIS_TOKEN = resolveDaemonIdentity().token
+    return 'set-from-machine-identity'
+  } catch {
+    return 'no-token' // the task's own error (and resolveDaemonIdentity's message) will explain
+  }
+}
+
 // Resolve a saved account-scoped script by slug for the `user_script` task type.
 // Cache-first: use the local copy if present, otherwise PULL it from the cloud
 // (the Hive "pull the script if it doesn't exist on the machine" use case) and
@@ -889,6 +908,7 @@ class TaskExecutor {
     const taskId = task.id
     const runtime = task.runtime || task.config?.runtime || process.env.RUNTIME || 'iris_agent'
     const startTime = Date.now()
+    ensureScriptToken()
     const fromGate = opts.fromGate === true // re-entry from the gate's queue drain
 
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -5561,4 +5581,4 @@ function openEnvelopeBuffers({ ephPublic, wrapNonce, wrappedDek, wrapTag, recipi
   return { dek, plaintext: Buffer.concat([cd.update(sealed), cd.final()]) }
 }
 
-module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION }
+module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken }

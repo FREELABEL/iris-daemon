@@ -352,3 +352,36 @@ describe('scrape-leads.sh', { skip: !canRunBrowser() && 'no Chrome or browser-us
     assert.equal(down.code, 2); assert.equal(down.data.measured, false)
   })
 })
+
+// ── ensureScriptToken: scripts get THIS machine's credential, never a shared hardcoded one ──
+describe('ensureScriptToken', () => {
+  it('fills HEYIRIS_TOKEN from the machine identity only when it is empty, and never overwrites', () => {
+    const { ensureScriptToken, resetDaemonIdentityForTests } = require('../daemon/task-executor')
+    const saved = { H: process.env.HEYIRIS_TOKEN, K: process.env.IRIS_API_KEY }
+    try {
+      delete process.env.HEYIRIS_TOKEN
+      process.env.IRIS_API_KEY = 'machine-own-key-0123456789abcdef'
+      if (resetDaemonIdentityForTests) resetDaemonIdentityForTests()
+      const r = ensureScriptToken()
+      assert.ok(['set-from-machine-identity', 'already-set'].includes(r), r)
+      assert.ok(process.env.HEYIRIS_TOKEN, 'scripts must receive a token')
+      process.env.HEYIRIS_TOKEN = 'explicit'
+      assert.equal(ensureScriptToken(), 'already-set')
+      assert.equal(process.env.HEYIRIS_TOKEN, 'explicit', 'an explicitly configured token must win')
+    } finally {
+      if (saved.H === undefined) delete process.env.HEYIRIS_TOKEN; else process.env.HEYIRIS_TOKEN = saved.H
+      if (saved.K === undefined) delete process.env.IRIS_API_KEY; else process.env.IRIS_API_KEY = saved.K
+    }
+  })
+
+  it('no hardcoded 32-hex token survives anywhere in the daemon or its SOM specs', () => {
+    const { execFileSync } = require('child_process')
+    let out = ''
+    try {
+      out = execFileSync('git', ['grep', '-nE', "\\|\\| ['\"][0-9a-f]{32}['\"]", '--', 'daemon', 'som', 'scripts'], { cwd: ROOT, encoding: 'utf8' })
+    } catch (e) {
+      if (e.status !== 1) throw e // 1 = no matches, which is the pass; anything else is a broken check
+    }
+    assert.equal(out.trim(), '', 'a hardcoded token fallback came back:\n' + out)
+  })
+})
