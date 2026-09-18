@@ -273,3 +273,82 @@ print("RESULT=" + json.dumps(out))
     assert.equal(r.harness_js, 2, "loading the helpers must not replace the harness's own js()")
   })
 })
+
+// ── scrape-leads: deterministic lead extraction ──
+// Every shape below is one that fooled an earlier version, ON A REAL SITE, not a guess:
+//  - ycombinator.com/people returned three department headings as people and missed ~100 real
+//    ones: cards were a bare <a> (photo, name, title, bio) with no class, and job titles like
+//    "General Partner" are name-shaped, so every card looked like it held two people.
+//  - nav links ("Startup Directory", "Hacker News") are name-shaped too.
+//  - O'Neil and "Dr. Priya van der Berg" were rejected by the first name rule.
+describe('scrape-leads.sh', { skip: !canRunBrowser() && 'no Chrome or browser-use on this machine' }, () => {
+  const { execFile } = require('child_process')
+  const SL = path.join(ROOT, 'scripts/browser-use/scrape-leads.sh')
+  let server, base
+  const site = {
+    '/robots.txt': 'User-agent: *\nDisallow: /private/\n',
+    '/': '<html><head><title>Acme Dental | Austin</title><meta property="og:site_name" content="Acme Dental"></head><body>' +
+      '<nav><a href="/team">Our Team</a> <a href="/private/staff">Staff portal</a></nav>' +
+      '<footer><h4>Front desk</h4><a href="mailto:hello@acme.test">hello@acme.test</a></footer></body></html>',
+    '/team': '<html><head><title>Team | Acme Dental</title><meta property="og:site_name" content="Acme Dental"></head><body>' +
+      '<div class="grid">' +
+      '<div class="team-member"><h3>Maria Gonzalez</h3><p class="role">Lead Dentist, DDS</p><a href="mailto:maria@acme.test">Email</a> <a href="https://www.linkedin.com/in/maria-g">in</a></div>' +
+      '<div class="team-member"><h3>James O\'Neil</h3><p class="role">Practice Manager</p><a href="tel:+15125550101">Call</a></div>' +
+      '<div class="team-member"><h3>Dr. Priya van der Berg</h3><p>Orthodontist</p></div>' +
+      '<div class="team-member"><h3>Read More</h3><p>Not a person</p></div></div></body></html>',
+    '/private/staff': '<html><body><div class="team-member"><h3>Secret Person</h3><p class="role">Director</p></div></body></html>',
+    // YC-shaped: classless <a> cards, name-shaped titles, a name-shaped section heading, name-shaped nav
+    '/people': '<html><head><title>People</title></head><body><nav><a href="/x">Startup Directory</a> <a href="/y">Hacker News</a></nav>' +
+      '<h2>Investment Operations</h2><div>' +
+      ['Garry Tan|President & CEO', 'Gustaf Alströmer|General Partner', 'Diana Hu|Managing Partner'].map(x => {
+        const [n, t] = x.split('|')
+        return `<a href="/p/${n.split(' ')[0]}"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="80" height="80"><div>${n}</div><div>${t}</div><p>${n} is a ${t} at YC and has worked on many companies over the years.</p></a>`
+      }).join('') + '</div></body></html>',
+    '/empty': '<html><head><title>Services</title></head><body><h1>Services</h1><p>Cleanings.</p></body></html>',
+  }
+  const run = (args) => new Promise(resolve => {
+    execFile('bash', [SL, ...args, '--delay', '0.2'], { timeout: 180000, maxBuffer: 8e6 }, (err, stdout) => {
+      const line = String(stdout).trim().split('\n').filter(l => l.startsWith('{')).pop()
+      resolve({ code: err ? err.code : 0, data: line ? JSON.parse(line) : null, raw: String(stdout) })
+    })
+  })
+  before(async () => {
+    server = http.createServer((q, r) => {
+      const body = site[q.url.split('?')[0]]
+      r.writeHead(body ? 200 : 404, { 'Content-Type': q.url === '/robots.txt' ? 'text/plain' : 'text/html; charset=utf-8' })
+      r.end(body || 'not found')
+    })
+    await new Promise(r => server.listen(0, '127.0.0.1', r))
+    base = `http://127.0.0.1:${server.address().port}`
+  })
+  after(() => server.close())
+
+  it('follows "Our Team", skips what robots.txt disallows, and keeps company contacts apart from people', { timeout: 200000 }, async () => {
+    const { code, data } = await run([`${base}/`])
+    assert.equal(code, 0)
+    assert.deepEqual(data.skipped.map(s => s.url.replace(base, '')), ['/private/staff'])
+    const names = data.leads.map(l => l.name.v)
+    assert.deepEqual(names.sort(), ['Dr. Priya van der Berg', "James O'Neil", 'Maria Gonzalez'])
+    assert.ok(!names.includes('Secret Person'), 'a robots-disallowed page must never be read')
+    const maria = data.leads.find(l => l.name.v === 'Maria Gonzalez')
+    assert.equal(maria.email.v, 'maria@acme.test'); assert.equal(maria.company, 'Acme Dental')
+    assert.match(maria.socials.linkedin, /linkedin\.com\/in\/maria-g/)
+    assert.deepEqual(data.contacts.map(c => c.value), ['hello@acme.test'], "a person's own phone must not reappear as a company contact")
+  })
+
+  it('reads a YC-shaped page: classless photo cards yes, headings and nav no', { timeout: 200000 }, async () => {
+    const { code, data } = await run([`${base}/people`, '--no-follow'])
+    assert.equal(code, 0)
+    const names = data.leads.map(l => l.name.v).sort()
+    assert.deepEqual(names, ['Diana Hu', 'Garry Tan', 'Gustaf Alströmer'])
+    for (const l of data.leads) assert.ok(l.evidence.includes('photo') && l.evidence.includes('role-title'), JSON.stringify(l))
+    assert.equal(data.leads.find(l => l.name.v === 'Gustaf Alströmer').title.v, 'General Partner')
+  })
+
+  it('a page with no people is exit 1 (a real answer); an unreachable site is exit 2 (not "no leads")', { timeout: 200000 }, async () => {
+    const empty = await run([`${base}/empty`, '--no-follow'])
+    assert.equal(empty.code, 1); assert.equal(empty.data.measured, true); assert.equal(empty.data.leads.length, 0)
+    const down = await run(['http://127.0.0.1:1/', '--no-follow'])
+    assert.equal(down.code, 2); assert.equal(down.data.measured, false)
+  })
+})
