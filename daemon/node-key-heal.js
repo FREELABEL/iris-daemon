@@ -135,7 +135,7 @@ async function healNodeKey ({
     ...(nodeId ? { node_id: nodeId } : {}),
     ...(previousKey && previousKey !== apiKey ? { node_api_key_previous: previousKey } : {})
   })
-  log.log(`[daemon] Node key was rejected — re-registered this machine with the signed-in account${nodeId ? ` (node ${String(nodeId).slice(0, 8)}…)` : ''}.`)
+  log.log(`[daemon] ${previousKey ? 'Node key was rejected — re-registered' : 'Enrolled'} this machine with the signed-in account${nodeId ? ` (node ${String(nodeId).slice(0, 8)}…)` : ''}.`)
   return { healed: true, reason: 'healed', apiKey, nodeId }
 }
 
