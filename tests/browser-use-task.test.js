@@ -183,3 +183,82 @@ describe('browser_use: routing capability', () => {
     assert.equal(typeof browserUseCapability(), 'boolean')
   })
 })
+
+// ── safe_click: the click-validation helpers (ported from browser-use/jev-ultrafast, MIT) ──
+// Both tools we measured reported success for a click that did nothing. These pin the four
+// refusals and the one success that matter, through the REAL browser-harness loader.
+describe('agent_helpers: safe_click', { skip: !canRunBrowser() && 'no Chrome or browser-use on this machine' }, () => {
+  const { spawn, execFileSync: run } = require('child_process')
+  const os = require('os')
+  let server, base, profile, chrome, port
+  const page = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Clicks</title></head>' +
+    '<body style="font-family:Georgia,serif;margin:20px;width:300px"><h1>Clicks</h1>' +
+    '<p>Text <a id="wrap" href="#wrapped">this link text is long enough to wrap onto a second line here</a> after.</p>' +
+    '<div style="position:relative;height:60px"><button id="under" onclick="document.title=\'UNDER CLICKED\'">Covered Button</button>' +
+    '<div style="position:absolute;inset:0;background:rgba(0,0,0,.3)">Cookie banner</div></div>' +
+    '<button>Next</button> <button>Next</button></body></html>'
+  const env = () => ({ ...process.env, BU_NAME: `t${process.pid}`, BU_CDP_URL: `http://127.0.0.1:${port}`,
+    BH_TELEMETRY: '0', BH_TAB_MARKER: '0',
+    BH_AGENT_WORKSPACE: path.join(profile, 'ws'),   // load THIS checkout's helpers, not whatever is installed
+    PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:${process.env.PATH}` })
+
+  before(async () => {
+    server = http.createServer((q, r) => { r.writeHead(200, { 'Content-Type': 'text/html' }); r.end(page) })
+    await new Promise(r => server.listen(0, '127.0.0.1', r))
+    base = `http://127.0.0.1:${server.address().port}`
+    profile = fs.mkdtempSync(path.join(os.tmpdir(), 'safeclick-'))
+    fs.mkdirSync(path.join(profile, 'ws'))
+    fs.copyFileSync(path.join(ROOT, 'scripts/browser-use/agent_helpers.py'), path.join(profile, 'ws', 'agent_helpers.py'))
+    port = 9400 + (process.pid % 500)
+    chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      ['--headless=new', `--user-data-dir=${path.join(profile, 'chrome')}`, `--remote-debugging-port=${port}`, '--no-first-run', 'about:blank'],
+      { stdio: 'ignore' })
+    for (let i = 0; i < 40; i++) { try { run('curl', ['-sf', `http://127.0.0.1:${port}/json/version`]); break } catch { await new Promise(r => setTimeout(r, 250)) } }
+  })
+  after(() => {
+    try { run('browser-use', ['--reload'], { env: env(), stdio: 'ignore' }) } catch {}
+    chrome.kill('SIGKILL'); server.close()
+    try { run('chmod', ['-R', 'u+rwX', profile]); fs.rmSync(profile, { recursive: true, force: true }) } catch {}
+  })
+
+  it('clicks a wrapped link, refuses a covered, ambiguous or stale target', { timeout: 120000 }, async () => {
+    const script = `
+import json
+new_tab("${base}/"); wait_for_load()
+out = {}
+def attempt(k, fn):
+    try: out[k] = {"ok": True, **fn()}
+    except ClickBlocked as e: out[k] = {"ok": False, "why": str(e)}
+els = elements(); w = [e for e in els if e["href"] == "#wrapped"][0]
+out["lines"] = w["lines"]
+attempt("wrapped", lambda: safe_click(w["i"]))
+attempt("covered", lambda: click_text("Covered Button"))
+out["title"] = page_info()["title"]
+attempt("ambiguous", lambda: click_text("Next"))
+elements(); js("window.__irisGen++")
+attempt("stale", lambda: safe_click(1))
+out["harness_js"] = js("1+1")
+print("RESULT=" + json.dumps(out))
+`
+    // ASYNC, never execFileSync: the page server above lives in THIS process, and a sync exec
+    // blocks the event loop, so Chrome's request for the page never gets an answer and the test
+    // times out looking like a browser failure (execfilesync-starves-an-in-process-server).
+    const res = await new Promise((resolve, reject) => {
+      const child = spawn('browser-use', [], { env: env() })
+      let out = '', err = ''
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('browser-use timed out: ' + err.slice(-300))) }, 90000)
+      child.stdout.on('data', d => { out += d }); child.stderr.on('data', d => { err += d })
+      child.on('close', () => { clearTimeout(timer); resolve(out + '\n' + err) })
+      child.stdin.end(script)
+    })
+    const r = JSON.parse(res.split('\n').find(l => l.startsWith('RESULT=')).slice(7))
+    assert.ok(r.lines >= 2, 'fixture link must actually wrap')
+    assert.equal(r.wrapped.ok, true); assert.equal(r.wrapped.changed, true)
+    assert.match(r.wrapped.url_after, /#wrapped$/)
+    assert.equal(r.covered.ok, false); assert.match(r.covered.why, /covered by .*Cookie banner/)
+    assert.notEqual(r.title, 'UNDER CLICKED', 'the covered button must never receive the click')
+    assert.equal(r.ambiguous.ok, false); assert.match(r.ambiguous.why, /matches 2 controls/)
+    assert.equal(r.stale.ok, false); assert.match(r.stale.why, /stale/)
+    assert.equal(r.harness_js, 2, "loading the helpers must not replace the harness's own js()")
+  })
+})
