@@ -427,6 +427,9 @@ function startDaemon () {
     'fl-iris-api-v5-mnmol.ondigitalocean.app',
     'main.heyiris.io',
     'apiv2.heyiris.io',
+    // The WEB APP host, not the API: every /api/v6/node-agent route 404s there. A client's
+    // config was hand-edited to it while chasing a 401, which turned one failure into two (#185896).
+    'app.heyiris.io',
   ]
 
   function migrateStaleUrl (url) {

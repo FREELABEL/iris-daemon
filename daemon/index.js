@@ -27,6 +27,7 @@ const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { tmuxPolicy } = require('./tmux-manager')
 const { detectTailscaleIp } = require('./tailscale-address')
+const { healNodeKey, isRejectedKey } = require('./node-key-heal')
 const { deriveSessionStatus, sessionActivity, sessionReportFields, SESSIONS_PER_PROVIDER_LIMIT } = require('./session-status')
 const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
@@ -211,10 +212,30 @@ class Daemon {
     this.tailscaleIp = tailscaleIp
     if (tailscaleIp) console.log(`[daemon] Tailnet address: ${tailscaleIp}`)
 
-    const heartbeatResult = await this.cloud.sendHeartbeat({
+    const heartbeatPayload = {
       hardware_profile: this.hardwareProfile,
       ...(tailscaleIp ? { tailscale_ip: tailscaleIp } : {})
-    })
+    }
+    let heartbeatResult
+    try {
+      heartbeatResult = await this.cloud.sendHeartbeat(heartbeatPayload)
+    } catch (err) {
+      // Checked on start, like updates: a node key the hub rejects is repaired from the signed-in
+      // account instead of 401-ing forever (#185896). daemon.js retries start() on failure, so a
+      // user who signs in AFTER this fails is healed on the next retry with nothing else to run.
+      if (!isRejectedKey(err)) throw err
+      const heal = await healNodeKey({
+        apiUrl: this.config.apiUrl,
+        nodeName: this.nodeName,
+        previousKey: this.cloud.apiKey,
+        configPath: CONFIG_FILE,
+        capabilities: { os: os.platform(), arch: os.arch(), cpus: os.cpus().length }
+      })
+      if (!heal.healed) throw err
+      this.cloud.apiKey = heal.apiKey
+      this.config.apiKey = heal.apiKey
+      heartbeatResult = await this.cloud.sendHeartbeat(heartbeatPayload)
+    }
     this.nodeId = heartbeatResult.node_id
     this._persistNodeId(this.nodeId)
 

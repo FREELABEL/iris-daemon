@@ -4691,6 +4691,9 @@ async function autoStartBots () {
 
 // ─── Auto-Start Daemon (Embedded Mode) ────────────────────────────
 
+let pendingEmbeddedDaemon = null
+let embeddedDaemonRetry = null
+
 async function autoStartDaemon () {
   // Skip if daemon.js already started its own daemon (prevents double Pusher subscription)
   if (process.env._DAEMON_STARTED === '1') {
@@ -4743,9 +4746,10 @@ async function autoStartDaemon () {
 
   try {
     const { Daemon } = require('./daemon/index')
+    const { nodeApiUrl } = require('./daemon/node-key-heal')
     const daemonConfig = {
       apiKey,
-      apiUrl: apiUrl || 'https://freelabel.net',
+      apiUrl: nodeApiUrl(apiUrl),
       dataDir: process.env.DAEMON_DATA_DIR || path.join(__dirname, '..', 'daemon-data'),
       flApiPath: process.env.FL_API_PATH || null,
       pusherKey,
@@ -4753,8 +4757,12 @@ async function autoStartDaemon () {
       externalApp: app // mount daemon routes on bridge's express app
     }
 
-    embeddedDaemon = new Daemon(daemonConfig)
+    // Reuse the instance across retries — start() is written to be re-invoked (daemon.js does the
+    // same), and a fresh Daemon per attempt would leak its intervals.
+    embeddedDaemon = pendingEmbeddedDaemon || new Daemon(daemonConfig)
+    pendingEmbeddedDaemon = embeddedDaemon
     await embeddedDaemon.start()
+    pendingEmbeddedDaemon = null
     console.log('[daemon] Embedded daemon started successfully — bridge + daemon on single port')
 
     // Alias daemon routes at root level so frontend can call /files, /processes, etc.
@@ -4770,6 +4778,14 @@ async function autoStartDaemon () {
   } catch (err) {
     console.error(`[daemon] Failed to start embedded daemon: ${err.message}`)
     embeddedDaemon = null
+    // A rejected node key used to leave the bridge in bridge-only mode until someone restarted it —
+    // so signing in afterwards fixed nothing. Re-check every minute, like the update check: start()
+    // re-registers from the signed-in account, so signing in at ANY point heals the node (#185896).
+    const { isRejectedKey } = require('./daemon/node-key-heal')
+    if (isRejectedKey(err) && !embeddedDaemonRetry) {
+      console.error('[daemon] Will re-check in 60s. Signing in (the IRIS app, or: iris auth login) repairs this automatically.')
+      embeddedDaemonRetry = setTimeout(() => { embeddedDaemonRetry = null; autoStartDaemon() }, 60 * 1000)
+    }
   }
 }
 
@@ -4917,7 +4933,10 @@ server.on('error', (err) => {
     if (result.action === 'retry') {
       const delay = result.stopped === 'launchd' ? 2000 : 1500
       setTimeout(() => {
-        server.listen(PORT, '0.0.0.0')
+        // BIND_HOST, not '0.0.0.0'. The first listen honours BRIDGE_BIND_HOST (default 127.0.0.1)
+        // but this retry hard-coded all interfaces, so any restart that collided on the port —
+        // launchd's daemon already up plus a manual start — silently exposed the bridge (#185888).
+        server.listen(PORT, BIND_HOST)
       }, delay)
       return
     }
