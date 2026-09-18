@@ -107,3 +107,15 @@ test('"earlier messages not shown" counts against the whole session, not against
     assert.strictEqual(omittedFrom(10, 140, 60), 140);
     assert.strictEqual(omittedFrom(60, 0, 60), 0);
 })
+
+test('a byte cursor is accepted, and nonsense is simply absent rather than zero', () => {
+    // `since: 0` and `since: absent` MUST differ — 0 means "I have nothing, stream me everything
+    // from the start", absent means "this is a first open, give me the page and the totals".
+    assert.strictEqual(normalizeHistoryRequest({ id: 'abcd' }).since, undefined)
+    assert.strictEqual(normalizeHistoryRequest({ id: 'abcd', since: '0' }).since, 0)
+    assert.strictEqual(normalizeHistoryRequest({ id: 'abcd', since: '4096' }).since, 4096)
+    assert.strictEqual(normalizeHistoryRequest({ id: 'abcd', since: 4096 }).since, 4096)
+    for (const bad of ['', 'abc', '-1', null, undefined, {}]) {
+        assert.strictEqual(normalizeHistoryRequest({ id: 'abcd', since: bad }).since, undefined, `since=${JSON.stringify(bad)}`)
+    }
+})

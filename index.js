@@ -2932,6 +2932,21 @@ app.post('/api/sessions/claude-code/:id/message', async (req, res) => {
 // Provider optional: bridge_call sends query strings, and the caller may only know the id. Each
 // provider's own history route is reused (it already parses transcripts); the first that has the
 // session answers. 404 from all of them is "not on this machine", which is a real answer.
+/** In-process: no socket, no auth header, no timeout, no JSON round trip. */
+async function readClaudeCodeHistoryBody (asked) {
+  const out = claudeCodeHistory({ sessionId: asked.id, limit: asked.limit, since: asked.since })
+  return out.status === 200 ? out.body : { error: (out.body && out.body.error) || 'unavailable' }
+}
+
+/** Providers still served by their own route. */
+async function fetchProviderHistory (provider, asked, headers) {
+  const since = asked.since === undefined ? '' : `&since=${asked.since}`
+  const url = `http://127.0.0.1:${PORT}/api/sessions/${provider}/${encodeURIComponent(asked.id)}/history?limit=${asked.limit}${since}`
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
+  if (r.status === 404) return null
+  return r.json().catch(() => null)
+}
+
 app.get('/api/sessions/history', async (req, res) => {
   const { normalizeHistoryRequest, tailMessages, omittedFrom } = require('./lib/session-history-request')
   const asked = normalizeHistoryRequest(req.query)
@@ -2943,13 +2958,21 @@ app.get('/api/sessions/history', async (req, res) => {
 
   const tried = []
   for (const provider of asked.providers) {
-    // Ask for the page we are going to show. Without this the provider route paged at its own
-    // default and the tail below was a tail of THAT page, not of the session.
-    const url = `http://127.0.0.1:${PORT}/api/sessions/${provider}/${encodeURIComponent(asked.id)}/history?limit=${asked.limit}`
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
-      const body = await r.json().catch(() => null)
-      if (r.status === 404 || !body || body.error) { tried.push(provider); continue }
+      // claude-code reads IN PROCESS. This used to be an HTTP call from the daemon to itself —
+      // auth header, 20s timeout, a 404 path and a full JSON round trip of the payload — to reach
+      // a function in the same file. The rest still go over the loopback until they are refactored
+      // the same way.
+      const body = provider === 'claude-code'
+        ? await readClaudeCodeHistoryBody(asked)
+        : await fetchProviderHistory(provider, asked, headers)
+      if (!body || body.error) { tried.push(provider); continue }
+
+      // An incremental read is already exactly the appended messages — paging it would drop the
+      // oldest of them and leave a hole the client cannot detect.
+      if (body.incremental) {
+        return res.json({ ...body, provider, session_id: asked.id })
+      }
 
       const { messages, omitted } = tailMessages(body.messages, asked.limit)
       return res.json({
@@ -2972,172 +2995,187 @@ app.get('/api/sessions/history', async (req, res) => {
   return res.status(404).json({ error: `Session ${asked.id} was not found on this machine`, providers_tried: tried })
 })
 
-app.get('/api/sessions/claude-code/:id/history', (req, res) => {
-  const sessionId = req.params.id
+/**
+ * One session's transcript, read from the END of the file.
+ *
+ * `since` is a byte cursor from a previous read. With one, only the appended bytes are read and no
+ * summary is recomputed — that is the whole point: the steady state is a `stat` that returns
+ * nothing. Without one this is a first open: a bounded tail read for the page, plus one full scan
+ * for the totals the panel shows.
+ *
+ * MEASURED before the cursor existed: 40.7MB read and 1,876 message objects built in order to
+ * return 60, on every poll of every viewer — 1.09s of CPU each time.
+ */
+function claudeCodeHistory ({ sessionId, limit, since }) {
+  const { readTail, readSince } = require('./lib/session-tail')
   const claudeDir = path.join(process.env.HOME, '.claude', 'projects')
 
-  // Find the JSONL file across all project dirs
   let filePath = null
   try {
-    const dirs = fs.readdirSync(claudeDir).filter(d =>
-      fs.statSync(path.join(claudeDir, d)).isDirectory()
-    )
-    for (const dir of dirs) {
+    for (const dir of fs.readdirSync(claudeDir)) {
       const candidate = path.join(claudeDir, dir, `${sessionId}.jsonl`)
-      if (fs.existsSync(candidate)) {
-        filePath = candidate
-        break
-      }
+      if (fs.existsSync(candidate)) { filePath = candidate; break }
     }
-  } catch (err) {
-    return res.status(404).json({ error: 'Session not found' })
+  } catch {
+    return { status: 404, body: { error: 'Session not found' } }
   }
-
-  if (!filePath) {
-    return res.status(404).json({ error: `Session ${sessionId} not found` })
-  }
+  if (!filePath) return { status: 404, body: { error: `Session ${sessionId} not found` } }
 
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    const lines = content.split('\n').filter(Boolean)
+    const stat = fs.statSync(filePath)
+    const want = Math.max(1, Math.min(parseInt(limit, 10) || 60, 200))
 
-    const messages = []
-    const filesEdited = new Set()
-    const filesRead = new Set()
-    const commandsRun = []
-    const toolCounts = {}
-    let cwd = null
-    let gitBranch = null
-    let totalCostUsd = 0
-
-    for (const line of lines) {
-      const obj = tryJSON(line)
-      if (!obj) continue
-
-      if (obj.cwd && !cwd) cwd = obj.cwd
-      if (obj.gitBranch && !gitBranch) gitBranch = obj.gitBranch
-
-      const msg = obj.message || {}
-      const role = msg.role || obj.type
-      const msgContent = msg.content || obj.content || ''
-
-      // Cost tracking
-      if (obj.costUSD) totalCostUsd += obj.costUSD
-
-      // Skip non-message types
-      if (!['user', 'assistant'].includes(role)) continue
-
-      // Parse content blocks
-      if (typeof msgContent === 'string' && msgContent.trim()) {
-        messages.push({
-          role,
-          type: 'text',
-          text: msgContent.slice(0, 2000),
-          timestamp: obj.timestamp || null
-        })
-      } else if (Array.isArray(msgContent)) {
-        for (const block of msgContent) {
-          if (!block || typeof block !== 'object') continue
-
-          if (block.type === 'text' && block.text) {
-            messages.push({
-              role,
-              type: 'text',
-              text: block.text.slice(0, 2000),
-              timestamp: obj.timestamp || null
-            })
-          } else if (block.type === 'tool_use') {
-            const toolName = block.name || 'unknown'
-            const input = block.input || {}
-            toolCounts[toolName] = (toolCounts[toolName] || 0) + 1
-
-            if (['Edit', 'Write', 'NotebookEdit'].includes(toolName)) {
-              const fp = input.file_path || input.notebook_path || ''
-              if (fp) filesEdited.add(fp)
-              messages.push({
-                role,
-                type: 'tool_use',
-                tool: toolName,
-                file_path: fp,
-                timestamp: obj.timestamp || null
-              })
-            } else if (toolName === 'Read') {
-              const fp = input.file_path || ''
-              if (fp) filesRead.add(fp)
-              messages.push({
-                role,
-                type: 'tool_use',
-                tool: 'Read',
-                file_path: fp || null,
-                command: null,
-                timestamp: obj.timestamp || null
-              })
-            } else if (toolName === 'Bash') {
-              const cmd = (input.command || '').slice(0, 200)
-              if (cmd) commandsRun.push(cmd)
-              messages.push({
-                role,
-                type: 'tool_use',
-                tool: 'Bash',
-                command: cmd,
-                timestamp: obj.timestamp || null
-              })
-            } else if (toolName === 'Grep' || toolName === 'Glob') {
-              messages.push({
-                role,
-                type: 'tool_use',
-                tool: toolName,
-                file_path: input.path || input.pattern || null,
-                command: input.pattern || null,
-                timestamp: obj.timestamp || null
-              })
-            } else {
-              messages.push({
-                role,
-                type: 'tool_use',
-                tool: toolName,
-                timestamp: obj.timestamp || null
-              })
-            }
-          } else if (block.type === 'tool_result') {
-            // skip tool results to keep response small
-          }
+    if (Number.isFinite(since)) {
+      const out = readSince(fs, filePath, stat.size, since, { max: want })
+      return {
+        status: 200,
+        body: {
+          session_id: sessionId,
+          // Both of these mean the same thing to the reader: stop appending, refetch the page.
+          incremental: !out.reset && out.truncated !== true,
+          reset: out.reset === true,
+          truncated: out.truncated === true,
+          offset: out.offset,
+          touched_at: stat.mtime.toISOString(),
+          messages: out.messages,
+          messages_returned: out.messages.length,
+          bytes_read: out.bytesRead
         }
       }
     }
 
-    const stat = fs.statSync(filePath)
-    const { newestMessages, HISTORY_PAGE } = require('./lib/session-history-request')
-    const page = newestMessages(messages, parseInt(req.query.limit, 10) || HISTORY_PAGE)
-
-    res.json({
-      session_id: sessionId,
-      project_path: cwd,
-      git_branch: gitBranch,
-      created_at: stat.birthtime.toISOString(),
-      // When it last SPOKE — see lib/session-times.js and the list route.
-      updated_at: lastMessageAtFromChunk(content),
-      touched_at: stat.mtime.toISOString(),
-      total_cost_usd: totalCostUsd,
-      summary: {
-        total_messages: messages.filter(m => m.type === 'text').length,
-        user_messages: messages.filter(m => m.role === 'user' && m.type === 'text').length,
-        assistant_messages: messages.filter(m => m.role === 'assistant' && m.type === 'text').length,
-        files_edited: [...filesEdited],
-        files_read: [...filesRead],
-        commands_run: commandsRun.slice(0, 50),
-        tools_used: toolCounts
-      },
-      // The NEWEST page. `slice(0, n)` here returned the OLDEST, so a caller taking a tail of it
-      // got a transcript that stopped hours before `updated_at` in this same response.
-      messages: page.messages,
-      messages_total: page.total,
-      messages_omitted: page.omitted
-    })
+    const page = readTail(fs, filePath, stat.size, want)
+    const totals = scanSessionTotals(filePath)
+    return {
+      status: 200,
+      body: {
+        session_id: sessionId,
+        project_path: totals.cwd,
+        git_branch: totals.gitBranch,
+        created_at: stat.birthtime.toISOString(),
+        // When it last SPOKE — see lib/session-times.js and the list route.
+        updated_at: totals.lastMessageAt,
+        touched_at: stat.mtime.toISOString(),
+        total_cost_usd: totals.totalCostUsd,
+        incremental: false,
+        offset: page.offset,
+        summary: totals.summary,
+        messages: page.messages,
+        messages_total: totals.summary.total_entries,
+        messages_omitted: Math.max(0, totals.summary.total_entries - page.messages.length),
+        messages_returned: page.messages.length,
+        bytes_read: page.bytesRead
+      }
+    }
   } catch (err) {
     console.error(`[claude-code] History read error: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    return { status: 500, body: { error: err.message } }
   }
+}
+
+/**
+ * The counts the panel shows ("220 messages · 50 commands · 16 files edited").
+ *
+ * These genuinely need the whole file, so this is the one full scan left — and it runs ONLY on a
+ * first open, never on a refresh. It COUNTS rather than building a message object per block, which
+ * is why it is cheaper than the read it replaced.
+ */
+function scanSessionTotals (filePath) {
+  const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit']
+  const filesEdited = new Set()
+  const filesRead = new Set()
+  const commandsRun = []
+  const toolCounts = {}
+  let cwd = null
+  let gitBranch = null
+  let totalCostUsd = 0
+  let entries = 0
+  let texts = 0
+  let userTexts = 0
+  let assistantTexts = 0
+  let lastMessageAt = null
+  let lastMs = -Infinity
+
+  for (const raw of fs.readFileSync(filePath, 'utf8').split('\n')) {
+    const trimmed = raw.trim()
+    if (trimmed === '' || trimmed[0] !== '{') continue
+    let obj
+    try { obj = JSON.parse(trimmed) } catch { continue }
+
+    if (obj.cwd && !cwd) cwd = obj.cwd
+    if (obj.gitBranch && !gitBranch) gitBranch = obj.gitBranch
+    if (obj.costUSD) totalCostUsd += obj.costUSD
+
+    const msg = obj.message || {}
+    const role = msg.role || obj.type
+    if (!['user', 'assistant'].includes(obj.type) || !['user', 'assistant'].includes(role)) continue
+
+    const ms = Date.parse(obj.timestamp || '')
+    if (!Number.isNaN(ms) && ms > lastMs) { lastMs = ms; lastMessageAt = obj.timestamp }
+
+    const content = msg.content || obj.content || ''
+    if (typeof content === 'string') {
+      if (content.trim()) {
+        entries++
+        texts++
+        if (role === 'user') userTexts++
+        else assistantTexts++
+      }
+      continue
+    }
+    if (!Array.isArray(content)) continue
+
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type === 'text' && block.text) {
+        entries++
+        texts++
+        if (role === 'user') userTexts++
+        else assistantTexts++
+      } else if (block.type === 'tool_use') {
+        entries++
+        const tool = block.name || 'unknown'
+        const input = block.input || {}
+        toolCounts[tool] = (toolCounts[tool] || 0) + 1
+        if (EDIT_TOOLS.includes(tool)) {
+          const fp = input.file_path || input.notebook_path || ''
+          if (fp) filesEdited.add(fp)
+        } else if (tool === 'Read') {
+          if (input.file_path) filesRead.add(input.file_path)
+        } else if (tool === 'Bash') {
+          const cmd = String(input.command || '').slice(0, 200)
+          if (cmd) commandsRun.push(cmd)
+        }
+      }
+    }
+  }
+
+  return {
+    cwd,
+    gitBranch,
+    totalCostUsd,
+    lastMessageAt,
+    summary: {
+      total_messages: texts,
+      total_entries: entries,
+      user_messages: userTexts,
+      assistant_messages: assistantTexts,
+      files_edited: [...filesEdited],
+      files_read: [...filesRead],
+      commands_run: commandsRun.slice(0, 50),
+      tools_used: toolCounts
+    }
+  }
+}
+
+app.get('/api/sessions/claude-code/:id/history', (req, res) => {
+  const since = parseInt(req.query.since, 10)
+  const out = claudeCodeHistory({
+    sessionId: req.params.id,
+    limit: req.query.limit,
+    since: Number.isFinite(since) ? since : undefined
+  })
+  res.status(out.status).json(out.body)
 })
 
 app.delete('/api/sessions/claude-code/:id', (req, res) => {
