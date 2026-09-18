@@ -4736,9 +4736,27 @@ async function autoStartDaemon () {
     } catch { /* no config file */ }
   }
 
+  if (!apiKey && !isLocalMode) {
+    // The daemon is the ONE writer of the node key (#185896): with no key but a signed-in account,
+    // enroll this machine here instead of waiting for an installer step that no longer exists.
+    const { healNodeKey, nodeApiUrl, readAccount } = require('./daemon/node-key-heal')
+    if (readAccount()) {
+      const r = await healNodeKey({
+        apiUrl: nodeApiUrl(apiUrl),
+        nodeName: require('os').hostname(),
+        configPath: path.join(process.env.HOME, '.iris', 'config.json'),
+        capabilities: { os: process.platform, arch: process.arch }
+      })
+      if (r.healed) apiKey = r.apiKey
+    }
+  }
+
   if (!apiKey) {
-    console.log('[daemon] No NODE_API_KEY found — daemon not started (bridge-only mode)')
-    console.log('[daemon] To enable: set NODE_API_KEY env var or run the IRIS installer')
+    console.log('[daemon] Not enrolled and not signed in — daemon not started (bridge-only mode)')
+    console.log('[daemon] Sign in (the IRIS app, or: iris auth login). This re-checks every 60s.')
+    if (!isLocalMode && !embeddedDaemonRetry) {
+      embeddedDaemonRetry = setTimeout(() => { embeddedDaemonRetry = null; autoStartDaemon() }, 60 * 1000)
+    }
     return
   }
 

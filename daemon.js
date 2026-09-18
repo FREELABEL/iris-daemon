@@ -479,16 +479,11 @@ function startDaemon () {
     maxCpuThreshold: fileConfig.max_cpu_threshold || null
   }
 
-  if (!config.apiKey) {
-    console.error('Error: Node API key required.')
-    console.error('  node daemon.js --api-key node_live_xxx')
-    console.error('  OR set NODE_API_KEY environment variable')
-    console.error('  OR configure ~/.iris/config.json')
-    process.exit(1)
-  }
-
   // ─── Socket Lock: Request handoff from existing daemon ────────
-  acquireSocketLock(() => {
+  // No key is not fatal when someone is signed in: the daemon is the ONE writer of the node key
+  // (#185896), so it enrolls this machine itself. Installers, `iris hive connect` and sign-in no
+  // longer mint keys — they sign in and start this.
+  ensureNodeKey(config).then(() => acquireSocketLock(() => {
     // Reset circuit breaker on fresh start
     if (fs.existsSync(STATUS_FILE)) {
       try {
@@ -651,7 +646,22 @@ function startDaemon () {
     }
 
     startDaemonWithRetry()
-  })
+  }))
+
+  async function ensureNodeKey (cfg) {
+    if (cfg.apiKey) return
+    const { healNodeKey } = require('./daemon/node-key-heal')
+    const r = await healNodeKey({
+      apiUrl: cfg.apiUrl,
+      nodeName: cfg.nodeName,
+      configPath: CONFIG_FILE,
+      capabilities: { os: os.platform(), arch: os.arch(), cpus: os.cpus().length }
+    })
+    if (r.healed) { cfg.apiKey = r.apiKey; return }
+    console.error('Error: this machine is not enrolled yet, and could not enroll itself.')
+    console.error('  Sign in to IRIS (the IRIS app, or: iris auth login), then restart: iris daemon restart')
+    process.exit(1)
+  }
 
   // ─── Handle IPC messages from CLI commands ──────────────────
 

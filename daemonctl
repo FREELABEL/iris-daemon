@@ -163,41 +163,13 @@ case "${1:-status}" in
                 -e 's|https://apiv2\.heyiris\.io[^"]*|https://freelabel.net|g' \
                 "$IRIS_CONFIG" && rm -f "$IRIS_CONFIG.bak"
         fi
-        if ! has_node_key; then
-            # Self-heal: auto-register if SDK token exists
-            if [ -f "$HOME/.iris/sdk/.env" ]; then
-                _TOKEN=$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
-                _UID=$(grep IRIS_USER_ID "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
-                if [ -n "$_TOKEN" ]; then
-                    echo "No node key found. Auto-registering..."
-                    _HLABEL=$(hostname -s 2>/dev/null || echo "My-Machine")
-                    _HDOCK=$(command -v docker >/dev/null 2>&1 && echo "true" || echo "false")
-                    _RESP=$(curl -sL --max-time 10 \
-                        -H "Authorization: Bearer $_TOKEN" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"name\": \"$_HLABEL\", \"capabilities\": {\"docker\": $_HDOCK}}" \
-                        "https://raichu.heyiris.io/api/v1/hive/register-node" 2>/dev/null || echo '{}')
-                    _NKEY=$(echo "$_RESP" | jq -r '.node_key // empty' 2>/dev/null || \
-                            echo "$_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node_key',''))" 2>/dev/null || \
-                            echo "$_RESP" | sed -n 's/.*"node_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-                    if [ -n "$_NKEY" ] && [ "$_NKEY" != "null" ]; then
-                        printf '{"node_api_key":"%s","user_id":%s,"api_url":"https://freelabel.net"}\n' "$_NKEY" "${_UID:-0}" > "$IRIS_CONFIG"
-                        chmod 600 "$IRIS_CONFIG"
-                        echo "Registered! Continuing to start daemon..."
-                    else
-                        echo "Auto-registration failed. Register manually:"
-                        echo "  iris-daemon register"
-                        exit 1
-                    fi
-                fi
-            fi
-            # Re-check after auto-registration attempt
-            if ! has_node_key; then
-                echo "No API key configured."
-                echo "  Authenticate:  iris-login"
-                echo "  Then register: iris-daemon register"
-                exit 1
-            fi
+        # The daemon enrolls this machine itself — it is the ONE writer of the node key (#185896).
+        # This script used to mint keys here too (via a different endpoint, with no machine
+        # fingerprint), which is how machines ended up holding keys the hub did not know.
+        if ! has_node_key && ! grep -q '^IRIS_API_KEY=.' "$HOME/.iris/sdk/.env" 2>/dev/null; then
+            echo "This machine is not enrolled and nobody is signed in."
+            echo "  Sign in (the IRIS app, or: iris auth login), then: iris-daemon start"
+            exit 1
         fi
         SOCK="$HOME/.iris/daemon.sock"
         if [ -S "$SOCK" ] && node -e "require('net').createConnection('$SOCK',()=>{console.log('alive');process.exit(0)}).on('error',()=>process.exit(1))" 2>/dev/null; then
@@ -373,71 +345,13 @@ case "${1:-status}" in
         # shellcheck disable=SC2086
         tail -f $LOG_TARGETS ;;
     register)
-        if [ ! -f "$HOME/.iris/sdk/.env" ] || [ -z "$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)" ]; then
-            if command -v iris-login >/dev/null 2>&1; then
-                echo "Not authenticated. Running iris-login..."
-                iris-login
-                # Re-check after login
-                if [ ! -f "$HOME/.iris/sdk/.env" ]; then echo "Auth failed."; exit 1; fi
-            else
-                echo "Not authenticated. Run 'iris-login' first."
-                exit 1
-            fi
-        fi
-        SDK_TOKEN=$(grep IRIS_API_KEY "$HOME/.iris/sdk/.env" | cut -d= -f2)
-        if [ -z "$SDK_TOKEN" ]; then
-            echo "SDK token not found. Run 'iris-login' first."
+        # Enrollment is the daemon's job now (#185896): sign in, then (re)start it. A dead key is
+        # replaced automatically on start, so "register" is just a restart with a sign-in check.
+        if ! grep -q '^IRIS_API_KEY=.' "$HOME/.iris/sdk/.env" 2>/dev/null; then
+            echo "Not signed in. Sign in first (the IRIS app, or: iris auth login)."
             exit 1
         fi
-        HOSTNAME_LABEL=$(hostname -s 2>/dev/null || echo "My Machine")
-        HAS_DOCKER=$(command -v docker >/dev/null 2>&1 && echo "true" || echo "false")
-        USER_ID=$(grep IRIS_USER_ID "$HOME/.iris/sdk/.env" 2>/dev/null | cut -d= -f2)
-        echo "Registering $(hostname -s) as Hive compute node..."
-        REG_TMP=$(mktemp 2>/dev/null || echo "/tmp/iris-reg-$$")
-        HTTP_CODE=$(curl -sL --max-time 10 -o "$REG_TMP" -w "%{http_code}" \
-            -H "Authorization: Bearer $SDK_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"name\": \"$HOSTNAME_LABEL\", \"capabilities\": {\"docker\": $HAS_DOCKER}}" \
-            "https://raichu.heyiris.io/api/v1/hive/register-node" 2>/dev/null || echo "000")
-        RESP=$(cat "$REG_TMP" 2>/dev/null || echo '{}'); rm -f "$REG_TMP"
-        NODE_KEY=$(echo "$RESP" | jq -r '.node_key // empty' 2>/dev/null || \
-                   echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node_key',''))" 2>/dev/null || \
-                   echo "$RESP" | sed -n 's/.*"node_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        if [ -n "$NODE_KEY" ] && [ "$NODE_KEY" != "null" ]; then
-            mkdir -p "$HOME/.iris"
-            # MERGE, never truncate. A `printf ... > "$IRIS_CONFIG"` here destroyed
-            # every field outside the three it wrote — including node_id, this
-            # node's own identity — and reverted a custom api_url (#185145).
-            #
-            # The patch goes in on STDIN, not argv: the node key would otherwise be
-            # readable in `ps` output by anyone else on the machine.
-            #
-            # api_url is deliberately NOT sent. Registration has no opinion about
-            # which endpoint this node talks to; the previous hardcoded value
-            # silently overwrote it. It is set below only when absent.
-            if ! printf '{"node_api_key":"%s","user_id":"%s"}' "$NODE_KEY" "${USER_ID}" \
-                 | node "$BRIDGE_DIR/lib/config-merge.js" "$IRIS_CONFIG"; then
-                echo "Registration obtained a node key but could NOT save it — config.json is unchanged." >&2
-                echo "  Nothing was lost. Fix the error above and re-run: iris-daemon register" >&2
-                exit 1
-            fi
-            # Seed api_url only if this config has never had one.
-            if ! node -e 'const c=require(process.argv[1]);process.exit(c.api_url?0:1)' "$IRIS_CONFIG" 2>/dev/null; then
-                printf '{"api_url":"https://freelabel.net"}' | node "$BRIDGE_DIR/lib/config-merge.js" "$IRIS_CONFIG" >/dev/null
-            fi
-            echo "Registered! Node key saved to ~/.iris/config.json"
-            echo "Start with: iris-daemon start"
-        else
-            case "$HTTP_CODE" in
-                000) echo "Registration failed: network unreachable." ;;
-                401) echo "Registration failed: token not authorized."
-                     echo "  Your SDK token may be expired. Run: iris-login" ;;
-                5*)  echo "Registration failed: server error ($HTTP_CODE). Try again later." ;;
-                *)   echo "Registration failed (HTTP $HTTP_CODE)."
-                     echo "$RESP" | head -c 200 ;;
-            esac
-            echo "  Manual setup: https://web.heyiris.io/dashboard/hive"
-        fi ;;
+        exec "$0" restart ;;
     doctor)
         # Shared with iris-bridge on purpose: iris-daemon and iris-bridge are two
         # control surfaces over ONE process, and neither knew anything about the
