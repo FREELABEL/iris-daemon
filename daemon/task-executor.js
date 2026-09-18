@@ -192,9 +192,19 @@ function resolveDaemonIdentity () {
     }
   } catch { /* ignore */ }
 
+  // No token → refuse, and say what to do. This used to fall back to a HARDCODED token, which
+  // meant a node with no credentials of its own silently acted as the platform/admin identity —
+  // and, the repo being public, handed that identity to anyone who read it. That token was
+  // rotated on 2026-09-18; a node now has to be enrolled with its own.
+  if (!token) {
+    throw new Error(
+      'No IRIS token on this machine (checked FL_API_TOKEN / HEYIRIS_TOKEN, ~/.iris/sdk/.env, ' +
+      '~/.iris/config.json node_api_key). Enroll it with `iris hive connect`.'
+    )
+  }
   _daemonIdentity = {
     userId: userId ? String(userId) : '1',
-    token: token || 'ca54cd87e7046098eee99de3b9c98cfd',
+    token,
   }
   return _daemonIdentity
 }

@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // ── CONFIG ──────────────────────────────────────────────────────────
-const TOKEN = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd';
+const TOKEN = process.env.HEYIRIS_TOKEN || (() => { throw new Error("HEYIRIS_TOKEN is not set. The hardcoded fallback here was a leaked admin token, rotated 2026-09-18 — set HEYIRIS_TOKEN to your own IRIS token.") })();
 const BOARD_ID = parseInt(process.env.BOARD_ID || '38', 10);
 const LIMIT = parseInt(process.env.LIMIT || '30', 10);
 const IG_ACCOUNT = process.env.IG_ACCOUNT || 'heyiris.io';
