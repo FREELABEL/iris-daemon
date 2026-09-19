@@ -264,12 +264,27 @@ function ensureScriptToken () {
  * assets), but a 500 or a malformed body must NOT read as "no assets" — that would run a
  * watermarker with no watermark and call it a success.
  */
-async function resolveUserScriptAssets (slug) {
-  const apiBase = process.env.IRIS_API_BASE || process.env.API_BASE_URL || 'https://freelabel.net'
-  const token = process.env.IRIS_NODE_TOKEN || process.env.NODE_TOKEN || ''
-  const url = `${apiBase}/api/v6/node-agent/scripts/${encodeURIComponent(slug)}/assets`
+/**
+ * Where, and as whom, to call a /api/v6/node-agent/* route: the cloud client's own URL and NODE key.
+ *
+ * These routes accept the node key only. The script pulls used to send resolveDaemonIdentity()'s
+ * ACCOUNT token (and the asset pull an env var nothing sets), so every pull 401'd (#186174) while
+ * every other node-agent call — all of which go through the cloud client — worked.
+ */
+function nodeAgentRequest (cloud, routePath) {
+  if (!cloud || !cloud.apiUrl || !cloud.apiKey) {
+    throw new Error('this node has no cloud connection (api url + node key) to pull scripts with')
+  }
+  return {
+    url: new URL(routePath, cloud.apiUrl).toString(),
+    headers: { Authorization: `Bearer ${cloud.apiKey}`, Accept: 'application/json' }
+  }
+}
 
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } })
+async function resolveUserScriptAssets (slug, cloud) {
+  const { url, headers } = nodeAgentRequest(cloud, `/api/v6/node-agent/scripts/${encodeURIComponent(slug)}/assets`)
+
+  const res = await fetch(url, { headers })
   if (res.status === 404) return []                       // no such script here — the caller already failed
   if (!res.ok) throw new Error(`asset fetch failed: HTTP ${res.status}`)
 
@@ -280,7 +295,7 @@ async function resolveUserScriptAssets (slug) {
   return data
 }
 
-async function resolveUserScriptBySlug (slug, expectedSha = null) {
+async function resolveUserScriptBySlug (slug, expectedSha = null, cloud = null) {
   const contentDir = path.join(os.homedir(), '.iris', 'data', 'scripts', 'by-content')
   const sha = (s) => crypto.createHash('sha256').update(s, 'utf-8').digest('hex')
 
@@ -301,11 +316,9 @@ async function resolveUserScriptBySlug (slug, expectedSha = null) {
     }
   }
 
-  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
-  const { token } = resolveDaemonIdentity()
-  const url = `${apiBase}/api/v6/node-agent/scripts/${encodeURIComponent(slug)}`
+  const { url, headers } = nodeAgentRequest(cloud, `/api/v6/node-agent/scripts/${encodeURIComponent(slug)}`)
   console.log(`[executor] user_script '${slug}' — pulling from cloud`)
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } })
+  const res = await fetch(url, { headers })
   if (!res.ok) throw new Error(`Failed to pull script '${slug}' from cloud: HTTP ${res.status}`)
   const json = await res.json()
   const script = json.data || json
@@ -1847,7 +1860,17 @@ class TaskExecutor {
   // caller that does not pass one gets exactly the previous behaviour — which is what keeps
   // the direct-invocation tests, and any other call site, working unchanged.
   runProcess (task, workspace, outputLines, outputStream = null) {
-    return new Promise(async (resolve, reject) => {
+    // Was `new Promise(async (resolve, reject) => { ... })`. A throw inside an async executor never
+    // reaches `reject`: it becomes an unhandled rejection and Node exits — so any error before spawn
+    // (a 401 pulling a script, a malformed task) killed the whole daemon and every task on it
+    // (#186174). Now a throw anywhere in the body rejects this promise and fails only the task.
+    return new Promise((resolve, reject) => {
+      this._runProcessBody(task, workspace, outputLines, outputStream, resolve, reject).catch(reject)
+    })
+  }
+
+  _runProcessBody (task, workspace, outputLines, outputStream, resolve, reject) {
+    return Promise.resolve().then(async () => {
       // spawnOptions travels WITH cmd/args. Declared together so a branch that
       // sets a command and forgets the platform's spawn options reads as
       // incomplete rather than as working code (#185143's first patch fixed a
@@ -2001,7 +2024,7 @@ class TaskExecutor {
           const slug = (task.config?.script_slug || task.prompt || '').trim()
           if (!slug) throw new Error('user_script requires a script_slug')
           const expectedSha = task.config?.script_sha256 || null
-          const script = await resolveUserScriptBySlug(slug, expectedSha)
+          const script = await resolveUserScriptBySlug(slug, expectedSha, this.cloud)
           const runtime = task.config?.runtime || script.runtime || 'bash'
           const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
           const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
@@ -2012,7 +2035,7 @@ class TaskExecutor {
           // reported here, with the asset's name, instead of as whatever the script does when
           // its input is absent.
           try {
-            const assets = await resolveUserScriptAssets(slug)
+            const assets = await resolveUserScriptAssets(slug, this.cloud)
             if (assets.length) materialiseAssets(workspace.dir, assets)
           } catch (e) {
             // A script whose inputs are incomplete should not start. Throwing here fails the
@@ -5581,4 +5604,4 @@ function openEnvelopeBuffers({ ephPublic, wrapNonce, wrappedDek, wrapTag, recipi
   return { dek, plaintext: Buffer.concat([cd.update(sealed), cd.final()]) }
 }
 
-module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken }
+module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets }
