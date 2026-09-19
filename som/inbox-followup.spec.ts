@@ -82,7 +82,9 @@ function isOurMessage(senderName: string, igAccount: string, messageBody?: strin
   // Exact match on normalized name
   if (lower === acctLower) return true;
   // Account handle appears within the sender name
-  if (lower.includes(acctLower) || acctLower.includes(lower)) return true;
+  // Only this direction. The reverse made a lead called "iris", "hey" or "io" count as us, so every
+  // reply they sent was thrown away (caught by tests/e2e/inbox-sender.unit.spec.ts in the monorepo).
+  if (lower.includes(acctLower)) return true;
 
   // Content-based detection: if the message matches our outreach scripts, it's us.
   // Instagram shows display names (not handles) as senders, so handle comparison
