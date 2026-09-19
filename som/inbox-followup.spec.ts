@@ -4,6 +4,9 @@ import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-prov
 import { InstagramDmProvider } from './helpers/providers/instagram-dm-provider';
 import * as fs from 'fs';
 import * as path from 'path';
+// Reply intent (#186253): hard rule for explicit opt-outs, IRIS Decide (local model) for the rest.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { classifyReply, isOptOut } = require('../decide/reply-intent');
 
 // ── CONFIG ──────────────────────────────────────────────────────────
 const TOKEN = process.env.HEYIRIS_TOKEN || (() => { throw new Error("HEYIRIS_TOKEN is not set. The hardcoded fallback here was a leaked admin token, rotated 2026-09-18 — set HEYIRIS_TOKEN to your own IRIS token.") })();
@@ -111,7 +114,6 @@ function isOurMessage(senderName: string, igAccount: string, messageBody?: strin
 }
 
 // Hard opt-out / decline — these ALWAYS pause the sequence (never auto-reply).
-const HARD_OPTOUT_RE = /\b(no thanks|not interested|stop|unsubscribe|don't message|dont message|leave me alone|nah i'm good|nah im good|pass|no thank you|remove me)\b/i;
 
 export interface NextStep {
   id: number;
@@ -153,7 +155,9 @@ interface MatchedLead {
   replyAge: string; // human-readable age of most recent reply
   tagIds: number[];
   nextStep?: NextStep | null; // resolved scripted reply (preview pass)
-  optOut?: boolean;           // hard opt-out detected → never auto-reply
+  optOut?: boolean;           // opt-out (hard rule or confident decision) → never auto-reply
+  replyHold?: boolean;        // intent unclear → a person decides; no auto-reply, no opt-out
+  intent?: string | null;     // interested | question | not_now | opt_out | other (#186253)
 }
 
 interface UnmatchedConvo {
@@ -403,11 +407,31 @@ test(`Inbox Follow-up — Board ${BOARD_ID} / @${IG_ACCOUNT}`, async ({ page, co
     console.log(`  Mode: ${SEND_REPLIES && !DRY_RUN ? 'SEND (live)' : 'PREVIEW (no send)'}`);
     for (const lead of replied) {
       const replyText = lead.replyMessages.map((m) => m.body).join(' ');
-      if (HARD_OPTOUT_RE.test(replyText)) {
+      // #186253: HARD_OPTOUT_RE matched bare "pass"/"stop", so "I'll pass this to my partner" opted a
+      // warm lead out forever. Explicit opt-outs are still a hard rule inside classifyReply; the rest
+      // is a typed decision on this machine, and anything unclear is HELD for a person.
+      let c: any;
+      try {
+        c = await classifyReply({ reply: replyText });
+      } catch (e: any) {
+        // No local model: fall back to the hard rule alone, and hold everything it does not decide.
+        c = /\b(unsubscribe|remove me|not interested|leave me alone|don'?t message)\b/i.test(replyText)
+          ? { intent: 'opt_out', confidence: 1, method: 'rule', hold: false }
+          : { intent: null, confidence: 0, method: 'unavailable', hold: true };
+        console.log(`    (reply classifier unavailable: ${String(e?.message ?? e).slice(0, 80)})`);
+      }
+      lead.intent = c.intent;
+      if (isOptOut(c)) {
         lead.optOut = true;
-        console.log(`    @${lead.handle} — opt-out detected → will pause sequence (no auto-reply)`);
+        console.log(`    @${lead.handle} — opt-out (${c.method}) → will pause sequence (no auto-reply)`);
         continue;
       }
+      if (c.hold) {
+        lead.replyHold = true;
+        console.log(`    @${lead.handle} — reply unclear (${c.intent ?? '?'} ${Number(c.confidence).toFixed(2)}) → HELD for a person, no auto-reply`);
+        continue;
+      }
+      console.log(`    @${lead.handle} — intent: ${c.intent} (${Number(c.confidence).toFixed(2)})`);
       let steps: any[] = [];
       try { steps = await apiClient.getSteps(lead.leadId); } catch { steps = []; }
       const next = resolveNextStep(steps);
