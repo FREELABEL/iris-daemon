@@ -236,6 +236,25 @@ function resolveDaemonIdentity () {
  * failing on its next run. Only fills an EMPTY variable: an explicitly configured token wins.
  * Returns what it did, for tests and logs.
  */
+/**
+ * The signed-in ACCOUNT identity, for a script's environment (#186147).
+ *
+ * A persisted script run with `hive script exec` did not get IRIS_API_KEY — nothing ever put it in a
+ * child's env; a launchd daemon's own env has none, and a push-time run only had it when a login
+ * shell happened to source ~/.iris/sdk/.env. Scripts that call the IRIS API need the ACCOUNT key.
+ * Never the node key: resolveDaemonIdentity() falls back to it, and handing a node credential to a
+ * script under the account key's name is a different, wider power. Empty when nobody is signed in.
+ */
+function accountEnvForScripts () {
+  try {
+    const acct = process.env.IRIS_API_KEY
+      ? { token: process.env.IRIS_API_KEY, userId: process.env.IRIS_USER_ID || null }
+      : require('./node-key-heal').readAccount()
+    if (!acct || !acct.token) return {}
+    return { IRIS_API_KEY: acct.token, ...(acct.userId ? { IRIS_USER_ID: String(acct.userId) } : {}) }
+  } catch { return {} }
+}
+
 function ensureScriptToken () {
   if (process.env.HEYIRIS_TOKEN) return 'already-set'
   try {
@@ -4453,6 +4472,7 @@ exit 1
         TASK_TYPE: task.type,
         WORKSPACE_DIR: workspace.dir,
         PROJECT_DIR: workspace.projectDir,
+        ...accountEnvForScripts(),
         ...(workspace.env || {}),
         ...(task.config?.env_vars || {})
       }
@@ -4770,6 +4790,7 @@ exit 1
           TASK_ID: task.id,
           TASK_TYPE: task.type,
           RUNTIME: runtime,
+          ...accountEnvForScripts(),
           ...(task.config?.env_vars || {})
         },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -5622,4 +5643,4 @@ function openEnvelopeBuffers({ ephPublic, wrapNonce, wrappedDek, wrapTag, recipi
   return { dek, plaintext: Buffer.concat([cd.update(sealed), cd.final()]) }
 }
 
-module.exports = { TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets }
+module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets }
