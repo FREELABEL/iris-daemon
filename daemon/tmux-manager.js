@@ -60,11 +60,18 @@ function tmuxPolicy (platform = process.platform, env = process.env) {
     }
   }
 
+  // RECOMMENDED, not required — on macOS and Linux too (#185887). A fresh Mac has no tmux, and
+  // refusing to start made the daemon exit on every new client machine; the only way past it was
+  // IRIS_NO_TMUX=1, which nobody knows to set. The reasoning above applies here unchanged: without
+  // tmux a node is degraded (no session persistence), not broken. Say what is lost and how to get
+  // it back, then keep working.
   // Only name the installer that exists on the platform being told to run it.
+  const install = platform === 'darwin' ? 'brew install tmux' : 'sudo apt install tmux   (or your distro equivalent)'
   return {
-    required: true,
-    mode: 'required',
-    install: platform === 'darwin' ? 'brew install tmux' : 'sudo apt install tmux   (or your distro equivalent)'
+    required: false,
+    mode: 'recommended',
+    install,
+    note: `tmux not found — continuing WITHOUT session persistence (tasks run via direct spawn). For persistent sessions: ${install}`
   }
 }
 

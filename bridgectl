@@ -18,26 +18,28 @@ BRIDGE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 # a client had to do on 2026-08-31, twice in one session, once for each dependency.
 #
 # "exited with code 1" is not a diagnosis. This turns it into one.
-missing_deps=""
-command -v node >/dev/null 2>&1 || missing_deps="$missing_deps node"
-command -v tmux >/dev/null 2>&1 || missing_deps="$missing_deps tmux"
-# git is used 10x by the bridge (clone/pull for self-update). On macOS the binary exists as a
-# stub that PROMPTS for Xcode Command Line Tools, so "git is there" is not the same as "git
-# works" — `git --version` is the check that distinguishes them.
-git --version >/dev/null 2>&1 || missing_deps="$missing_deps git"
-if [ -n "$missing_deps" ]; then
-    echo "ERROR: the Hive daemon cannot start — missing:$missing_deps" >&2
-    case "$missing_deps" in
-        *node*) echo "  node: re-run the installer (curl -fsSL https://heyiris.io/install-code | bash)" >&2 ;;
-    esac
-    case "$missing_deps" in
-        *tmux*) echo "  tmux: brew install tmux    (macOS)  |  sudo apt-get install tmux  (Linux)" >&2 ;;
-    esac
-    case "$missing_deps" in
-        *git*) echo "  git:  xcode-select --install (macOS)  |  sudo apt-get install git   (Linux)" >&2 ;;
-    esac
+# Find node ourselves — the IRIS app, launchd and cron run this with a GUI PATH that has none
+# (same resolver as daemonctl; see there).
+for _d in "$HOME"/.iris/runtime/node-*/bin /opt/homebrew/bin /usr/local/bin; do
+    if [ -x "$_d/node" ]; then PATH="$_d:$PATH"; break; fi
+done
+# The package-manager dirs themselves, so tools that ARE installed (tmux, npm) are found too.
+for _d in /opt/homebrew/bin /usr/local/bin; do
+    case ":$PATH:" in *":$_d:"*) ;; *) [ -d "$_d" ] && PATH="$PATH:$_d" ;; esac
+done
+export PATH
+
+# ONLY node is fatal. tmux and git used to be too (#185887): a fresh Mac has neither — its `git`
+# is a stub that pops an Xcode install prompt — so the bridge refused to start on every new client
+# machine. Neither is needed to run: tmux only adds session persistence (the daemon falls back to
+# direct spawn), and the daemon is fetched over HTTPS, not cloned. Say what is lost; keep going.
+if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: the Hive daemon cannot start — Node.js is missing." >&2
+    echo "  Re-run the installer: curl -fsSL https://heyiris.io/install-code | bash" >&2
     exit 1
 fi
+command -v tmux >/dev/null 2>&1 || \
+    echo "note: tmux not found — running without session persistence. For it: brew install tmux (macOS) | sudo apt-get install tmux (Linux)" >&2
 
 case "${1:-status}" in
     start)

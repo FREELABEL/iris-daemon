@@ -24,9 +24,15 @@ describe('tmux policy', () => {
     assert.match(p.note, /session persistence/i)
   })
 
-  it('macOS and Linux still require it', () => {
-    assert.equal(tmuxPolicy('darwin', {}).required, true)
-    assert.equal(tmuxPolicy('linux', {}).required, true)
+  it('macOS and Linux RECOMMEND it but never refuse to start (#185887 — a fresh Mac has no tmux)', () => {
+    for (const os of ['darwin', 'linux']) {
+      const p = tmuxPolicy(os, {})
+      assert.equal(p.required, false)
+      assert.equal(p.mode, 'recommended')
+      // Degraded must be legible: what is lost, and the command that gets it back.
+      assert.match(p.note, /session persistence/i)
+      assert.ok(p.note.includes(p.install))
+    }
   })
 
   it('THE REMEDIATION NAMES A COMMAND THAT EXISTS ON THE PLATFORM PRINTING IT', () => {
@@ -43,13 +49,13 @@ describe('tmux policy', () => {
     assert.equal(tmuxPolicy('win32', {}).install, undefined)
   })
 
-  it('IRIS_NO_TMUX=1 disables it everywhere, including where it is normally required', () => {
-    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: '1' }).required, false)
-    assert.equal(tmuxPolicy('linux', { IRIS_NO_TMUX: '1' }).required, false)
+  it('IRIS_NO_TMUX=1 disables it everywhere', () => {
+    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: '1' }).mode, 'disabled')
+    assert.equal(tmuxPolicy('linux', { IRIS_NO_TMUX: '1' }).mode, 'disabled')
   })
 
   it('only the exact value "1" disables it — a stray truthy string must not', () => {
-    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: '0' }).required, true)
-    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: 'false' }).required, true)
+    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: '0' }).mode, 'recommended')
+    assert.equal(tmuxPolicy('darwin', { IRIS_NO_TMUX: 'false' }).mode, 'recommended')
   })
 })

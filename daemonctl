@@ -13,6 +13,10 @@ BRIDGE_PORT="${BRIDGE_PORT:-3200}"
 for _d in "$HOME"/.iris/runtime/node-*/bin /opt/homebrew/bin /usr/local/bin; do
     if [ -x "$_d/node" ]; then PATH="$_d:$PATH"; break; fi
 done
+# The package-manager dirs themselves, so tools that ARE installed (tmux, npm) are found too.
+for _d in /opt/homebrew/bin /usr/local/bin; do
+    case ":$PATH:" in *":$_d:"*) ;; *) [ -d "$_d" ] && PATH="$PATH:$_d" ;; esac
+done
 export PATH
 
 # ONE LOG CONTRACT, because there were two and the reader picked the wrong one.
