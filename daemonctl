@@ -5,6 +5,16 @@ BRIDGE_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
 IRIS_CONFIG="$HOME/.iris/config.json"
 BRIDGE_PORT="${BRIDGE_PORT:-3200}"
 
+# FIND NODE OURSELVES. The IRIS desktop app's Hive menu, launchd and cron all run this with the
+# PATH a GUI process gets (/usr/bin:/bin:/usr/sbin:/sbin) — no node on it. Every `node` below then
+# failed, so "Hive: Daemon Status" reported "Not running" on a running daemon and "Restart" could
+# stop it but not start it (measured 2026-09-18). Prefer the runtime the installer ships, then the
+# usual package-manager locations; a node already on PATH still wins if none of these exist.
+for _d in "$HOME"/.iris/runtime/node-*/bin /opt/homebrew/bin /usr/local/bin; do
+    if [ -x "$_d/node" ]; then PATH="$_d:$PATH"; break; fi
+done
+export PATH
+
 # ONE LOG CONTRACT, because there were two and the reader picked the wrong one.
 # launchd (the supervised, normal path) sends the daemon's streams to ~/.iris/logs/ via
 # StandardOutPath/StandardErrorPath in io.heyiris.daemon.plist. The unsupervised nohup
