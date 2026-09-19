@@ -20,9 +20,12 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 
-const SOCKET = 'iris'
+// Overridable ONLY so tests can run on a throwaway server instead of the live daemon's.
+const SOCKET = process.env.IRIS_TMUX_SOCKET || 'iris'
 const LOG_DIR = path.join(os.homedir(), '.iris', 'tmux-logs')
 const EXIT_DIR = path.join(os.homedir(), '.iris', 'tmux-exit')
+// Where a task's environment waits, 0600, for the wrapper to source and delete (#186280).
+const ENV_DIR = path.join(os.homedir(), '.iris', 'tmux-env')
 const LEDGER_FILE = path.join(os.homedir(), '.iris', 'tmux-ledger.jsonl')
 const MIN_VERSION = 3.0
 const MAX_LOG_SIZE = 50 * 1024 * 1024 // 50MB
@@ -203,16 +206,12 @@ class TmuxManager {
 
     // Build the full command string for tmux
     // Wrap in bash to capture exit code + signal wait-for channel
-    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile)
-
-    // Build -e flags so env vars land in the process's environment at spawn
-    // time (see below for why this can't use set-environment after the fact).
-    const envArgs = []
-    for (const [k, v] of Object.entries(env || {})) {
-      if (v !== undefined && v !== null) {
-        envArgs.push('-e', `${k}=${String(v)}`)
-      }
-    }
+    // The environment reaches the command through a private file the wrapper sources and deletes
+    // before anything runs — NOT `-e K=V` flags, which put every value (tokens included) on the
+    // tmux command line, readable by any process, and for the first session kept on the tmux
+    // SERVER's command line for as long as it lives (#186280).
+    const envFile = this._writeEnvFile(sessionName, env)
+    const fullCmd = this._buildWrappedCommand(cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile, envFile)
 
     // Create detached session, running the wrapped command directly as the
     // pane's process instead of spawning the user's interactive login shell
@@ -229,10 +228,14 @@ class TmuxManager {
       '-s', sessionName,
       '-c', cwd || process.cwd(),
       '-x', '200', '-y', '50', // generous pane size for output
-      ...envArgs,
       fullCmd
     ]
-    this._exec(newSessionArgs)
+    try {
+      this._exec(newSessionArgs)
+    } catch (err) {
+      this._removeEnvFile(envFile)
+      throw err
+    }
 
     // Set up pipe-pane to stream output to log file
     this._exec(['pipe-pane', '-t', sessionName, '-o', `cat >> ${this._shellEscape(outputFile)}`])
@@ -253,6 +256,7 @@ class TmuxManager {
       title: task.title || null,
       outputFile,
       exitFile,
+      envFile,
       channel,
       created: Date.now(),
       status: 'running'
@@ -273,11 +277,14 @@ class TmuxManager {
    *   once pipe-pane is attached, so no output can be produced (and lost)
    *   before the log capture is listening (#182004).
    */
-  _buildWrappedCommand (cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile) {
+  _buildWrappedCommand (cmd, args, exitFile, channel, startChannel, stdoutFile, stderrFile, envFile) {
     const escapedCmd = this._shellEscape(cmd)
     const escapedArgs = (args || []).map(a => this._shellEscape(a)).join(' ')
     const escapedExitFile = this._shellEscape(exitFile)
     const waitForStart = startChannel ? `tmux -L ${SOCKET} wait-for ${startChannel}; ` : ''
+    // Load the task's environment first and delete the file at once, so it exists on disk only
+    // between the daemon writing it and this shell starting (#186280).
+    const loadEnv = envFile ? `. ${this._shellEscape(envFile)}; rm -f ${this._shellEscape(envFile)}; ` : ''
 
     // REDIRECT THE REAL STREAMS TO FILES.
     //
@@ -300,7 +307,7 @@ class TmuxManager {
     // 2. Captures $? to exit file
     // 3. Signals the wait-for channel
     // 4. Exits the pane (which kills the session if it's the only pane)
-    return `${waitForStart}${escapedCmd} ${escapedArgs}${redirect}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
+    return `${loadEnv}${waitForStart}${escapedCmd} ${escapedArgs}${redirect}; echo $? > ${escapedExitFile}; tmux -L ${SOCKET} wait-for -S ${channel}; exit`
   }
 
   /**
@@ -382,20 +389,15 @@ class TmuxManager {
     const firstStartChannel = `${sessionName}-0-start`
     try { fs.unlinkSync(firstExitFile) } catch {}
 
-    const firstCmd = this._buildWrappedCommand(firstRole.cmd, firstRole.args, firstExitFile, firstChannel, firstStartChannel)
-    const firstEnvArgs = []
-    for (const [k, v] of Object.entries(firstRole.env || {})) {
-      if (v !== undefined && v !== null) {
-        firstEnvArgs.push('-e', `${k}=${String(v)}`)
-      }
-    }
+    // Env through a private file, never `-e` values on a command line (#186280).
+    const firstEnvFile = this._writeEnvFile(`${sessionName}-0`, firstRole.env)
+    const firstCmd = this._buildWrappedCommand(firstRole.cmd, firstRole.args, firstExitFile, firstChannel, firstStartChannel, undefined, undefined, firstEnvFile)
 
     this._exec([
       'new-session', '-d',
       '-s', sessionName,
       '-c', firstRole.cwd || process.cwd(),
       '-x', '200', '-y', '50',
-      ...firstEnvArgs,
       firstCmd
     ])
 
@@ -438,16 +440,11 @@ class TmuxManager {
       try { fs.unlinkSync(paneLog) } catch {}
       fs.writeFileSync(paneLog, '')
 
-      const roleCmd = this._buildWrappedCommand(role.cmd, role.args, exitFile, channel, startChannel)
-      const roleEnvArgs = []
-      for (const [k, v] of Object.entries(role.env || {})) {
-        if (v !== undefined && v !== null) {
-          roleEnvArgs.push('-e', `${k}=${String(v)}`)
-        }
-      }
+      const roleEnvFile = this._writeEnvFile(`${sessionName}-${i}`, role.env)
+      const roleCmd = this._buildWrappedCommand(role.cmd, role.args, exitFile, channel, startChannel, undefined, undefined, roleEnvFile)
 
       // Split horizontally (stacked), running the role's command directly
-      this._exec(['split-window', '-t', sessionName, '-c', role.cwd || process.cwd(), ...roleEnvArgs, roleCmd])
+      this._exec(['split-window', '-t', sessionName, '-c', role.cwd || process.cwd(), roleCmd])
 
       // Pipe this pane's output to its own log
       this._execSafe(['pipe-pane', '-t', `${sessionName}:0.${i}`, '-o', `cat >> ${this._shellEscape(paneLog)}`])
@@ -573,6 +570,8 @@ class TmuxManager {
 
     // Clean log file
     const info = this.sessions.get(sessionName)
+    // Normally already gone (the wrapper deletes it on start); this covers a session that died first.
+    this._removeEnvFile(info?.envFile)
     if (info?.outputFile) {
       try { fs.unlinkSync(info.outputFile) } catch {}
     }
@@ -833,6 +832,31 @@ class TmuxManager {
         fs.writeFileSync(LEDGER_FILE, trimmed.join('\n') + '\n')
       }
     } catch {}
+  }
+
+  /**
+   * Write a task's environment as `export K='v'` lines to a 0600 file in a 0700 directory, for
+   * the wrapper to source (#186280). Returns the path, or null when there is nothing to pass.
+   * A name that is not a shell identifier is dropped: it would be written as code, not a name.
+   */
+  _writeEnvFile (name, env) {
+    const lines = []
+    for (const [k, v] of Object.entries(env || {})) {
+      if (v === undefined || v === null) continue
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue
+      lines.push(`export ${k}='${String(v).replace(/'/g, "'\\''")}'`)
+    }
+    if (!lines.length) return null
+    fs.mkdirSync(ENV_DIR, { recursive: true, mode: 0o700 })
+    fs.chmodSync(ENV_DIR, 0o700) // mkdir's mode does nothing when the directory already exists
+    const file = path.join(ENV_DIR, `${name}.env`)
+    try { fs.unlinkSync(file) } catch {}
+    fs.writeFileSync(file, lines.join('\n') + '\n', { mode: 0o600, flag: 'wx' })
+    return file
+  }
+
+  _removeEnvFile (file) {
+    if (file) try { fs.unlinkSync(file) } catch {}
   }
 
   // ── Utilities ─────────────────────────────────────────────────────────────
