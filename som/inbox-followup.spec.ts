@@ -73,6 +73,10 @@ function parseMessageLine(line: string): { sender: string; body: string; timesta
  * Compares against the account handle and common display name variations.
  */
 function isOurMessage(senderName: string, igAccount: string, messageBody?: string): boolean {
+  // The inbox provider labels a bubble it knows is ours with the literal sender "me". This only
+  // compared against the account handle, so "me" never matched and EVERY message we sent was
+  // counted as a reply (measured 2026-09-18: 10 of 10 "replied" leads carried our own pitch).
+  if (senderName.trim().toLowerCase() === 'me') return true;
   const lower = senderName.toLowerCase().replace(/[._]/g, '');
   const acctLower = igAccount.toLowerCase().replace(/[._]/g, '');
   // Exact match on normalized name

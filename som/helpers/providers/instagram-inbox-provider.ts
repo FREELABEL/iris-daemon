@@ -327,8 +327,17 @@ export class InstagramInboxProvider extends BaseDiscoveryProvider {
         });
 
         for (const group of rightGroups) {
+          // Who sent it: which side of the group the bubble hugs. The avatar link alone is not
+          // enough — Instagram draws it only on the LAST bubble of a run, so earlier messages in
+          // a run of theirs were labelled 'me'. Measured on 16 real bubbles (2026-09-18): ours sit
+          // right (gap 28 right, 200+ left, blue), theirs sit left (gap 47 left, grey), 16 of 16.
           const hasProfileLink = group.querySelector('a[aria-label*="profile page"], a[href^="/"][role="link"] img');
-          const sender = hasProfileLink ? 'them' : 'me';
+          const firstText = group.querySelector('div[dir="auto"]') as HTMLElement | null;
+          let sender = hasProfileLink ? 'them' : 'me';
+          if (!hasProfileLink && firstText) {
+            const g = group.getBoundingClientRect(), b = firstText.getBoundingClientRect();
+            sender = (g.right - b.right) < (b.left - g.left) ? 'me' : 'them';
+          }
           const textEls = group.querySelectorAll('div[dir="auto"]');
           for (const el of Array.from(textEls)) {
             const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
