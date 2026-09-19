@@ -43,6 +43,24 @@ try {
 const { AdmissionGate } = require('./admission-gate')
 const { BROWSER_LAUNCH_FAILURE_RE } = require('../lib/playwright-setup')
 const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure, interpreterFor, generatedScriptFor, posixScriptPlan } = require('../lib/shell-for-platform')
+// The user_script branch calls these. 1ab5101 (2026-08-28) wired them in without importing them
+// and without defining getIsolationState, so every saved-script run that got past the pull died
+// on a ReferenceError (#186174). Nothing reached that line until the auth fixes, so it hid.
+const { planScriptExecution, nodePolicyFromEnv } = require('./sandbox')
+const { materialiseAssets } = require('./script-assets')
+const { probeIsolation } = require('./permission-probe')
+
+// `docker info` runs synchronously (up to 5s) and blocks the event loop, so measure at most once a
+// minute. A stale answer only decides host-vs-sandbox for the next run; a re-probe fixes it.
+let _isolationState = null
+let _isolationAt = 0
+async function getIsolationState () {
+  if (!_isolationState || Date.now() - _isolationAt > 60000) {
+    _isolationState = probeIsolation()
+    _isolationAt = Date.now()
+  }
+  return _isolationState
+}
 
 /**
  * Task types whose `prompt` is NOT a shell command.

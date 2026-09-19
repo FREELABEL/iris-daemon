@@ -45,7 +45,12 @@ before(async () => {
     const ok = req.headers.authorization === `Bearer ${NODE_KEY}`
     res.setHeader('Content-Type', 'application/json')
     if (!ok) { res.statusCode = 401; return res.end('{"message":"Unauthenticated."}') }
+    if (req.url.includes('/scripts/runs/assets')) {
+      const body = Buffer.from('the-watermark')
+      return res.end(JSON.stringify({ data: [{ path: 'mark.txt', bytes: body.length, sha256: require('crypto').createHash('sha256').update(body).digest('hex'), content_base64: body.toString('base64') }] }))
+    }
     if (req.url.endsWith('/assets')) return res.end('{"data":[]}')
+    if (req.url.includes('/scripts/runs')) return res.end(JSON.stringify({ data: { script_content: 'cat mark.txt; echo; echo ran-ok\n', runtime: 'bash' } }))
     res.end(JSON.stringify({ data: { script_content: 'echo hi\n', runtime: 'bash' } }))
   })
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
@@ -107,5 +112,33 @@ describe('an error before spawn fails the TASK, never the daemon', () => {
     assert.match(out.err.message, /requires a script_slug/)
     await new Promise((r) => setImmediate(r))
     assert.equal(unhandled.length, 0)
+  })
+})
+
+describe('a saved script gets past the pull and actually RUNS', () => {
+  // MEASURED 2026-09-18, the run after the auth fixes deployed: "planScriptExecution is not
+  // defined". 1ab5101 (2026-08-28) wired isolation into this branch and never imported
+  // planScriptExecution / nodePolicyFromEnv / materialiseAssets, nor defined getIsolationState.
+  // Every earlier failure (401, then 422) stopped the run before this line, so no user_script
+  // run through `iris scripts run` has completed since.
+  it('runs the script with its asset written beside it', async () => {
+    const savedPath = process.env.PATH
+    process.env.PATH = '/usr/bin:/bin' // no docker on PATH -> the host path, deterministically
+    try {
+      const ex = new TaskExecutor(cloud(), {})
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'us-run-'))
+      const lines = []
+      const out = await Promise.race([
+        ex.runProcess({ id: 't-run', type: 'user_script', prompt: 'runs', config: {} }, { dir }, lines)
+          .then((r) => ({ settled: 'resolved', r }), (err) => ({ settled: 'rejected', err })),
+        new Promise((r) => setTimeout(() => r({ settled: 'never' }), 20000))
+      ])
+      assert.equal(out.settled, 'resolved', out.err ? `rejected: ${out.err.message}` : 'did not finish')
+      assert.equal(fs.readFileSync(path.join(dir, 'mark.txt'), 'utf8'), 'the-watermark')
+      const text = lines.join('\n') + JSON.stringify(out.r || {})
+      assert.match(text, /ran-ok/)
+    } finally {
+      process.env.PATH = savedPath
+    }
   })
 })
