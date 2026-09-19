@@ -317,9 +317,10 @@ test(`Inbox Follow-up — Board ${BOARD_ID} / @${IG_ACCOUNT}`, async ({ page, co
   console.log('');
 
   // ── DISCORD NOTIFICATIONS ──
+  // No hard-coded fallback (#186187): a webhook URL is a credential — it sat in this PUBLIC repo for
+  // months. Unset = no Discord post; the scan itself is unaffected.
   const discordWebhook = process.env.DISCORD_TASK_WEBHOOK_URL ||
-    process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL ||
-    'https://discord.com/api/webhooks/1473938540139253834/XXWsRliRH7keLMEKrlnCcPPriR-iniyUhfCZU9MubNBBoZESBOLgvl8GqBAwYdajiEp7';
+    process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL || '';
 
   // Always send scan summary (even with 0 replies)
   try {
@@ -340,7 +341,7 @@ test(`Inbox Follow-up — Board ${BOARD_ID} / @${IG_ACCOUNT}`, async ({ page, co
       footer: { text: `Board ${BOARD_ID}` },
       timestamp: new Date().toISOString(),
     };
-    await fetch(discordWebhook, {
+    if (discordWebhook) await fetch(discordWebhook, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'SOM Inbox', embeds: [summaryEmbed] }),
@@ -386,6 +387,7 @@ test(`Inbox Follow-up — Board ${BOARD_ID} / @${IG_ACCOUNT}`, async ({ page, co
     };
 
     try {
+      if (!discordWebhook) throw new Error('no Discord webhook configured (DISCORD_TASK_WEBHOOK_URL)');
       const res = await fetch(discordWebhook, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
