@@ -8,6 +8,7 @@
 const fs = require('fs')
 const path = require('path')
 const { getLocatorForElement } = require('./dom-extractor')
+const { navigationAllowed, safeOutputPath } = require('./untrusted')
 
 /**
  * Execute a single action on the page.
@@ -17,7 +18,7 @@ const { getLocatorForElement } = require('./dom-extractor')
  * @param {string} outputDir - path to .output/ for saving files
  * @returns {{ ok: boolean, message: string, done?: boolean, result?: string, error?: string }}
  */
-async function executeAction(page, action, dom, outputDir) {
+async function executeAction(page, action, dom, outputDir, opts = {}) {
   const type = action.type?.toLowerCase()
 
   switch (type) {
@@ -64,16 +65,10 @@ async function executeAction(page, action, dom, outputDir) {
 
     case 'navigate': {
       if (!action.url) return { ok: false, message: 'No URL provided for navigate action' }
-      // Security: check domain allowlist
-      const allowed = process.env.ALLOWED_DOMAINS
-      if (allowed) {
-        const allowedList = allowed.split(',').map(d => d.trim().replace('*.', ''))
-        const urlHost = new URL(action.url).hostname
-        const domainAllowed = allowedList.some(d => urlHost === d || urlHost.endsWith('.' + d))
-        if (!domainAllowed) {
-          return { ok: false, message: `Domain ${urlHost} not in allowed list: ${allowed}` }
-        }
-      }
+      // Security (#185962): http(s) only, and stay on the task's own site unless the operator widened
+      // it — ALLOWED_DOMAINS still wins when set. A page cannot talk the agent into leaving.
+      const verdict = navigationAllowed(action.url, opts.nav || {})
+      if (!verdict.ok) return { ok: false, message: verdict.reason }
       await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 15000 })
       return { ok: true, message: `Navigated to ${action.url}` }
     }
@@ -89,8 +84,10 @@ async function executeAction(page, action, dom, outputDir) {
       if (!data) return { ok: false, message: 'No data extracted' }
 
       // Optionally save to file
-      if (action.save_as && outputDir) {
-        const filePath = path.join(outputDir, action.save_as)
+      if (action.save_as) {
+        // Only inside the task's output folder (#185962) — save_as came from the model, which reads the page.
+        const filePath = safeOutputPath(outputDir, action.save_as)
+        if (!filePath) return { ok: false, message: `Refused to save to "${action.save_as}": files may only be written inside the task output folder` }
         fs.mkdirSync(path.dirname(filePath), { recursive: true })
         fs.writeFileSync(filePath, typeof data === 'string' ? data : JSON.stringify(data, null, 2))
       }
@@ -102,8 +99,10 @@ async function executeAction(page, action, dom, outputDir) {
 
     case 'screenshot': {
       const filename = action.save_as || `step-screenshot.png`
-      const filePath = outputDir ? path.join(outputDir, filename) : filename
-      if (outputDir) fs.mkdirSync(path.dirname(filePath), { recursive: true })
+      // Only inside the task's output folder (#185962). With no folder it used to write into the cwd.
+      const filePath = safeOutputPath(outputDir, filename)
+      if (!filePath) return { ok: false, message: `Refused to save screenshot "${filename}": no task output folder, or the name leaves it` }
+      fs.mkdirSync(path.dirname(filePath), { recursive: true })
       await page.screenshot({ path: filePath, fullPage: action.full_page || false })
       return { ok: true, message: `Screenshot saved: ${filename}` }
     }
