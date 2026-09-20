@@ -129,6 +129,7 @@ async function main() {
     result: result.result,
     error: result.error,
     steps: result.steps,
+    usage: result.usage,
     history: result.history,
     url: page.url(),
     title: await page.title().catch(() => ''),

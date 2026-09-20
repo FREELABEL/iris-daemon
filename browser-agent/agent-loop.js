@@ -10,6 +10,9 @@ const { executeAction } = require('./action-executor')
 const { SECURITY_RULES, fencePageContent, hostOf } = require('./untrusted')
 
 const DEFAULT_MAX_STEPS = 15
+const { addUsage, emptyUsage } = require('./usage')
+const { parseAction } = require('./parse-action')
+
 const DEFAULT_MODEL = 'gpt-4o-mini'
 
 /**
@@ -67,7 +70,9 @@ What is the next action? Respond with ONE JSON object only.`
         { role: 'user', content: userMessage },
       ],
       temperature: 0.1,
-      max_tokens: 200,
+      // A reasoning model spends this budget THINKING and answers with nothing: measured
+      // 2026-09-20, qwen3:4b returned six empty replies at 200. Raise it for those models.
+      max_tokens: Number(process.env.BROWSER_AGENT_MAX_TOKENS) || 200,
     }),
   })
 
@@ -77,21 +82,18 @@ What is the next action? Respond with ONE JSON object only.`
   }
 
   const data = await response.json()
+  // The caller adds this up: a step is not a unit of cost (the whole DOM is in every prompt).
+  const usage = data.usage
   const content = data.choices?.[0]?.message?.content?.trim()
   if (!content) throw new Error('Empty LLM response')
 
-  // Parse JSON from response (strip markdown fences if present)
-  let cleaned = content
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '')
+  // Thinking, fences, prose — see parse-action.js.
+  const action = parseAction(content)
+  if (!action) {
+    console.error(`[agent] Failed to parse LLM response: ${content.slice(0, 200)}`)
+    return { type: 'fail', reason: `Could not parse LLM response: ${content.slice(0, 100)}`, _usage: usage }
   }
-
-  try {
-    return JSON.parse(cleaned)
-  } catch (e) {
-    console.error(`[agent] Failed to parse LLM response: ${content}`)
-    return { type: 'fail', reason: `Could not parse LLM response: ${content.slice(0, 100)}` }
-  }
+  return { ...action, _usage: usage }
 }
 
 /**
@@ -99,7 +101,7 @@ What is the next action? Respond with ONE JSON object only.`
  * @param {import('playwright').Page} page
  * @param {object} task - { prompt, title, config }
  * @param {object} options - { maxSteps, model, outputDir }
- * @returns {{ success: boolean, result?: string, error?: string, steps: number, history: string[] }}
+ * @returns {{ success: boolean, result?: string, error?: string, steps: number, history: string[], usage: {calls:number,promptTokens:number,completionTokens:number,callsWithoutUsage:number} }}
  */
 async function agentLoop(page, task, options = {}) {
   const maxSteps = options.maxSteps || task.config?.max_steps || DEFAULT_MAX_STEPS
@@ -107,6 +109,8 @@ async function agentLoop(page, task, options = {}) {
   const outputDir = options.outputDir || process.env.OUTPUT_DIR
 
   const history = []
+  // What the run spent, from what the API reported — see usage.js.
+  let usage = emptyUsage()
   // The site this task starts on bounds where it may navigate (#185962) — see untrusted.js.
   const nav = {
     startHost: hostOf(task.config?.url) || hostOf(typeof page.url === 'function' ? page.url() : null),
@@ -138,6 +142,7 @@ async function agentLoop(page, task, options = {}) {
     let action
     try {
       action = await decideAction(task, domText, history, step, model)
+      usage = addUsage(usage, action?._usage)
       console.log(`[agent] Action: ${JSON.stringify(action)}`)
     } catch (e) {
       console.error(`[agent] LLM decision failed: ${e.message}`)
@@ -158,10 +163,10 @@ async function agentLoop(page, task, options = {}) {
 
       if (result.done) {
         if (result.result) {
-          return { success: true, result: result.result, steps: step + 1, history }
+          return { success: true, result: result.result, steps: step + 1, history, usage }
         }
         if (result.error) {
-          return { success: false, error: result.error, steps: step + 1, history }
+          return { success: false, error: result.error, steps: step + 1, history, usage }
         }
       }
 
@@ -180,7 +185,7 @@ async function agentLoop(page, task, options = {}) {
     }
   }
 
-  return { success: false, error: `Max steps (${maxSteps}) reached`, steps: maxSteps, history }
+  return { success: false, error: `Max steps (${maxSteps}) reached`, steps: maxSteps, history, usage }
 }
 
 module.exports = { agentLoop }
