@@ -105,16 +105,32 @@ async function extractDOM(page) {
     _index: i,
   }))
 
-  return { url, title, elements: indexed }
+  // THE PAGE ITSELF. Without this the snapshot is a list of things to click, and a page of prose
+  // arrives as "(no interactive elements found)" — the agent cannot answer a question about
+  // content it was never shown (#186360). Bounded: this goes into every prompt.
+  const text = await page
+    .evaluate(() => (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim())
+    .catch(() => '')
+
+  return { url, title, elements: indexed, text }
 }
 
 /**
  * Format DOM snapshot as a string for LLM consumption.
  */
-function formatDOM(dom) {
+const DEFAULT_TEXT_CHARS = Number(process.env.BROWSER_AGENT_TEXT_CHARS) || 3000
+
+function formatDOM(dom, opts = {}) {
+  const limit = opts.textChars ?? DEFAULT_TEXT_CHARS
   const lines = []
   lines.push(`URL: ${dom.url}`)
   lines.push(`Title: ${dom.title}`)
+  if (dom.text) {
+    const shown = String(dom.text).slice(0, limit)
+    lines.push('')
+    lines.push(`Page text (first ${shown.length} characters${String(dom.text).length > limit ? ', truncated' : ''}):`)
+    lines.push(shown)
+  }
   lines.push('')
   lines.push('Interactive elements:')
 
@@ -183,4 +199,4 @@ async function getLocatorForElement(page, dom, elementId) {
   return handle.asElement()
 }
 
-module.exports = { extractDOM, formatDOM, getLocatorForElement }
+module.exports = { extractDOM, formatDOM, getLocatorForElement, DEFAULT_TEXT_CHARS }

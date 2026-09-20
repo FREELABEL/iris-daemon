@@ -92,8 +92,10 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
         fs.writeFileSync(filePath, typeof data === 'string' ? data : JSON.stringify(data, null, 2))
       }
 
-      // Truncate for log output
-      const preview = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data).slice(0, 200)
+      // The text goes BACK TO THE MODEL (history-entry.js bounds it), so 200 chars is too little
+      // to answer a question with — that cap is why an extract taught the agent nothing (#186360).
+      const cap = Number(process.env.BROWSER_AGENT_EXTRACT_CHARS) || 4000
+      const preview = typeof data === 'string' ? data.slice(0, cap) : JSON.stringify(data).slice(0, cap)
       return { ok: true, message: `Extracted ${data.length} chars`, data: preview }
     }
 

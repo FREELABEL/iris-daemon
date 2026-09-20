@@ -12,6 +12,7 @@ const { SECURITY_RULES, fencePageContent, hostOf } = require('./untrusted')
 const DEFAULT_MAX_STEPS = 15
 const { addUsage, emptyUsage } = require('./usage')
 const { parseAction } = require('./parse-action')
+const { historyEntry } = require('./history-entry')
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
 
@@ -154,8 +155,8 @@ async function agentLoop(page, task, options = {}) {
     // ACT
     try {
       const result = await executeAction(page, action, dom, outputDir, { nav })
-      const entry = `${action.type}${action.element ? ' ' + action.element : ''}${action.text ? ' "' + action.text.slice(0, 30) + '"' : ''}${action.url ? ' ' + action.url : ''} → ${result.message}`
-      history.push(entry)
+      // Includes what an extract actually FOUND — see history-entry.js.
+      history.push(historyEntry(action, result))
       console.log(`[agent] Result: ${result.message}`)
       // A task that started on a blank page has no site yet: the first one it reaches becomes the
       // boundary, so a page later in the run cannot send it somewhere else (#185962).
@@ -170,11 +171,7 @@ async function agentLoop(page, task, options = {}) {
         }
       }
 
-      if (!result.ok) {
-        console.warn(`[agent] Action failed: ${result.message}`)
-        // Append failure context so LLM can adapt on next step
-        history[history.length - 1] += ' [FAILED - try a different approach]'
-      }
+      if (!result.ok) console.warn(`[agent] Action failed: ${result.message}`)
 
       // Brief pause between actions
       await page.waitForTimeout(500)
