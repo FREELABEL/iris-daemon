@@ -61,4 +61,20 @@ function parseAction(content) {
   }
 }
 
-module.exports = { parseAction }
+/**
+ * Why a reply came back empty, in words an operator can act on.
+ *
+ * A reasoning model answers in two parts: it thinks, then it replies. When the thinking fills the
+ * whole budget there is no reply left — measured 2026-09-20, qwen3:4b spent 704 of 1200 tokens
+ * thinking about a BLANK page, then returned nothing at all once a real page was in the prompt.
+ * "Empty LLM response" is true and useless; the completion count is the evidence.
+ */
+function emptyReplyMessage(usage, maxTokens) {
+  const used = typeof usage?.completion_tokens === "number" ? usage.completion_tokens : null
+  if (used !== null && maxTokens && used >= maxTokens * 0.95) {
+    return `The model used its whole reply budget thinking (${used} of ${maxTokens} tokens) and never answered. Raise BROWSER_AGENT_MAX_TOKENS, or use a model that thinks less.`
+  }
+  return `The model returned an empty reply${used !== null ? ` after ${used} token(s)` : ""}.`
+}
+
+module.exports = { parseAction, emptyReplyMessage }

@@ -11,7 +11,7 @@ const { SECURITY_RULES, fencePageContent, hostOf } = require('./untrusted')
 
 const DEFAULT_MAX_STEPS = 15
 const { addUsage, emptyUsage } = require('./usage')
-const { parseAction } = require('./parse-action')
+const { parseAction, emptyReplyMessage } = require('./parse-action')
 const { historyEntry } = require('./history-entry')
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
@@ -57,6 +57,7 @@ ${fencePageContent(domText)}
 ${stepHistory.length > 0 ? `PREVIOUS ACTIONS:\n${stepHistory.map((h, i) => `  ${i + 1}. ${h}`).join('\n')}\n` : ''}
 What is the next action? Respond with ONE JSON object only.`
 
+  const maxTokens = Number(process.env.BROWSER_AGENT_MAX_TOKENS) || 200
   const baseUrl = process.env.OPENAI_API_BASE || 'https://api.openai.com/v1'
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
@@ -73,7 +74,7 @@ What is the next action? Respond with ONE JSON object only.`
       temperature: 0.1,
       // A reasoning model spends this budget THINKING and answers with nothing: measured
       // 2026-09-20, qwen3:4b returned six empty replies at 200. Raise it for those models.
-      max_tokens: Number(process.env.BROWSER_AGENT_MAX_TOKENS) || 200,
+      max_tokens: maxTokens,
     }),
   })
 
@@ -86,7 +87,7 @@ What is the next action? Respond with ONE JSON object only.`
   // The caller adds this up: a step is not a unit of cost (the whole DOM is in every prompt).
   const usage = data.usage
   const content = data.choices?.[0]?.message?.content?.trim()
-  if (!content) throw new Error('Empty LLM response')
+  if (!content) throw new Error(emptyReplyMessage(usage, maxTokens))
 
   // Thinking, fences, prose — see parse-action.js.
   const action = parseAction(content)
