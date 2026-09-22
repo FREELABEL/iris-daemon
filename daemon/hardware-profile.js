@@ -201,6 +201,59 @@ function detectGPU () {
   return result
 }
 
+// Last access-proven GPU answer, and when it was taken. Re-probed at most this often so the
+// heartbeat stays cheap without going stale the way the 24h profile cache does.
+const GPU_CAPABILITY_TTL_MS = 5 * 60 * 1000
+let _gpuCapability = null
+let _gpuCapabilityAt = 0
+
+/**
+ * Is there a GPU this node can actually USE — proven by the driver answering?
+ *
+ * Deliberately NOT `detectProfile().gpu.available`, for two reasons:
+ *
+ *   1. That profile is cached for 24 hours and only sent on the STARTUP heartbeat, so an eGPU
+ *      unplugged at noon would still be advertised at midnight.
+ *   2. It is a detection, and detection answers "does a device exist". Routing needs "can work
+ *      run here" — advertise a capability on evidence of ACCESS, never of EXISTENCE (#182020).
+ *      A node once advertised Full Disk Access because `existsSync()` returned true; existsSync
+ *      is a stat, TCC blocks the open, and the scripts that needed it returned zero rows — a
+ *      legitimate-looking answer to many questions.
+ *
+ * `nvidia-smi --query-gpu` cannot answer without a working driver, so Linux/Windows NVIDIA is
+ * access-proven. On macOS the Metal line is the OS's own Metal stack replying, which is the
+ * strongest probe available without compiling a shader. Windows Intel/AMD via
+ * Win32_VideoController is an inventory listing and proves nothing usable, so it reports FALSE
+ * here even though detectGPU() lists it — a node that cannot prove it stays out of the routing.
+ *
+ * Anything else — no GPU, no driver, a probe that threw, a probe that timed out — is false.
+ * "We could not tell" must never route work here.
+ */
+function gpuCapability ({ force = false } = {}) {
+  const now = Date.now()
+  if (!force && _gpuCapability !== null && (now - _gpuCapabilityAt) < GPU_CAPABILITY_TTL_MS) {
+    return _gpuCapability
+  }
+
+  let proven = false
+  try {
+    if (os.platform() === 'darwin') {
+      const output = execSync('system_profiler SPDisplaysDataType 2>/dev/null', { encoding: 'utf-8', timeout: 8000 })
+      proven = /metal/i.test(output)
+    } else {
+      const nullDev = os.platform() === 'win32' ? '2>nul' : '2>/dev/null'
+      const output = execSync(`nvidia-smi --query-gpu=name --format=csv,noheader ${nullDev}`, { encoding: 'utf-8', timeout: 8000 })
+      proven = output.trim().length > 0
+    }
+  } catch {
+    proven = false
+  }
+
+  _gpuCapability = proven
+  _gpuCapabilityAt = now
+  return proven
+}
+
 /**
  * Check if Ollama is running and what models are available.
  */
@@ -350,4 +403,4 @@ function getCachedProfile () {
   return null
 }
 
-module.exports = { detectProfile, getCachedProfile, detectAppleApps, CACHE_PATH }
+module.exports = { detectProfile, getCachedProfile, detectAppleApps, gpuCapability, CACHE_PATH }

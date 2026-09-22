@@ -102,6 +102,35 @@ async function main () {
         assert(typeof mod.CACHE_PATH === 'string', 'CACHE_PATH should be a string')
       })
 
+      await runTest(results, 'hardware-profile: gpuCapability() answers a boolean, cheaply', async () => {
+        const mod = require('./daemon/hardware-profile')
+        assert(typeof mod.gpuCapability === 'function', 'gpuCapability should be exported — the heartbeat calls it')
+
+        const t0 = Date.now()
+        const proven = mod.gpuCapability({ force: true })
+        const coldMs = Date.now() - t0
+
+        // An absent answer must never reach the cloud as "maybe": the mirror clears on anything
+        // that is not exactly true, and routing needs that to be a decision, not a gap.
+        assert(typeof proven === 'boolean', 'gpuCapability must answer true or false')
+        assert(coldMs < 8000, `probe should finish inside its own timeout, took ${coldMs}ms`)
+
+        const t1 = Date.now()
+        const cached = mod.gpuCapability()
+        assert(cached === proven, 'the cached answer should match the probe')
+        assert(Date.now() - t1 < 50, 'the cached answer should be immediate, so a heartbeat costs nothing')
+
+        // profile.gpu is a SPEC SHEET — cached 24h, sent once at startup. It may legitimately
+        // claim a device the capability refuses to prove (Windows integrated adapters), but never
+        // the reverse: access cannot be proven for a device that was never detected.
+        const profile = await mod.detectProfile()
+        if (proven) assert(profile.gpu.available === true, 'a proven GPU must also appear in the profile')
+
+        if (config.verbose) {
+          console.log(`    ${DIM}GPU routable: ${proven} (cold ${coldMs}ms)${RESET}`)
+        }
+      })
+
       await runTest(results, 'hardware-profile: detectProfile() returns valid structure', async () => {
         const { detectProfile } = require('./daemon/hardware-profile')
         const profile = await detectProfile()

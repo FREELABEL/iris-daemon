@@ -446,6 +446,22 @@ class Daemon {
           return null
         }
       })(),
+      // Hardware the cloud may ROUTE on, as opposed to hardware it merely displays. The GPU in
+      // `hardware_profile` is detected once at startup and cached for 24h, which is fine for a
+      // spec sheet and wrong for a routing decision; this is probed on the heartbeat and proven
+      // by the driver answering (#182020). Mirrored into `capabilities` server-side, so
+      // `--requires gpu` finally matches something.
+      hardware_capabilities: (() => {
+        try {
+          return { gpu: require('./hardware-profile').gpuCapability() }
+        } catch (e) {
+          // Same rule as the probes above: never take the heartbeat down over a capability.
+          // null clears the flag server-side, which is the safe direction — a node that cannot
+          // prove a GPU stops receiving GPU work.
+          console.error(`[heartbeat] gpu capability probe failed: ${e.message}`)
+          return null
+        }
+      })(),
       // Power/load truth so the cloud can SEE which nodes are on battery / hibernating and
       // route heavy (browser) work to AC-powered nodes. The daemon already computes this for
       // its own battery-aware throttling; we just surface it. Additive — no behavior change.
