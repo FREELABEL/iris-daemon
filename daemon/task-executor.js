@@ -222,7 +222,7 @@ function resolveDaemonIdentity () {
   }
   _daemonIdentity = {
     userId: userId ? String(userId) : '1',
-    token,
+    token: token || null,
   }
   return _daemonIdentity
 }
