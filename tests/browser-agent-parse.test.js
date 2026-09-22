@@ -55,3 +55,52 @@ describe('parseAction', () => {
     assert.equal(parseAction('[{"type":"click"}]'), null)
   })
 })
+
+/**
+ * Measured 2026-09-20: after two successful extracts, qwen3:4b replied {"action":"extract"} twice.
+ * The loop answered "Unknown action type: undefined" and burned the rest of its steps on it. The
+ * model named the same action with the wrong key — a shape it uses consistently, not a typo.
+ */
+describe('parseAction: the key the model used', () => {
+  it('"action" is accepted as the name of the action', () => {
+    assert.deepEqual(parseAction('{"action":"extract","selector":"table"}'), { type: 'extract', selector: 'table' })
+  })
+
+  it('an explicit "type" wins when both are present', () => {
+    assert.equal(parseAction('{"type":"done","action":"click"}').type, 'done')
+  })
+
+  it('an object with neither is not given a type it did not ask for', () => {
+    assert.equal(parseAction('{"selector":"table"}').type, undefined)
+  })
+
+  it('the rest of the object survives the rename', () => {
+    assert.deepEqual(parseAction('{"action":"done","result":"67"}'), { type: 'done', result: '67' })
+  })
+})
+
+/**
+ * "answer" is a way of finishing. Measured 2026-09-20: qwen3:4b found kimi-k3's Mean with `find`,
+ * then replied {"type":"answer","answer":"67"} — the right number — and the loop recorded
+ * "Unknown action type: answer" until the step cap scored the run a failure.
+ */
+describe('parseAction — a finishing answer under another name', () => {
+  it('reads {"type":"answer","answer":...} as done with that result', () => {
+    assert.deepEqual(parseAction('{"type":"answer","answer":"67"}'), { type: 'done', result: '67' })
+  })
+  it('accepts final_answer and a result field too', () => {
+    assert.deepEqual(parseAction('{"type":"final_answer","result":"67"}'), { type: 'done', result: '67' })
+  })
+  it('reads the number under "value" — measured run 2, {"type":"answer","value":67}', () => {
+    assert.deepEqual(parseAction('{"type":"answer","value":67}'), { type: 'done', result: '67' })
+  })
+  it('keeps a numeric answer as text', () => {
+    assert.deepEqual(parseAction('{"type":"answer","answer":67}'), { type: 'done', result: '67' })
+  })
+  it('does not turn an answer with nothing in it into done', () => {
+    assert.equal(parseAction('{"type":"answer"}').type, 'answer')
+  })
+  it('leaves done alone', () => {
+    assert.deepEqual(parseAction('{"type":"done","result":"x"}'), { type: 'done', result: 'x' })
+  })
+})

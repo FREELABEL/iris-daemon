@@ -73,3 +73,36 @@ describe('what a step tells the model afterwards', () => {
     assert.match(historyEntry({ type: "click", element: "@9" }, { ok: false, message: "Element @9 not found" }), /\[FAILED/)
   })
 })
+
+/**
+ * Measured 2026-09-20, after the alias fix: told to extract, qwen3:4b extracted the WHOLE page
+ * three times in a row. Each time it got back the first 600 characters — the bound — which did not
+ * contain what it was looking for, so the same action looked worth repeating. The history said
+ * "…[truncated]" and nothing about what to do instead.
+ */
+describe('an extract that came back cut short', () => {
+  const big = 'x'.repeat(5000)
+
+  it('says the text was cut AND how to get the part you want', () => {
+    const e = historyEntry({ type: 'extract' }, { ok: true, message: 'Extracted 12387 chars', data: big }, { dataChars: 300 })
+    assert.match(e, /truncated/i)
+    assert.match(e, /selector/i)
+  })
+
+  it('an extract that fit is not given advice it does not need', () => {
+    const e = historyEntry({ type: 'extract' }, { ok: true, message: 'Extracted 40 chars', data: 'kimi-k3 67' })
+    assert.doesNotMatch(e, /selector/i)
+  })
+
+  it('repeating the same action with the same result is named as such', () => {
+    const prev = [historyEntry({ type: 'extract' }, { ok: true, message: 'Extracted 12387 chars', data: big }, { dataChars: 300 })]
+    const e = historyEntry({ type: 'extract' }, { ok: true, message: 'Extracted 12387 chars', data: big }, { dataChars: 300, history: prev })
+    assert.match(e, /same (result|as)/i)
+  })
+
+  it('a different action after a repeat is not accused of repeating', () => {
+    const prev = [historyEntry({ type: 'extract' }, { ok: true, message: 'Extracted 12387 chars', data: big }, { dataChars: 300 })]
+    const e = historyEntry({ type: 'extract', selector: 'table' }, { ok: true, message: 'Extracted 837 chars', data: 'MODEL · LANE' }, { history: prev })
+    assert.doesNotMatch(e, /same result/i)
+  })
+})

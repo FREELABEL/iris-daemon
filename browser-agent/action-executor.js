@@ -9,6 +9,7 @@ const fs = require('fs')
 const path = require('path')
 const { getLocatorForElement } = require('./dom-extractor')
 const { navigationAllowed, safeOutputPath } = require('./untrusted')
+const { findInText } = require('./find-in-text')
 
 /**
  * Execute a single action on the page.
@@ -71,6 +72,19 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
       if (!verdict.ok) return { ok: false, message: verdict.reason }
       await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 15000 })
       return { ok: true, message: `Navigated to ${action.url}` }
+    }
+
+    // SEARCH the page rather than read it from the top. Every long-page failure measured on
+    // 2026-09-20 was a window problem: the agent could not ask WHERE something was (#186360).
+    case 'find': {
+      const page_text = await page.evaluate(() => document.body?.innerText || '').catch(() => '')
+      let found
+      try {
+        found = findInText(page_text, action.text ?? action.query ?? action.selector)
+      } catch (e) {
+        return { ok: false, message: e.message }
+      }
+      return { ok: true, message: `find "${action.text ?? action.query ?? ''}" — ${found.matches} match(es)`, data: found.text }
     }
 
     case 'extract': {

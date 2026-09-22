@@ -36,6 +36,20 @@ function firstObject(text) {
   return null
 }
 
+/**
+ * "answer" is a way of finishing. Measured 2026-09-20: qwen3:4b found the number it was sent for,
+ * replied {"type":"answer","answer":"67"}, and the loop called it an unknown action until the step
+ * cap scored a correct run as a failure. Only with something in it — an empty answer is not done.
+ */
+const ANSWER_TYPES = new Set(["answer", "final_answer", "final", "respond", "response"])
+
+function finishingAnswer(action) {
+  if (!ANSWER_TYPES.has(String(action.type).toLowerCase())) return action
+  const value = action.answer ?? action.result ?? action.value ?? action.text ?? action.response
+  if (value === undefined || value === null || String(value).trim() === "") return action
+  return { type: "done", result: String(value) }
+}
+
 function parseAction(content) {
   if (typeof content !== "string") return null
   let text = content.trim()
@@ -55,7 +69,16 @@ function parseAction(content) {
   if (!obj) return null
   try {
     const parsed = JSON.parse(obj)
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+    // The model named the action under "action" instead of "type" — measured 2026-09-20, qwen3:4b
+    // did it twice in a row after a successful extract, and each one cost a step to
+    // "Unknown action type: undefined". A defined alias, not a guess: an explicit type wins.
+    let out = parsed
+    if (parsed.type === undefined && typeof parsed.action === "string") {
+      const { action, ...rest } = parsed
+      out = { type: action, ...rest }
+    }
+    return finishingAnswer(out)
   } catch {
     return null
   }
