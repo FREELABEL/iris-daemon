@@ -73,7 +73,7 @@ async function getIsolationState () {
  *
  * Add a type here whenever you add one that carries structured config.
  */
-const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use'])
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use', 'llm_infer'])
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -1060,13 +1060,17 @@ class TaskExecutor {
     console.log(`[executor]   Node:     ${nodeId}`)
     console.log(`[executor]   Timeout:  ${timeoutSec}s`)
     console.log(`[executor]   Created:  ${createdAt}${age ? ` (${age}s ago)` : ''}`)
-    if (task.config) {
+    // llm_infer carries chat messages that may be sensitive: log key names only, never values.
+    const _redactTaskContent = task.type === 'llm_infer'
+    if (task.config && typeof task.config === 'object') {
       const configKeys = Object.keys(task.config).filter(k => !['timeout_seconds'].includes(k))
       if (configKeys.length > 0) {
-        console.log(`[executor]   Config:   ${configKeys.map(k => `${k}=${JSON.stringify(task.config[k]).substring(0, 40)}`).join(', ')}`)
+        console.log(`[executor]   Config:   ${_redactTaskContent
+          ? configKeys.join(', ') + ' (values redacted)'
+          : configKeys.map(k => `${k}=${JSON.stringify(task.config[k]).substring(0, 40)}`).join(', ')}`)
       }
     }
-    if (task.prompt) {
+    if (task.prompt && !_redactTaskContent) {
       console.log(`[executor]   Prompt:   ${task.prompt.substring(0, 80)}${task.prompt.length > 80 ? '…' : ''}`)
     }
 
@@ -1274,6 +1278,20 @@ class TaskExecutor {
       outputStream.stop().catch(() => {})
         const m = payload.metadata || {}
         console.log(`[browser-use] ${task.prompt.split(' ')[0]} → ${payload.status}  run=${m.run_ms ?? '-'}ms  upload=${m.upload_ms ?? '-'}ms${payload.error ? '  ' + payload.error : ''}`)
+        await this.cloud.submitResult(taskId, payload)
+        return
+      }
+
+      // ── Short-circuit: llm_infer — one chat completion on this node's loopback Mesh LLM ──
+      //
+      // Logic lives in mesh-llm.js so its tests run the SAME code this calls. The target is
+      // always 127.0.0.1:$IRIS_MESH_API_PORT; a config naming another host is refused there.
+      // Result `data` is the contract shape: { ok, response, latency_ms } | { ok:false, error }.
+      if (task.type === 'llm_infer') {
+        const { runLlmInfer } = require('./mesh-llm')
+        const payload = await runLlmInfer(task)
+        clearInterval(progressInterval)
+      outputStream.stop().catch(() => {})
         await this.cloud.submitResult(taskId, payload)
         return
       }

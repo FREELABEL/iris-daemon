@@ -430,7 +430,20 @@ class Daemon {
       // into capabilities and routes the type only to nodes that report it true.
       task_capabilities: (() => {
         try {
-          return { browser_use: require('./browser-use-task').browserUseCapability() }
+          return {
+            browser_use: require('./browser-use-task').browserUseCapability(),
+            // llm_mesh / llm_mesh_models (epic #187246): a loopback probe of the Mesh LLM engine,
+            // cached 60s and refreshed in the background — the heartbeat never waits on it. Absent
+            // until the first probe lands, false while the engine is down or has no model loaded.
+            ...(() => {
+              try {
+                return require('./mesh-llm').meshCapability()
+              } catch (e) {
+                console.error(`[heartbeat] llm_mesh capability probe failed: ${e.message}`)
+                return {}
+              }
+            })()
+          }
         } catch (e) {
           console.error(`[heartbeat] task capability probe failed: ${e.message}`)
           return null
