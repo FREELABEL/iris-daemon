@@ -109,6 +109,9 @@ describe('local model seam — request and response', () => {
     assert.match(parseLocalLlmResponse(starved).error, /ran out of tokens before answering — the budget went on reasoning/)
     assert.match(parseLocalLlmResponse('{"choices":[{"message":{"content":"  "},"finish_reason":"length"}]}').error, /raise max_tokens/)
     assert.equal(parseLocalLlmResponse('{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}').error, 'returned an empty answer')
+    // Shape measured from MeshLLM 0.77 serving qwen3:4b with max_tokens 300: null, not "".
+    const meshStarved = '{"choices":[{"finish_reason":"length","index":0,"message":{"content":null,"reasoning_content":"Okay, the user sent"}}]}'
+    assert.match(parseLocalLlmResponse(meshStarved).error, /budget went on reasoning/)
   })
 
   it('unrecognised output is left alone', () => {

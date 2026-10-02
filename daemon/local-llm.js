@@ -114,7 +114,9 @@ function parseLocalLlmResponse (raw) {
   }
   const choice = parsed?.choices?.[0]
   if (choice) {
-    const content = choice.message?.content ?? choice.text
+    // MeshLLM sends `content: null` (with `reasoning_content`) where Ollama sends "" — both
+    // are a missing answer, not an unrecognised body.
+    const content = choice.message ? (choice.message.content ?? '') : choice.text
     if (typeof content === 'string') {
       // An empty answer is a failure, not a result. Measured on qwen3:8b under Ollama /v1 with
       // max_tokens 60: content "", finish_reason "length", the whole budget spent in a separate
