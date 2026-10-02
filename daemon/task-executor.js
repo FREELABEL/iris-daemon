@@ -49,6 +49,7 @@ const { shellFor, scriptFor, pathDelimiterFor, describeSpawnFailure, interpreter
 const { planScriptExecution, nodePolicyFromEnv } = require('./sandbox')
 const { materialiseAssets } = require('./script-assets')
 const { probeIsolation } = require('./permission-probe')
+const localLlm = require('./local-llm')
 
 // `docker info` runs synchronously (up to 5s) and blocks the event loop, so measure at most once a
 // minute. A stale answer only decides host-vs-sandbox for the next run; a re-probe fixes it.
@@ -4725,6 +4726,9 @@ exit 1
       // incomplete rather than as working code (#185143's first patch fixed a
       // function the failing path never called; this is the same trap).
       let cmd, args, spawnOptions
+      // local_llm only: the request body goes on stdin, and the resolved server travels with it.
+      let stdinPayload = null
+      let llmConfig = null
 
       switch (runtime) {
         case 'claude_code':
@@ -4743,20 +4747,12 @@ exit 1
           break
 
         case 'local_llm': {
-          // HTTP request to local Ollama server — use curl to stream
-          const model = task.model || task.config?.model || 'qwen3:8b'
-          const payload = JSON.stringify({
-            model,
-            prompt: task.prompt,
-            stream: false
-          })
+          // Any OpenAI-compatible server on this node — Ollama by default, MeshLLM / LM Studio /
+          // vLLM via LOCAL_LLM_BASE_URL. The URL is the node's to choose, never the task's.
+          llmConfig = localLlm.resolveLocalLlmConfig(task)
+          stdinPayload = JSON.stringify(localLlm.buildChatBody(task, llmConfig))
           cmd = 'curl'
-          args = [
-            '-s', '-X', 'POST',
-            'http://localhost:11434/api/generate',
-            '-H', 'Content-Type: application/json',
-            '-d', payload
-          ]
+          args = localLlm.buildCurlArgs(llmConfig)
           break
         }
 
@@ -4804,6 +4800,11 @@ exit 1
       child._taskTitle = task.title || task.type
       child._taskType = task.type
       this.runningTasks.set(task.id, child)
+
+      if (stdinPayload !== null) {
+        child.stdin.on('error', () => { /* curl exited before reading — its exit code says why */ })
+        child.stdin.end(stdinPayload)
+      }
 
       child.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(Boolean)
@@ -4853,16 +4854,26 @@ exit 1
       child.on('close', (code) => {
         clearTimeout(timer)
 
-        // For local_llm, parse the JSON response from Ollama
-        if (runtime === 'local_llm' && code === 0 && outputLines.length > 0) {
-          try {
-            const lastLine = outputLines[outputLines.length - 1]
-            const parsed = JSON.parse(lastLine)
-            if (parsed.response) {
-              // Replace raw JSON with the actual model response
-              outputLines[outputLines.length - 1] = parsed.response
+        if (runtime === 'local_llm') {
+          if (code !== 0) {
+            const why = localLlm.describeCurlExit(code, llmConfig)
+            if (why) return reject(new Error(why))
+          } else {
+            // Parse the whole body, not the last line — a server that pretty-prints its JSON
+            // spreads one response over many lines.
+            const reply = localLlm.parseLocalLlmResponse(stdoutLines.join('\n'))
+            if (reply.error) {
+              return reject(new Error(`Local model server at ${llmConfig.baseUrl} failed (${llmConfig.model}): ${reply.error}`))
             }
-          } catch { /* output as-is if not valid JSON */ }
+            if (reply.content !== null) {
+              // Swap the raw JSON for the answer itself.
+              for (const line of stdoutLines) {
+                const at = outputLines.lastIndexOf(line)
+                if (at !== -1) outputLines.splice(at, 1)
+              }
+              outputLines.push(...reply.content.split('\n'))
+            }
+          }
         }
 
         if (code === 0) {

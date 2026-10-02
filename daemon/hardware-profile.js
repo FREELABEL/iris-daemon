@@ -13,6 +13,7 @@ const fs = require('fs')
 const path = require('path')
 const { execSync } = require('child_process')
 const http = require('http')
+const { probeLocalLlm } = require('./local-llm')
 
 const CACHE_PATH = path.join(os.homedir(), '.iris', 'hardware-profile.json')
 
@@ -24,8 +25,10 @@ const CACHE_PATH = path.join(os.homedir(), '.iris', 'hardware-profile.json')
  * That is exactly what happened with apple_apps — see detectAppleApps().
  *
  * 2 — apple_apps: look under /System/Applications (macOS 10.15+), not just /Applications.
+ * 3 — local_llm: probe the OpenAI-compatible server the node will actually call
+ *     (LOCAL_LLM_BASE_URL — Ollama, MeshLLM, LM Studio…), not only Ollama's native port.
  */
-const PROFILE_SCHEMA_VERSION = 2
+const PROFILE_SCHEMA_VERSION = 3
 
 /** Re-detect if the cache is older than this, so capability changes propagate. */
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
@@ -67,6 +70,8 @@ async function detectProfile (options = {}) {
     disk: detectDisk(),
     gpu: detectGPU(),
     ollama: await detectOllama(),
+    // What a local_llm task will hit. `ollama` above stays for the hub, which already reads it.
+    local_llm: await probeLocalLlm(),
     apple_apps: detectAppleApps(),
     node_version: process.version,
     hostname: os.hostname()
