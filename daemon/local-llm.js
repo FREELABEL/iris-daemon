@@ -185,7 +185,53 @@ function probeLocalLlm (env = process.env, { timeoutMs = 3000 } = {}) {
   })
 }
 
+/**
+ * What this node's local model server can answer for, kept fresh in the background.
+ *
+ * The heartbeat sends `report()` every beat so the hub can route a `local_llm` task to a node
+ * that can serve its model. Probed here, never inline: a heartbeat that waits on an HTTP call
+ * is a heartbeat that can make a healthy node look dead. `report()` is null until the first
+ * probe lands, and the caller OMITS the key then — absent means "no update", while an empty
+ * list would tell the hub this node serves nothing, which is not known yet.
+ */
+class LocalModelReporter {
+  constructor ({ env = process.env, intervalMs = 60000, probe = probeLocalLlm } = {}) {
+    this.env = env
+    this.intervalMs = intervalMs
+    this.probe = probe
+    this._report = null
+    this._timer = null
+  }
+
+  async refresh () {
+    try {
+      const p = await this.probe(this.env)
+      this._report = { available: p.available === true, server: p.server, models: p.models || [] }
+    } catch {
+      this._report = { available: false, server: null, models: [] }
+    }
+    return this._report
+  }
+
+  start () {
+    this.refresh()
+    this._timer = setInterval(() => this.refresh(), this.intervalMs)
+    if (this._timer.unref) this._timer.unref()
+    return this
+  }
+
+  stop () {
+    if (this._timer) clearInterval(this._timer)
+    this._timer = null
+  }
+
+  report () {
+    return this._report
+  }
+}
+
 module.exports = {
+  LocalModelReporter,
   DEFAULT_MODEL,
   resolveLocalLlmConfig,
   guessServer,

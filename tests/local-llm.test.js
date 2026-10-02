@@ -198,3 +198,36 @@ describe('local model seam — against a real server', () => {
     assert.equal(p.model_count, 0)
   })
 })
+
+describe('local model reporter — what the heartbeat sends', () => {
+  const { LocalModelReporter } = require('../daemon/local-llm')
+
+  it('reports nothing until the first probe lands, so the hub keeps what it knew', () => {
+    const r = new LocalModelReporter({ probe: () => new Promise(() => {}) })
+    assert.equal(r.report(), null)
+  })
+
+  it('reports the models the server listed', async () => {
+    const r = new LocalModelReporter({ probe: async () => ({ available: true, server: 'mesh-llm', models: ['a', 'mesh'], base_url: 'x' }) })
+    await r.refresh()
+    assert.deepEqual(r.report(), { available: true, server: 'mesh-llm', models: ['a', 'mesh'] })
+  })
+
+  it('a probe that throws reports an unavailable server, not a stale list', async () => {
+    let n = 0
+    const r = new LocalModelReporter({ probe: async () => { if (n++) throw new Error('boom'); return { available: true, server: 'ollama', models: ['a'] } } })
+    await r.refresh()
+    await r.refresh()
+    assert.deepEqual(r.report(), { available: false, server: null, models: [] })
+  })
+
+  it('against a real server: lists what /v1/models returns', async () => {
+    const srv = await fakeServer((req, res) => json(res, 200, { data: [{ id: 'qwen3:8b' }] }))
+    try {
+      const r = new LocalModelReporter({ env: { LOCAL_LLM_BASE_URL: srv.base } })
+      await r.refresh()
+      assert.deepEqual(r.report().models, ['qwen3:8b'])
+      assert.equal(r.report().available, true)
+    } finally { srv.server.close() }
+  })
+})

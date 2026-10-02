@@ -36,6 +36,8 @@ const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
+const { LocalModelReporter } = require('./local-llm')
+const { MeshLlmSupervisor } = require('./mesh-llm-supervisor')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
 const { runScript, clampTimeout } = require('./script-runner')
 const { tccFixOneLine } = require('./tcc-notice')
@@ -367,6 +369,17 @@ class Daemon {
       console.error(`[daemon] Exiting after ${mins}m with no successful heartbeat — launchd will restart this node.`)
       process.exit(1)
     }
+    // MeshLLM, if this node is configured to run it (HIVE_MESH_LLM in ~/.iris/bridge/.env).
+    // Started BEFORE the model reporter so its first probe already sees the mesh. A bad setting
+    // is logged and skipped — it must never take the node down with it.
+    try {
+      this.meshLlm = new MeshLlmSupervisor()
+      if (!this.meshLlm.start()) this.meshLlm = null
+    } catch (e) {
+      console.error(`[mesh-llm] not started: ${e.message}`)
+      this.meshLlm = null
+    }
+    this.localModels = new LocalModelReporter().start()
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
       // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup
@@ -463,6 +476,10 @@ class Daemon {
       // spec sheet and wrong for a routing decision; this is probed on the heartbeat and proven
       // by the driver answering (#182020). Mirrored into `capabilities` server-side, so
       // `--requires gpu` finally matches something.
+      // The models this node's local model server can answer for — Ollama's own, or every model
+      // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
+      // its model can run. From a background cache; omitted until the first probe lands.
+      ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
       hardware_capabilities: (() => {
         try {
           return { gpu: require('./hardware-profile').gpuCapability() }
@@ -2905,6 +2922,9 @@ LIMIT ${limit}
     this.running = false
 
     console.log(`\n[daemon] Shutting down (${signal})...`)
+
+    if (this.localModels) this.localModels.stop()
+    if (this.meshLlm) this.meshLlm.stop()
 
     // Stop mesh networking
     this._stopMesh()
