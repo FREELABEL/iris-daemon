@@ -48,6 +48,7 @@ const fs = require('fs')
 const os = require('os')
 const net = require('net')
 const socketGuard = require('./daemon/socket-guard')
+const socketLock = require('./daemon/socket-lock')
 const { wireIpcConnection } = require('./lib/ipc-connection')
 
 const IRIS_DIR = path.join(os.homedir(), '.iris')
@@ -667,7 +668,15 @@ function startDaemon () {
 
   function handleIpcMessage (msg, conn, daemon) {
     switch (msg.cmd) {
-      case 'replace':
+      case 'replace': {
+        // A second launch agent asking us to step aside is not a restart — yielding to it is
+        // how two agents ping-pong forever. Refuse; it stands by until we are really gone.
+        const mine = socketLock.supervisorLabel()
+        if (!socketLock.shouldYield(mine, msg.label)) {
+          console.error(`[ipc] Refused a handoff to ${msg.label}: ${mine} is this machine's daemon.`)
+          conn.end(JSON.stringify({ status: 'refused', holder: mine, message: socketLock.duplicateAgentMessage(mine, msg.label) }) + '\n')
+          break
+        }
         conn.end(JSON.stringify({ status: 'ok', message: 'Shutting down for replacement' }) + '\n')
         // Give the response a moment to flush, then exit
         setTimeout(() => {
@@ -675,6 +684,7 @@ function startDaemon () {
           daemon.shutdown('replace')
         }, 200)
         break
+      }
 
       case 'pause':
         updateConfigPaused(true)
@@ -821,61 +831,14 @@ function startDaemon () {
 // and wait for it to exit. If socket is stale (dead process), clean up.
 
 function acquireSocketLock (onAcquired) {
-  // First, try to connect to see if someone is already listening
-  // On Windows, named pipes don't exist as files — just try connecting
-  if (process.platform !== 'win32' && !fs.existsSync(SOCK_FILE)) {
-    onAcquired()
-    return
-  }
-
-  const probe = net.createConnection(SOCK_FILE, () => {
-    // Socket is live — another daemon is running. Request handoff.
-    console.log('[startup] Requesting handoff from running daemon...')
-    probe.write(JSON.stringify({ cmd: 'replace' }) + '\n')
-  })
-
-  probe.on('data', (data) => {
-    try {
-      const resp = JSON.parse(data.toString().trim())
-      console.log(`[startup] ${resp.message || 'Previous daemon acknowledged'}`)
-    } catch { /* fine */ }
-    probe.end()
-
-    // Wait for old daemon to release the socket
-    const deadline = Date.now() + 5000
-    const waitForRelease = () => {
-      // Try to connect — if it fails, the old daemon is gone
-      const check = net.createConnection(SOCK_FILE, () => {
-        check.end()
-        if (Date.now() < deadline) {
-          setTimeout(waitForRelease, 200)
-        } else {
-          console.error('[startup] Previous daemon did not exit in time. Force-cleaning socket.')
-          cleanupSocket()
-          onAcquired()
-        }
-      })
-      check.on('error', () => {
-        // Connection refused or socket gone — old daemon exited
-        cleanupSocket()
-        console.log('[startup] Previous daemon stopped')
-        onAcquired()
-      })
-    }
-    setTimeout(waitForRelease, 500) // brief pause for shutdown
-  })
-
-  probe.on('error', (err) => {
-    if (err.code === 'ECONNREFUSED' || err.code === 'ENOENT') {
-      // Stale socket from a dead process — clean it up
-      console.log('[startup] Cleaning stale socket')
-      cleanupSocket()
-      onAcquired()
-    } else {
-      console.error(`[startup] Socket probe failed: ${err.message}`)
-      cleanupSocket()
-      onAcquired()
-    }
+  // The protocol lives in daemon/socket-lock.js so it can be tested against real sockets.
+  // This process's launchd label rides along, so a running daemon can tell a restart
+  // (hand over) from a second launch agent competing with it (refuse — see shouldYield).
+  return socketLock.acquireSocketLock({
+    sockPath: SOCK_FILE,
+    onAcquired,
+    cleanupSocket,
+    label: socketLock.supervisorLabel()
   })
 }
 
