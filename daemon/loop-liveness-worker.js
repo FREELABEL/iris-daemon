@@ -26,14 +26,25 @@ const intervalMs = workerData.intervalMs
 const pid = workerData.pid
 const origin = workerData.origin
 
+const { judgeLiveness } = require('./loop-liveness')
+
+// Our own last check, and the last time the machine woke from sleep — see judgeLiveness.
+let lastCheck = null
+let wokeAt = null
+
 setInterval(() => {
   // Milliseconds since a shared origin. Storing whole seconds instead made a fresh stamp
   // read as up to 999ms stale, which killed healthy processes on short thresholds.
-  const last = Atomics.load(stamp, 0)
-  if (last === 0) return // main thread has not stamped yet
-
-  const staleMs = (Date.now() - origin) - last
-  if (staleMs < thresholdMs) return
+  const v = judgeLiveness({
+    now: Date.now(), origin, lastStamp: Atomics.load(stamp, 0), lastCheck, wokeAt, intervalMs, thresholdMs
+  })
+  if (v.wokeAt !== wokeAt && v.wokeAt !== null) {
+    try { require('fs').writeSync(2, `[watchdog] ${new Date().toISOString()} process was suspended (the machine slept) — not a hang; restarting the clock\n`) } catch { /* best effort */ }
+  }
+  lastCheck = v.lastCheck
+  wokeAt = v.wokeAt
+  if (!v.kill) return
+  const staleMs = v.staleMs
 
   // The ISO timestamp is load-bearing, not decoration: without it a kill count
   // read from this log cannot be bounded to the current boot, so 54 historical

@@ -99,3 +99,59 @@ test('start() reports whether the watchdog is actually armed', () => {
   assert.strictEqual(armed, true)
   l.stop()
 })
+
+/**
+ * A machine that SLEPT is not a process that HUNG.
+ *
+ * Sleep freezes every thread, the watchdog's included, while the wall clock keeps going. On
+ * wake the watchdog's first check compared the clock to a stamp from before the sleep and
+ * killed a perfectly healthy daemon. Measured on a MacBook that sleeps after one idle minute:
+ * 254 such kills, 62–353 s each, each one dropping its in-flight task and its MeshLLM.
+ *
+ * SIGSTOP is the faithful stand-in: it freezes every thread of the process while time passes,
+ * exactly as sleep does.
+ */
+const { spawn } = require('child_process')
+
+function startWatched (script) {
+  const child = spawn(process.execPath, ['-e', script], { cwd: ROOT, stdio: 'pipe' })
+  let stderr = ''
+  child.stderr.on('data', (d) => { stderr += d })
+  const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
+  return { child, exited, stderr: () => stderr }
+}
+const pause = (ms) => new Promise((r) => setTimeout(r, ms))
+
+test('a process frozen by SLEEP is not killed when it wakes', async () => {
+  const w = startWatched(`
+    const { LoopLiveness } = require('./daemon/loop-liveness')
+    new LoopLiveness({ thresholdMs: 2000, intervalMs: 200 }).start()
+    setTimeout(() => process.exit(0), 60000)
+  `)
+  await pause(800)                    // armed and stamping
+  w.child.kill('SIGSTOP')             // "the lid closes"
+  await pause(4000)                   // twice the threshold
+  w.child.kill('SIGCONT')             // "the lid opens"
+  await pause(2500)                   // longer than the threshold again, now awake
+  const alive = w.child.exitCode === null && w.child.signalCode === null
+  w.child.kill('SIGKILL')
+  await w.exited
+  assert.ok(alive, `a healthy process must survive a sleep; watchdog said: ${w.stderr().slice(0, 200)}`)
+})
+
+test('…but a main thread that is STILL stuck after the wake is killed', async () => {
+  const w = startWatched(`
+    const { LoopLiveness } = require('./daemon/loop-liveness')
+    new LoopLiveness({ thresholdMs: 2000, intervalMs: 200 }).start()
+    process.on('SIGCONT', () => { while (true) {} })   // wakes up, then hangs for real
+    setTimeout(() => {}, 60000)
+  `)
+  await pause(800)
+  w.child.kill('SIGSTOP')
+  await pause(4000)
+  w.child.kill('SIGCONT')
+  const r = await Promise.race([w.exited, pause(12000).then(() => null)])
+  if (!r) w.child.kill('SIGKILL')
+  assert.ok(r && r.signal === 'SIGKILL', `a real hang after waking must still be killed; got ${JSON.stringify(r)}`)
+  assert.match(w.stderr(), /MAIN THREAD BLOCKED/)
+})

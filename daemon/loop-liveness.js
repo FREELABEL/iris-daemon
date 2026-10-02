@@ -86,4 +86,28 @@ class LoopLiveness {
   }
 }
 
-module.exports = { LoopLiveness }
+/**
+ * One watchdog check. Pure, so the rule can be tested without putting a laptop to sleep.
+ *
+ * The watchdog's own checks run every `intervalMs`. When the gap since its LAST check is far
+ * beyond that, the whole process was suspended — the machine slept — and every thread, the
+ * main one included, was frozen alike. That is not a hang, and a stamp from before the sleep
+ * says nothing about the main thread now. So the clock restarts at the wake: a main thread
+ * that is genuinely stuck afterwards is still killed, `thresholdMs` after waking.
+ *
+ * Before this, every wake from a sleep longer than the threshold killed a healthy daemon:
+ * 254 times on one MacBook that sleeps after an idle minute.
+ *
+ * @returns {{ kill: boolean, staleMs: number, wokeAt: number|null, lastCheck: number }}
+ */
+function judgeLiveness ({ now, origin, lastStamp, lastCheck, wokeAt, intervalMs, thresholdMs }) {
+  const suspendedFor = lastCheck == null ? 0 : now - lastCheck
+  if (suspendedFor > Math.max(intervalMs * 5, 5000)) {
+    return { kill: false, staleMs: 0, wokeAt: now, lastCheck: now }
+  }
+  if (!lastStamp) return { kill: false, staleMs: 0, wokeAt, lastCheck: now }
+  const staleMs = now - Math.max(origin + lastStamp, wokeAt || 0)
+  return { kill: staleMs >= thresholdMs, staleMs, wokeAt, lastCheck: now }
+}
+
+module.exports = { LoopLiveness, judgeLiveness }
