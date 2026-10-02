@@ -129,12 +129,22 @@ class TmuxManager {
 
   /**
    * Generate a safe session name from task metadata.
-   * Format: iris-{type}-{first 8 chars of taskId}
+   * Format: iris-{type}-{last 12 alphanumerics of taskId}
    */
   _sessionName (task) {
-    const type = (task.type || 'task').replace(/[^a-zA-Z0-9_-]/g, '')
-    const shortId = (task.id || '').substring(0, 8).replace(/[^a-zA-Z0-9]/g, '')
-    return `iris-${type}-${shortId}`
+    const type = (task.type || 'task').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
+    return `iris-${type}-${this._idTag(task.id)}`
+  }
+
+  /**
+   * The id's RANDOM tail, never its head (#187456). Task ids are UUIDv7: the first 8 hex characters
+   * are the top of a millisecond timestamp, shared by every task created in the same ~65 s, so a name
+   * built from them made concurrent tasks share a session — the second one's `kill-session` killed the
+   * first, deleted its exit file, and the first reported exit 1 with correct output. The last 12 hex
+   * characters are random bits.
+   */
+  _idTag (id) {
+    return String(id || '').replace(/[^a-zA-Z0-9]/g, '').slice(-12)
   }
 
   /**
@@ -367,7 +377,7 @@ class TmuxManager {
       throw new Error('Swarm requires at least one role')
     }
 
-    const shortId = (taskId || '').substring(0, 8).replace(/[^a-zA-Z0-9]/g, '')
+    const shortId = this._idTag(taskId)   // the random tail, not the timestamp head (#187456)
     const sessionName = `iris-swarm-${shortId}`
     const outputFile = path.join(LOG_DIR, `${sessionName}.log`)
 

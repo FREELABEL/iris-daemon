@@ -32,6 +32,9 @@ class Heartbeat {
 
     // Callback to write status file (set by Daemon)
     this.onPingCallback = null
+    // Called with the server's reply after every successful ping — the daemon uses it to pull work a
+    // dead push subscription never delivered (#187457).
+    this.onHeartbeatOk = null
 
     // LIVENESS (#182371). A daemon that cannot reach the hub for this long is not
     // "degraded", it is gone — and the one state a supervisor cannot fix is a process that
@@ -122,6 +125,9 @@ class Heartbeat {
 
       // Trigger status file write after successful heartbeat
       if (this.onPingCallback) this.onPingCallback()
+      if (typeof this.onHeartbeatOk === 'function') {
+        try { this.onHeartbeatOk(result) } catch { /* a failing handler must not stop the heartbeat */ }
+      }
 
       // ── Status summary — log active tasks + capacity every heartbeat ──
       const state = this.getStateCallback ? this.getStateCallback() : {}

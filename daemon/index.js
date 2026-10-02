@@ -20,6 +20,7 @@
  * without routing through the hub — Machine A scrapes, Machine B enriches.
  */
 
+const { shouldPollPending } = require('./pending-poll')
 const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
@@ -494,7 +495,7 @@ class Daemon {
         : [],
       heartbeat_state: this.heartbeat.state,
       local_ip: this._getLocalIp(),
-      max_concurrent: parseInt(process.env.MAX_CONCURRENT || '3', 10),
+      max_concurrent: this._maxConcurrent(),
       // running ∪ reserved ∪ queued (gate.visibleIds) ∪ pending-accept — so the server
       // sees gate-queued tasks and never orphans or double-dispatches them.
       running_task_ids: [...new Set([
@@ -506,6 +507,16 @@ class Daemon {
       this._writeStatusFile()
       this._refreshSessionCache() // refresh session data after each heartbeat
       if (this.scheduleRegistry) this.scheduleRegistry.flushPending().catch(() => {})
+    }
+    // #187457 — a push subscription can die silently, and the heartbeat reply's dispatched_count does
+    // not reveal it (it counts only what the heartbeat itself dispatched). So after each successful
+    // heartbeat, when there is room, ask for our own assigned/dispatched tasks. Dedup drops doubles.
+    this._lastPendingPollAt = 0
+    this.heartbeat.onHeartbeatOk = () => {
+      const active = this.executor ? this.executor.runningTasks.size : 0
+      if (!shouldPollPending({ now: Date.now(), lastPollAt: this._lastPendingPollAt, active, max: this._maxConcurrent(), paused: this.paused })) return
+      this._lastPendingPollAt = Date.now()
+      this.checkPendingTasks().catch(() => {})
     }
     this.heartbeat.start()
 
@@ -2023,6 +2034,13 @@ LIMIT ${limit}
     })
   }
 
+  /** Slots this node runs at once. ONE setting, read by the capacity check AND the heartbeat — they had
+   *  separate defaults (4 enforced, 3 reported), so the server and the node disagreed about room. */
+  _maxConcurrent () {
+    const n = parseInt(process.env.MAX_CONCURRENT || '3', 10)
+    return Number.isFinite(n) && n > 0 ? n : 3
+  }
+
   async handleTaskDispatched (event) {
     const ts = new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
     console.log(`[daemon] [${ts}] Task dispatched: ${event.task_id} — "${event.title}"`)
@@ -2066,19 +2084,17 @@ LIMIT ${limit}
 
     const isBrowserTask = false // lock disabled — max concurrent handles throttling
 
-    // Reject if at capacity
-    const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10)
+    // At capacity: DEFER, don't fail. The task stays dispatched on the server and this daemon picks
+    // it up itself at the first heartbeat with a free slot (the pending poll, #187457) — or the
+    // server's orphan path routes it elsewhere. It used to be reported failed with "Will retry on next
+    // schedule", which nothing did, and its id was refused for 5 minutes. Forget we saw it, so the
+    // re-delivery is not dropped as a duplicate.
+    const MAX_CONCURRENT = this._maxConcurrent()
     const activeTasks = this.executor ? this.executor.runningTasks.size : 0
     if (activeTasks >= MAX_CONCURRENT) {
-      console.log(`[daemon] Deferring task ${event.task_id} — ${activeTasks} tasks running (max ${MAX_CONCURRENT})`)
+      console.log(`[daemon] Deferring task ${event.task_id} — ${activeTasks}/${MAX_CONCURRENT} slots busy; it will be picked up when one frees`)
       this.pendingTaskIds.delete(event.task_id)
-      this.recentlyRejectedTasks.set(event.task_id, Date.now())
-      try {
-        await this.cloud.submitResult(event.task_id, {
-          status: 'failed',
-          error: `Node at capacity (${activeTasks}/${MAX_CONCURRENT} tasks running). Will retry on next schedule.`
-        })
-      } catch { /* best effort */ }
+      this.recentlySeenTasks.delete(event.task_id)
       return
     }
 
