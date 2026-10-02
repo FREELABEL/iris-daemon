@@ -24,6 +24,7 @@ const { shouldPollPending } = require('./pending-poll')
 const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
+const { decide, isExpiredRefusal, KeyLedger } = require('./delivery-contract')
 const { Heartbeat } = require('./heartbeat')
 const { probePermissions } = require('./permission-probe')
 const { tmuxPolicy } = require('./tmux-manager')
@@ -59,6 +60,16 @@ class Daemon {
     this.cloud = new CloudClient(config.apiUrl, config.apiKey, config.apiUrlFallback)
     this.workspaces = new WorkspaceManager(config.dataDir)
     this.executor = new TaskExecutor(this.cloud, this.workspaces)
+
+    // The delivery contract, node side (#187568): ran-once per key, never started late.
+    this.keyLedger = new KeyLedger()
+    this._keyByTask = new Map() // taskId → idempotency_key, for tasks running here
+    this.cloud.onResultSubmitted = (taskId, result) => {
+      const key = this._keyByTask.get(taskId)
+      if (!key) return
+      this._keyByTask.delete(taskId)
+      this.keyLedger.finish(key, taskId, result)
+    }
     // Override fl-api path if explicitly provided
     if (config.flApiPath) {
       this.executor.flApiPath = config.flApiPath
@@ -2130,7 +2141,7 @@ LIMIT ${limit}
     //
     // Kicked off before the try so a rejection can never escape as an unhandled
     // rejection; it is awaited (and its errors interpreted) at the original point below.
-    const acceptPromise = this.cloud.acceptTask(event.task_id).catch((e) => e)
+    const acceptPromise = this.cloud.acceptTask(event.task_id, { arrived_at: new Date(_t.evt).toISOString() }).catch((e) => e)
 
     try {
       // Fetch full task details (retry with backoff — Pusher event can arrive before DB commit)
@@ -2160,6 +2171,12 @@ LIMIT ${limit}
       // Accept was started in parallel above; collect it here. Same semantics as before
       // — "already running" is tolerated, anything else still aborts the task.
       const acceptErr = await acceptPromise
+      if (acceptErr instanceof Error && isExpiredRefusal(acceptErr)) {
+        // The server refused it as LATE and has already marked it expired. Reporting a failure
+        // now would overwrite the truer status, so drop it quietly (#187568).
+        console.log(`[daemon] Task ${event.task_id} arrived after its deadline — expired on the server, not running it`)
+        return
+      }
       if (acceptErr instanceof Error) {
         if (acceptErr.message?.includes('running') || acceptErr.message?.includes('422')) {
           console.log('[daemon] Task already running — proceeding with execution')
@@ -2205,6 +2222,32 @@ LIMIT ${limit}
           } catch { /* best effort */ }
           return
         }
+      }
+
+      // ── THE DELIVERY CONTRACT, NODE SIDE (#187568) ───────────────────────────────
+      // Late by this machine's clock → report expired, never start it. A key that already
+      // completed here → replay its result instead of running the work a second time. A key
+      // running here right now → leave the twin alone.
+      const verdict = decide(task, this.keyLedger)
+      if (verdict.action === 'expire') {
+        console.log(`[daemon] Task ${event.task_id} is past its deadline (${task.not_after}) by this machine's clock — reporting expired, not running it`)
+        await this.cloud.submitResult(event.task_id, { status: 'expired', error: `Past its deadline (${task.not_after}) by this machine's clock when it was about to start.` })
+        return
+      }
+      if (verdict.action === 'replay') {
+        console.log(`[daemon] Task ${event.task_id} key '${task.idempotency_key}' already completed here as ${verdict.entry.task_id} — replaying that result, not re-running`)
+        const stored = verdict.entry.result || { status: 'completed' }
+        await this.cloud.submitResult(event.task_id, { ...stored, metadata: { ...(stored.metadata || {}), replayed_from_task: verdict.entry.task_id } })
+        return
+      }
+      if (verdict.action === 'skip') {
+        console.log(`[daemon] Task ${event.task_id} key '${task.idempotency_key}' is already running here as ${verdict.entry.task_id} — not starting a twin`)
+        await this.cloud.submitResult(event.task_id, { status: 'skipped', error: `The same key is already running on this machine as task ${verdict.entry.task_id}.` })
+        return
+      }
+      if (task.idempotency_key) {
+        this.keyLedger.begin(task.idempotency_key, task.id)
+        this._keyByTask.set(task.id, task.idempotency_key)
       }
 
       // Tag source for tmux ledger tracking

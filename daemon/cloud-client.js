@@ -135,8 +135,10 @@ class CloudClient {
   /**
    * Accept a dispatched task.
    */
-  async acceptTask (taskId) {
-    return this.post(`/api/v6/node-agent/tasks/${taskId}/accept`, {})
+  async acceptTask (taskId, body = {}) {
+    // body.arrived_at — when the task reached THIS machine, by its own clock (#187568). The
+    // server keeps the skew against its clock beside it, so a deadline in seconds is checkable.
+    return this.post(`/api/v6/node-agent/tasks/${taskId}/accept`, body)
   }
 
   /**
@@ -167,7 +169,16 @@ class CloudClient {
    * Submit final task result.
    */
   async submitResult (taskId, result) {
-    return this.post(`/api/v6/node-agent/tasks/${taskId}/result`, result)
+    try {
+      return await this.post(`/api/v6/node-agent/tasks/${taskId}/result`, result)
+    } finally {
+      // The ONE place every result passes through (the executor reports from a dozen sites),
+      // so the delivery contract learns how a keyed task ended here and nowhere else. In a
+      // finally: if the post fails the work still ran, and a retry must replay, not re-run.
+      if (typeof this.onResultSubmitted === 'function') {
+        try { this.onResultSubmitted(taskId, result) } catch { /* bookkeeping never breaks a task */ }
+      }
+    }
   }
 
   /**
