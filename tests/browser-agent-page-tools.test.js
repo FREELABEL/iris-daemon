@@ -213,3 +213,69 @@ test('navigation: a new document replaces the tool list; an SPA pushState keeps 
     await browser.close(); site.close()
   }
 })
+
+// ── a done must be backed by what the run did ──────────────────────────────
+
+const { doneVerdict, changedState } = require('../browser-agent/done-check')
+const { normalizeAnnotations } = require('../browser-agent/page-tools')
+
+test('done-check: a claim of a change with nothing changed is refused; a real change passes', () => {
+  const none = { changed: false, wroteWithTool: false }
+  // The gpt-5-nano run, verbatim shape.
+  assert.equal(doneVerdict({ result: 'Reservation created. Dana, party of 4. ID R-####' }, none).ok, false)
+  assert.equal(doneVerdict({ result: 'The page title is Example Domain' }, none).ok, true, 'a read-only answer needs no change')
+  assert.equal(doneVerdict({ result: 'Booked 4 at 19:30, R-1042' }, { changed: true, wroteWithTool: true }).ok, true)
+  assert.equal(doneVerdict({ result: 'anything' }, { changed: true, wroteWithTool: false }, { require_write: true }).ok, false)
+
+  const tools = [{ name: 'search', annotations: { readOnly: true } }, { name: 'book', annotations: {} }]
+  assert.equal(changedState({ type: 'tool', name: 'page.search' }, { ok: true }, tools), false, 'a read-only tool changes nothing')
+  assert.equal(changedState({ type: 'tool', name: 'page.book' }, { ok: true }, tools), true)
+  assert.equal(changedState({ type: 'tool', name: 'page.book' }, { ok: false }, tools), false, 'a failed write is not a write')
+  assert.equal(changedState({ type: 'click' }, { ok: true }, tools), true)
+  assert.equal(changedState({ type: 'extract' }, { ok: true }, tools), false)
+})
+
+test('annotations: the SDK\'s hint spelling counts the same as Chrome\'s', () => {
+  assert.deepEqual(normalizeAnnotations({ consequentialHint: true, readOnlyHint: false }), { readOnly: false, consequential: true, untrustedContent: false })
+  assert.deepEqual(normalizeAnnotations({ readOnly: true }), { readOnly: true, consequential: false, untrustedContent: false })
+  // A page-marked consequential tool with an innocent NAME is gated in fallback mode too.
+  assert.equal(approvalFor({ name: 'reserve', annotations: normalizeAnnotations({ consequentialHint: true }) }).ok, false)
+})
+
+const FALLBACK_WITH_HINTS = FALLBACK_PAGE.replace(
+  "book_table: { name: 'book_table',",
+  "hold: { name: 'hold', description: 'Hold a table with a deposit', annotations: { consequentialHint: true }, run() { ran.push('hold'); return { ok: true }; } }, " +
+  "search: { name: 'search', description: 'Search', annotations: { readOnlyHint: true }, run() { ran.push('search'); return { ok: true, summary: '3 open' }; } }, " +
+  "book_table: { name: 'book_table',")
+
+test('loop: a read-only search followed by "Reservation created" is not success', async () => {
+  const r = await run({
+    browserOpts: { args: WEBMCP_LAUNCH_ARGS },
+    html: FALLBACK_WITH_HINTS,
+    actions: [{ type: 'tool', name: 'page.search', input: {} }, { type: 'done', result: 'Reservation created, R-####' }],
+  })
+  assert.equal(r.result.success, false, 'the placeholder booking must not count')
+  assert.ok(r.result.history.some((h) => /"done" refused/.test(h)), JSON.stringify(r.result.history))
+})
+
+test('loop (fallback): a page-marked consequential tool with an innocent name is still gated', async () => {
+  const r = await run({
+    browserOpts: { args: WEBMCP_LAUNCH_ARGS },
+    html: FALLBACK_WITH_HINTS,
+    actions: [{ type: 'tool', name: 'page.hold', input: {} }, { type: 'fail', reason: 'x' }],
+  })
+  assert.deepEqual(r.ran, [])
+  assert.match(r.result.history[0], /needs operator approval/)
+})
+
+test('loop: the same successful write is not repeated (no duplicate bookings)', async () => {
+  const book = { type: 'tool', name: 'page.book_table', input: { size: 2 } }
+  const r = await run({
+    browserOpts: { args: WEBMCP_LAUNCH_ARGS },
+    html: FALLBACK_PAGE,
+    actions: [book, book, book, { type: 'done', result: 'booked' }],
+  })
+  assert.deepEqual(r.ran, ['book_table'], 'booked exactly once')
+  assert.ok(r.result.history.some((h) => /already succeeded in step 1/.test(h)))
+  assert.equal(r.result.success, true)
+})

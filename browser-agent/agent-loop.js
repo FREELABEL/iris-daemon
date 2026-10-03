@@ -15,6 +15,7 @@ const { parseAction, emptyReplyMessage } = require('./parse-action')
 const { historyEntry } = require('./history-entry')
 const { ACTION_HELP, truncationHint } = require('./prompt-parts')
 const { PageTools, formatTools } = require('./page-tools')
+const { doneVerdict, changedState, wroteWithTool } = require('./done-check')
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
 
@@ -124,6 +125,12 @@ async function agentLoop(page, task, options = {}) {
     await pageTools.attach().catch(() => false)
   }
   const approveTools = task.config?.approve_tools
+  // What the run actually did, so a "done" that claims a change can be checked — done-check.js.
+  const evidence = { changed: false, wroteWithTool: false }
+  // Writes that already succeeded, by tool + exact input. Measured 2026-10-03: gpt-5-nano, after
+  // its done was refused, booked the same table twelve more times — twelve real reservations.
+  // Repeating a successful write is never progress; refuse it and say so.
+  const doneWrites = new Map()
   console.log(`[agent] Starting loop — max ${maxSteps} steps, model: ${model}`)
   console.log(`[agent] Task: ${task.prompt || task.title}`)
 
@@ -165,8 +172,26 @@ async function agentLoop(page, task, options = {}) {
     }
 
     // ACT
+    if (String(action.type).toLowerCase() === 'done') {
+      const verdict = doneVerdict(action, evidence, task.config || {})
+      if (!verdict.ok) {
+        console.warn(`[agent] ${verdict.reason}`)
+        history.push(`done "${String(action.result || '').slice(0, 60)}" → ${verdict.reason} [FAILED - try a different approach]`)
+        continue
+      }
+    }
+    const writeKey = String(action.type).toLowerCase() === 'tool' ? `${String(action.name).replace(/^page\./, '')} ${JSON.stringify(action.input ?? {})}` : null
+    if (writeKey && doneWrites.has(writeKey)) {
+      history.push(`tool ${action.name} → refused: this exact call already succeeded in step ${doneWrites.get(writeKey)}. Calling it again would do it twice. If the task is finished, use "done". [FAILED - try a different approach]`)
+      continue
+    }
     try {
       const result = await executeAction(page, action, dom, outputDir, { nav, pageTools, approveTools })
+      if (changedState(action, result, tools)) evidence.changed = true
+      if (wroteWithTool(action, result, tools)) {
+        evidence.wroteWithTool = true
+        if (writeKey) doneWrites.set(writeKey, step + 1)
+      }
       // Includes what an extract actually FOUND — see history-entry.js.
       history.push(historyEntry(action, result, { history }))
       console.log(`[agent] Result: ${result.message}`)

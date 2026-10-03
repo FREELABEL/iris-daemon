@@ -39,6 +39,22 @@ const CONSEQUENTIAL_NAME = /(checkout|pay|purchase|buy|order|charge|subscribe|do
 // a Chromium that lacks them, so these are safe to pass everywhere.
 const WEBMCP_LAUNCH_ARGS = ['--enable-features=WebMCPTesting,DevToolsWebMCPSupport']
 
+/**
+ * One spelling for annotations. Chrome's CDP reports {readOnly, consequential, untrustedContent};
+ * the page registered {readOnlyHint, consequentialHint, untrustedContentHint}, and that is what
+ * the SDK's fallback registry returns verbatim. Reading only the CDP spelling meant that in
+ * fallback mode a page's consequential flag was silently ignored — measured 2026-10-03, masked
+ * on the demo because the NAME check caught cancel_booking anyway.
+ */
+function normalizeAnnotations (a) {
+  a = a || {}
+  return {
+    readOnly: !!(a.readOnly || a.readOnlyHint),
+    consequential: !!(a.consequential || a.consequentialHint),
+    untrustedContent: !!(a.untrustedContent || a.untrustedContentHint),
+  }
+}
+
 function stripPrefix (name) {
   return String(name || '').replace(/^page\./, '')
 }
@@ -140,7 +156,7 @@ class PageTools {
       name: String(t.name),
       description: String(t.description || '').slice(0, MAX_DESCRIPTION),
       inputSchema: t.inputSchema || { type: 'object', properties: {} },
-      annotations: t.annotations || {},
+      annotations: normalizeAnnotations(t.annotations),
       frameId: t.frameId,
     }))
   }
@@ -229,4 +245,4 @@ function formatTools (tools) {
   return `PAGE TOOLS (declared by the page; call with {"type":"tool","name":"page.<name>","input":{...}}):\n${lines.join('\n')}`
 }
 
-module.exports = { PageTools, formatTools, approvalFor, isConsequential, shapeOutcome, WEBMCP_LAUNCH_ARGS }
+module.exports = { normalizeAnnotations, PageTools, formatTools, approvalFor, isConsequential, shapeOutcome, WEBMCP_LAUNCH_ARGS }
