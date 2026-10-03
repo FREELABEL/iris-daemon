@@ -13,7 +13,8 @@
  */
 
 /** The action list. `extract` now says where the text goes: back to the model. */
-const ACTION_HELP = `{"type": "click", "element": "@N"}                    — click an interactive element
+const ACTION_HELP = `{"type": "tool", "name": "page.book_table", "input": {...}} — call a tool the PAGE declared (listed under PAGE TOOLS). When one fits the task, use it INSTEAD of clicking and typing.
+{"type": "click", "element": "@N"}                    — click an interactive element
 {"type": "type", "element": "@N", "text": "..."}      — type text into an input
 {"type": "press", "key": "Enter"}                      — press a keyboard key
 {"type": "scroll", "direction": "down"}                — scroll the page (down/up)

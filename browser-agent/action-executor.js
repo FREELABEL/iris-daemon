@@ -2,7 +2,7 @@
  * Action Executor — maps LLM action decisions to Playwright calls.
  *
  * Supported actions:
- *   click, type, press, scroll, navigate, extract, screenshot, wait, done, fail
+ *   tool, click, type, press, scroll, navigate, extract, screenshot, wait, done, fail
  */
 
 const fs = require('fs')
@@ -23,6 +23,14 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
   const type = action.type?.toLowerCase()
 
   switch (type) {
+    // A tool the page declared (WebMCP) — see page-tools.js. Approval for consequential tools is
+    // the operator's (task config), enforced there, not left to the model.
+    case 'tool': {
+      if (!opts.pageTools) return { ok: false, message: 'Page tools are not available in this run — use click/type' }
+      if (!action.name) return { ok: false, message: 'No tool name provided for tool action' }
+      return opts.pageTools.call(action.name, action.input ?? action.args ?? {}, { approve: opts.approveTools })
+    }
+
     case 'click': {
       const handle = await getLocatorForElement(page, dom, action.element)
       if (!handle) return { ok: false, message: `Element ${action.element} not found` }

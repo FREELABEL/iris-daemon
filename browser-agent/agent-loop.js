@@ -14,6 +14,7 @@ const { addUsage, emptyUsage } = require('./usage')
 const { parseAction, emptyReplyMessage } = require('./parse-action')
 const { historyEntry } = require('./history-entry')
 const { ACTION_HELP, truncationHint } = require('./prompt-parts')
+const { PageTools, formatTools } = require('./page-tools')
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
 
@@ -37,6 +38,8 @@ RULES:
 - If a previous action FAILED, try a different approach (e.g. press Enter instead of clicking a button, or use navigate instead of clicking a link)
 - After typing in a search box, prefer pressing Enter over clicking a search button
 - Never repeat the exact same failed action more than once
+- If PAGE TOOLS are listed and one does what the task needs, call it with "tool" instead of clicking and typing. Fall back to clicking only when no tool fits or the tool failed
+- A tool marked CONSEQUENTIAL runs only with operator approval; if it is refused, report that with "fail" — never do the same thing by clicking
 
 AVAILABLE ACTIONS:
 ${ACTION_HELP}`
@@ -110,6 +113,13 @@ async function agentLoop(page, task, options = {}) {
     startHost: hostOf(task.config?.url) || hostOf(typeof page.url === 'function' ? page.url() : null),
     allowedHosts: task.config?.allowed_hosts || [],
   }
+  // What the page declares it can do (WebMCP). Absent tools are normal: the loop just clicks.
+  const pageTools = options.pageTools !== undefined ? options.pageTools : new PageTools(page)
+  if (pageTools && typeof pageTools.attach === 'function' && !pageTools._attached) {
+    pageTools._attached = true
+    await pageTools.attach().catch(() => false)
+  }
+  const approveTools = task.config?.approve_tools
   console.log(`[agent] Starting loop — max ${maxSteps} steps, model: ${model}`)
   console.log(`[agent] Task: ${task.prompt || task.title}`)
 
@@ -130,7 +140,12 @@ async function agentLoop(page, task, options = {}) {
       continue
     }
 
-    const domText = formatDOM(dom)
+    // The page's tools ride INSIDE the page state: their names and descriptions are the page's
+    // words, so they go through the same untrusted fence as its text.
+    const tools = pageTools ? await pageTools.list().catch(() => []) : []
+    if (tools.length) console.log(`[agent] Page tools: ${tools.map(t => t.name).join(', ')}`)
+    const toolsText = formatTools(tools)
+    const domText = toolsText ? `${toolsText}\n\n${formatDOM(dom)}` : formatDOM(dom)
 
     // THINK
     let action
@@ -147,7 +162,7 @@ async function agentLoop(page, task, options = {}) {
 
     // ACT
     try {
-      const result = await executeAction(page, action, dom, outputDir, { nav })
+      const result = await executeAction(page, action, dom, outputDir, { nav, pageTools, approveTools })
       // Includes what an extract actually FOUND — see history-entry.js.
       history.push(historyEntry(action, result, { history }))
       console.log(`[agent] Result: ${result.message}`)

@@ -11,6 +11,7 @@
 
 const { chromium } = require('playwright')
 const { agentLoop } = require('./agent-loop')
+const { WEBMCP_LAUNCH_ARGS } = require('./page-tools')
 const fs = require('fs')
 const path = require('path')
 
@@ -75,7 +76,8 @@ async function main() {
   // Launch browser
   const browser = await chromium.launch({
     headless: !opts.headed && !task.config?.headed,
-    args: ['--disable-blink-features=AutomationControlled'],
+    // WebMCP on, so a page's declared tools reach the agent (page-tools.js, epic #187727).
+    args: ['--disable-blink-features=AutomationControlled', ...WEBMCP_LAUNCH_ARGS],
   })
 
   const context = await browser.newContext({
