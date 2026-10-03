@@ -62,11 +62,63 @@ if [ -d "${HOME}/.volta" ]; then
   export PATH="${HOME}/.volta/bin:${PATH}"
 fi
 
-# Verify node is available
-if ! command -v node &>/dev/null; then
-  echo "[iris-daemon] ERROR: Node.js not found in PATH" >&2
-  echo "[iris-daemon] Install via: brew install node@20" >&2
+# ─── Pin ONE node binary ──────────────────────────────────────
+# macOS grants Full Disk Access per EXECUTABLE FILE. The resolution above picks "the newest nvm
+# node" on every start, so installing any newer Node (for any project, by any tool) silently
+# moved the daemon onto a binary with no grant — Mail, Messages and Calendar went dark with
+# nothing changed in IRIS. Measured 2026-10-03: 17 nvm versions on one Mac, access lost
+# repeatedly. So: the first start records the node it would have used anyway (no behaviour
+# change, no native-module ABI surprise), and every later start reuses that exact file.
+PIN_FILE="${IRIS_DIR}/daemon-node"
+
+# The real file behind a path. TCC tracks the real executable, not a symlink to it
+# (Homebrew's /opt/homebrew/bin/node points into a versioned Cellar path).
+real_path() {
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd "$(dirname "$p")" && pwd -P)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  echo "$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+}
+
+NODE_BIN=""
+if [ -n "${IRIS_DAEMON_NODE:-}" ]; then
+  NODE_BIN="${IRIS_DAEMON_NODE}"                       # explicit override wins
+elif [ -f "${PIN_FILE}" ]; then
+  PINNED="$(head -n 1 "${PIN_FILE}" | tr -d '[:space:]')"
+  if [ -n "${PINNED}" ] && [ -x "${PINNED}" ]; then
+    NODE_BIN="${PINNED}"
+  else
+    echo "[iris-daemon] the pinned node ${PINNED:-<empty>} is gone — choosing a new one." >&2
+    echo "[iris-daemon] Full Disk Access must be granted again, to the file named below." >&2
+  fi
+fi
+
+if [ -z "${NODE_BIN}" ]; then
+  if ! command -v node &>/dev/null; then
+    echo "[iris-daemon] ERROR: Node.js not found in PATH" >&2
+    echo "[iris-daemon] Install via: brew install node@20" >&2
+    exit 1
+  fi
+  NODE_BIN="$(real_path "$(command -v node)")"
+  if [ -z "${IRIS_DAEMON_NODE:-}" ] && printf '%s\n' "${NODE_BIN}" > "${PIN_FILE}.tmp" 2>/dev/null; then
+    mv -f "${PIN_FILE}.tmp" "${PIN_FILE}"
+    echo "[iris-daemon] pinned to ${NODE_BIN} — Full Disk Access belongs on THIS file" >&2
+  fi
+fi
+
+if [ ! -x "${NODE_BIN}" ]; then
+  echo "[iris-daemon] ERROR: ${NODE_BIN} is not an executable node" >&2
   exit 1
+fi
+export PATH="$(dirname "${NODE_BIN}"):${PATH}"
+
+# Test hook: print the binary this wrapper would run, and stop before touching config.
+if [ "${IRIS_WRAPPER_PRINT_NODE:-}" = "1" ]; then
+  echo "${NODE_BIN}"
+  exit 0
 fi
 
 # ─── Read Config ──────────────────────────────────────────────
@@ -77,7 +129,7 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 fi
 
 # Parse config.json using node (guaranteed available at this point)
-eval "$(node -e "
+eval "$("${NODE_BIN}" -e "
   const c = require('${CONFIG_FILE}');
   if (c.node_api_key) console.log('export NODE_API_KEY=' + JSON.stringify(c.node_api_key));
   if (c.iris_api_url) console.log('export IRIS_API_URL=' + JSON.stringify(c.iris_api_url));
@@ -92,7 +144,7 @@ export DAEMON_DATA_DIR="${IRIS_DIR}/data"
 # Auto-detect: config.json > symlink resolution > env var
 if [ -z "${FREELABEL_PATH:-}" ]; then
   # Check config.json first
-  FL_PATH=$(node -e "try { const c = require('${CONFIG_FILE}'); if (c.freelabel_path) console.log(c.freelabel_path); } catch {}" 2>/dev/null || true)
+  FL_PATH=$("${NODE_BIN}" -e "try { const c = require('${CONFIG_FILE}'); if (c.freelabel_path) console.log(c.freelabel_path); } catch {}" 2>/dev/null || true)
 
   # Fallback: if ~/.iris/daemon is a symlink, resolve it (e.g. -> /Users/x/Sites/freelabel/fl-docker-dev/coding-agent-bridge)
   if [ -z "${FL_PATH}" ] && [ -L "${DAEMON_DIR}" ]; then
@@ -113,4 +165,4 @@ fi
 
 # ─── Launch Daemon ────────────────────────────────────────────
 cd "${DAEMON_DIR}"
-exec node daemon.js
+exec "${NODE_BIN}" daemon.js

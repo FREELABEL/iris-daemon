@@ -27,9 +27,16 @@
 const TCC_SHORT =
   "the iris daemon has no Full Disk Access (the DAEMON's own grant, not your terminal's)"
 
-/** The message drivers reject with. Keeps the "No permission to read" prefix that the doctor greps for. */
+/**
+ * The message drivers reject with. Keeps the "No permission to read" prefix that the doctor greps for.
+ *
+ * It names the binary. This string is the ONLY part of a denial that reaches the CLI, `iris
+ * pulse check` and HTTP callers; the guidance with the path went to the daemon log, which nobody
+ * reading a failed `iris mail search` ever sees. Measured 2026-10-03: a user saw "the iris daemon
+ * has no Full Disk Access" three times and still had to ask which file to approve.
+ */
 function tccDenialMessage(store) {
-  return `No permission to read ${store} — ${TCC_SHORT}`
+  return `No permission to read ${store} — ${TCC_SHORT}. Grant Full Disk Access to ${process.execPath}, then run: iris-daemon restart`
 }
 
 /**
