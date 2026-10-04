@@ -332,6 +332,12 @@ case "${1:-status}" in
         fi
         sleep 1
         "$0" start ;;
+    grant-access)
+        # Full Disk Access, guided and verified. Run with the node the daemon is PINNED to
+        # (~/.iris/daemon-node), so the script reports on the same file it asks you to approve.
+        _GA_NODE="$(head -n 1 "$HOME/.iris/daemon-node" 2>/dev/null | tr -d '[:space:]')"
+        [ -x "$_GA_NODE" ] || _GA_NODE="$(command -v node)"
+        IRIS_DAEMONCTL="$0" exec "$_GA_NODE" "$BRIDGE_DIR/scripts/grant-access.js" "${@:2}" ;;
     status)
         SOCK="$HOME/.iris/daemon.sock"
         if [ -S "$SOCK" ]; then
@@ -372,5 +378,5 @@ case "${1:-status}" in
         # other (#185142). A self-check that lives in only one of them is a
         # self-check half the operators never run.
         exec node "$BRIDGE_DIR/lib/daemon-doctor-cli.js" "$@" ;;
-    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor}" ;;
+    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor|grant-access}" ;;
 esac

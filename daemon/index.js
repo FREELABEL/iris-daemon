@@ -712,6 +712,17 @@ class Daemon {
     const a2aPort = parseInt(process.env.A2A_PORT || '3200', 10)
     const prefix = useEmbedded ? '/daemon' : ''
 
+    // Full Disk Access, with the exact file to approve and whether a restart is all that's left.
+    // `iris pulse`, `iris mail`, `iris doctor` and `iris-daemon grant-access` all read this, so a
+    // blind spot always comes with its fix (see daemon/fda-status.js).
+    app.get(`${prefix}/permissions`, async (req, res) => {
+      try {
+        res.json(await require('./fda-status').permissionsReport())
+      } catch (e) {
+        res.status(500).json({ error: `permissions check failed: ${e.message}` })
+      }
+    })
+
     // Health check — in embedded mode, augment the bridge's /health instead
     app.get(`${prefix}/health`, (req, res) => {
       let persistentProcesses = 0
