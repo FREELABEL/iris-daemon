@@ -38,6 +38,7 @@ const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter } = require('./local-llm')
 const { MeshLlmSupervisor } = require('./mesh-llm-supervisor')
+const { startDeviceProbe, getDeviceReport } = require('./device-capabilities')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
 const { runScript, clampTimeout } = require('./script-runner')
 const { tccFixOneLine } = require('./tcc-notice')
@@ -214,6 +215,9 @@ class Daemon {
     console.log('[daemon] Detecting hardware...')
     this.hardwareProfile = await detectProfile()
     console.log(`[daemon] Hardware: ${this.hardwareProfile.cpu.model} | ${this.hardwareProfile.memory.total_gb}GB RAM | GPU: ${this.hardwareProfile.gpu.available ? this.hardwareProfile.gpu.name : 'none'}`)
+    // Radios and sensors (#187880). Async and backgrounded — the macOS probe takes ~4s and the
+    // heartbeat only ever reads its cached result.
+    startDeviceProbe()
 
     // Step 1: Authenticate with cloud and register as online
     console.log('[daemon] Authenticating with cloud...')
@@ -450,7 +454,12 @@ class Daemon {
       // Separate from the package version on purpose: this is the CONTRACT version for what
       // the daemon can serve. Bump it when capabilities change, so the cloud can answer "is
       // this node new enough for X" without string-comparing release numbers.
-      capability_schema: 2,
+      // 3 — device_capabilities (radios + sensors, #187880).
+      capability_schema: 3,
+      // Physical radio/sensor COUNTS — wifi, bluetooth, camera, audio_in, audio_out. The cloud
+      // derives the routing flags from these. null until the first background probe finishes,
+      // and on platforms we cannot probe: null is UNKNOWN, and the cloud leaves flags alone.
+      device_capabilities: getDeviceReport(),
       // Structured task types this node can RUN, not merely parse. The cloud mirrors these
       // into capabilities and routes the type only to nodes that report it true.
       task_capabilities: (() => {
