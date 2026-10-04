@@ -3548,6 +3548,19 @@ function loadOllamaSessions () {
 }
 
 // List available Ollama models
+// POST /api/local-llm/chat — one agent turn on this node's local model server (bridge_call
+// local_llm.chat). Body: { model, messages, tools?, tool_choice?, temperature?, max_tokens? }.
+// Returns { message: {role, content, tool_calls?}, finish_reason, usage, model, server }.
+// Behind the global bridgeAuth like every other route; the server address comes from the
+// node's env, never from the request (daemon/local-llm.js chat()).
+app.post('/api/local-llm/chat', async (req, res) => {
+  try {
+    res.json(await require('./daemon/local-llm').chat(req.body || {}))
+  } catch (e) {
+    res.status(/is required/.test(e.message) ? 400 : 502).json({ error: e.message })
+  }
+})
+
 app.get('/api/ollama/models', async (req, res) => {
   try {
     const resp = await fetch(`${OLLAMA_HOST}/api/tags`, { signal: AbortSignal.timeout(5000) })
