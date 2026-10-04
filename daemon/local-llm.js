@@ -136,6 +136,78 @@ function parseLocalLlmResponse (raw) {
   return { content: null }
 }
 
+/**
+ * The chat-completions body for a whole agent turn: the conversation so far, plus the tools the
+ * model may call. buildChatBody above is the one-prompt shape `local_llm` TASKS use; an agent needs
+ * the history and the tools, or it can neither follow a conversation nor act.
+ */
+function buildConversationBody (args = {}, cfg) {
+  if (!Array.isArray(args.messages) || args.messages.length === 0) {
+    throw new Error('messages is required — a non-empty array of {role, content}')
+  }
+  const body = { model: cfg.model, messages: args.messages, stream: false }
+  if (Array.isArray(args.tools) && args.tools.length) {
+    body.tools = args.tools
+    if (args.tool_choice) body.tool_choice = args.tool_choice
+  }
+  if (typeof args.temperature === 'number') body.temperature = args.temperature
+  if (Number.isInteger(args.max_tokens)) body.max_tokens = args.max_tokens
+  if (args.response_format) body.response_format = args.response_format
+  return body
+}
+
+/**
+ * One agent turn against this node's local model server (`local_llm.chat` over bridge_call).
+ *
+ * Returns the assistant MESSAGE — text, or tool calls — because an agent loop needs the
+ * structure. Flattened to text (what a `local_llm` task returns) a tool call is unusable.
+ * The server URL is the node's to choose (env), never the caller's: the cloud names a model, not
+ * an address, so a dispatched call cannot be pointed at anything else on the node's network.
+ *
+ * Every failure throws with a NAMED reason — no server, server refused, empty answer — because
+ * "the model failed" is three different problems with three different fixes.
+ */
+async function chat (args = {}, { env = process.env, timeoutMs = 10 * 60 * 1000, fetchImpl = fetch } = {}) {
+  const cfg = resolveLocalLlmConfig({ model: args.model }, env)
+  const body = buildConversationBody(args, cfg)
+  let res
+  try {
+    res = await fetchImpl(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    })
+  } catch (e) {
+    throw new Error(`No local model server answering at ${cfg.baseUrl} (${e.message})`)
+  }
+  const parsed = await res.json().catch(() => null)
+  if (!parsed) throw new Error(`Local model server at ${cfg.baseUrl} answered HTTP ${res.status} with a body that is not JSON`)
+  if (parsed.error) {
+    const e = parsed.error
+    throw new Error(`Local model server at ${cfg.baseUrl} refused (${cfg.model}): ${typeof e === 'string' ? e : (e.message || JSON.stringify(e))}`)
+  }
+  const choice = parsed.choices?.[0]
+  if (!choice?.message) throw new Error(`Local model server at ${cfg.baseUrl} returned no message (${cfg.model})`)
+  const m = choice.message
+  const toolCalls = Array.isArray(m.tool_calls) && m.tool_calls.length ? m.tool_calls : null
+  const content = typeof m.content === 'string' ? m.content : ''
+  // Same rule as parseLocalLlmResponse: no text and no tool call is a failure, not an answer.
+  if (!toolCalls && !content.trim()) {
+    const thought = m.reasoning || m.reasoning_content
+    throw new Error(choice.finish_reason === 'length'
+      ? `${cfg.model} ran out of tokens before answering${thought ? ' — the budget went on reasoning' : ''}; raise max_tokens`
+      : `${cfg.model} returned an empty answer`)
+  }
+  return {
+    message: { role: 'assistant', content, ...(toolCalls ? { tool_calls: toolCalls } : {}) },
+    finish_reason: choice.finish_reason || null,
+    usage: parsed.usage || null,
+    model: parsed.model || cfg.model,
+    server: cfg.server
+  }
+}
+
 /** curl exit codes worth translating — the bare number reads as a model failure. */
 function describeCurlExit (code, cfg) {
   switch (code) {
@@ -236,6 +308,8 @@ module.exports = {
   resolveLocalLlmConfig,
   guessServer,
   buildChatBody,
+  buildConversationBody,
+  chat,
   buildCurlArgs,
   parseLocalLlmResponse,
   describeCurlExit,

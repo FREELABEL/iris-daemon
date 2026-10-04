@@ -82,7 +82,46 @@ const appExists = (name) =>
 let vaultProbeCache = null
 const VAULT_PROBE_TTL_MS = 5 * 60 * 1000
 
+/**
+ * Whether this node's local model server answers. probeLocalLlm is async (an HTTP GET) and
+ * available() must be sync, so the answer is cached and refreshed in the background — at most
+ * once a minute, never on the request path. Before the first probe returns, the answer is
+ * "unknown", which is not "unavailable": the call is allowed, and chat() names the reason if
+ * the server is not there.
+ */
+let llmProbe = { at: 0, result: null, inflight: null }
+const LLM_PROBE_TTL_MS = 60 * 1000
+
+function localLlmAvailable () {
+  const now = Date.now()
+  if (!llmProbe.inflight && now - llmProbe.at > LLM_PROBE_TTL_MS) {
+    llmProbe.inflight = require('./local-llm').probeLocalLlm()
+      .then((p) => {
+        llmProbe.result = p.available
+          ? { ok: true, detail: `${p.server}: ${p.model_count} model(s)` }
+          : { ok: false, reason: `No local model server answering at ${p.base_url}` }
+        llmProbe.at = Date.now()
+      })
+      .catch(() => {})
+      .finally(() => { llmProbe.inflight = null })
+  }
+  return llmProbe.result || { ok: true, detail: 'not probed yet' }
+}
+
 const PROVIDERS = {
+  // An agent turn against this node's own model server (Ollama by default). The cloud sends the
+  // conversation and the tools; the node calls 127.0.0.1 and returns the assistant message. Lets a
+  // platform agent run on a model that never leaves the building — PATTY on iris-hive-001
+  // (EPIC #187884). timeoutMs: a 14B model on CPU took 40–75s per answer on 2026-10-03, past the
+  // 60s every other route gets.
+  local_llm: {
+    name: 'Local models',
+    description: "This node's OpenAI-compatible model server — Ollama by default",
+    available: localLlmAvailable,
+    functions: {
+      chat: { method: 'POST', path: '/api/local-llm/chat', timeoutMs: 10 * 60 * 1000 },
+    },
+  },
   obsidian: {
     name: 'Obsidian',
     description: 'Local Obsidian vaults — markdown read straight off disk',
@@ -312,7 +351,7 @@ async function call (providerKey, functionName, args = {}) {
   if (token) headers['x-bridge-key'] = token
 
   let url = `${base}${route.path}`
-  const init = { method: route.method, headers, signal: AbortSignal.timeout(60000) }
+  const init = { method: route.method, headers, signal: AbortSignal.timeout(route.timeoutMs || 60000) }
 
   if (route.method === 'GET') {
     const qs = new URLSearchParams()
