@@ -49,23 +49,46 @@ function instructions (binary) {
   ]
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 function token () {
   try { return fs.readFileSync(path.join(os.homedir(), '.iris', 'bridge-token'), 'utf8').trim() } catch { return '' }
 }
 
+async function get (route) {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), 8000)
+  try {
+    return await fetch(`${BRIDGE}${route}`, { headers: { 'X-Bridge-Key': token(), Accept: 'application/json' }, signal: ctrl.signal })
+  } finally { clearTimeout(t) }
+}
+
+/**
+ * The permissions report, or { starting } / { old_daemon } / null (not answering).
+ *
+ * A 404 is NOT proof of an old daemon. Measured 2026-10-04: right after a restart the bridge
+ * serves while the embedded daemon has not mounted /daemon/* yet, so /daemon/permissions 404s
+ * for a few seconds. Only "health answers, permissions does not" means the code is old.
+ */
 async function getReport () {
   try {
-    const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), 8000)
-    const res = await fetch(`${BRIDGE}/daemon/permissions`, { headers: { 'X-Bridge-Key': token(), Accept: 'application/json' }, signal: ctrl.signal })
-    clearTimeout(t)
-    if (res.status === 404) return { old_daemon: true }
-    if (!res.ok) return null
-    return await res.json()
+    const res = await get('/daemon/permissions')
+    if (res.ok) return await res.json()
+    if (res.status !== 404) return null
+    const health = await get('/daemon/health').catch(() => null)
+    return health && health.ok ? { old_daemon: true } : { starting: true }
   } catch { return null }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** Wait out a daemon that is still starting (up to `seconds`), then return the final answer. */
+async function settledReport (seconds = 30) {
+  let r = await getReport()
+  for (let i = 0; i < seconds / 2 && (r === null || (r && r.starting)); i++) {
+    await sleep(2000)
+    r = await getReport()
+  }
+  return r && r.starting ? null : r
+}
 
 function restartDaemon () {
   const r = spawnSync(DAEMONCTL, ['restart'], { stdio: 'inherit' })
@@ -88,7 +111,7 @@ async function main (argv) {
   const ti = argv.indexOf('--timeout')
   const timeoutS = ti >= 0 ? Math.max(10, parseInt(argv[ti + 1], 10) || 300) : 300
 
-  let report = await getReport()
+  let report = await settledReport(parseInt(process.env.IRIS_GRANT_SETTLE_SECONDS || '30', 10))
   if (report && report.old_daemon) {
     console.error('This daemon is too old to check its own permissions. Update it: iris-daemon start (it pulls the latest code), then run this again.')
     return 1

@@ -91,16 +91,17 @@ describe('grant-access decides the next step', () => {
 })
 
 describe('grant-access against a stub daemon', () => {
-  const runScript = (url, args) => new Promise((resolve) => {
+  const runScript = (url, args, env = {}) => new Promise((resolve) => {
     const p = spawn(process.execPath, [path.join(__dirname, '..', 'scripts', 'grant-access.js'), ...args],
-      { env: { ...process.env, IRIS_BRIDGE_URL: url }, stdio: ['ignore', 'pipe', 'pipe'] })
+      { env: { ...process.env, IRIS_BRIDGE_URL: url, IRIS_GRANT_SETTLE_SECONDS: '2', ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     p.stdout.on('data', (d) => { out += d }); p.stderr.on('data', (d) => { out += d })
     p.on('close', (code) => resolve({ code, out }))
   })
-  const serve = (body, status = 200) => new Promise((resolve) => {
+  const serve = (body, status = 200, healthStatus = 200) => new Promise((resolve) => {
     const s = http.createServer((req, res) => {
-      res.writeHead(req.url === '/daemon/permissions' ? status : 404, { 'Content-Type': 'application/json' })
+      const code = req.url === '/daemon/permissions' ? status : req.url === '/daemon/health' ? healthStatus : 404
+      res.writeHead(code, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(body))
     }).listen(0, '127.0.0.1', () => resolve(s))
   })
@@ -121,12 +122,21 @@ describe('grant-access against a stub daemon', () => {
     assert.match(r.out, /"available": false/)
   })
 
-  it('an old daemon without the route gets told to update, not a crash', async () => {
-    const s = await serve({}, 404)
+  it('an old daemon (health answers, permissions 404) gets told to update', async () => {
+    const s = await serve({}, 404, 200)
     const r = await runScript(`http://127.0.0.1:${s.address().port}`, [])
     s.close()
     assert.equal(r.code, 1)
     assert.match(r.out, /too old/)
+  })
+
+  it('a daemon still STARTING (everything 404) is waited for, never called "too old"', async () => {
+    const s = await serve({}, 404, 404)
+    const r = await runScript(`http://127.0.0.1:${s.address().port}`, [], { IRIS_GRANT_SETTLE_SECONDS: '4' })
+    s.close()
+    assert.equal(r.code, 1)
+    assert.doesNotMatch(r.out, /too old/)
+    assert.match(r.out, /not answering/)
   })
 
   it('daemon down: one clear line, exit 1', async () => {

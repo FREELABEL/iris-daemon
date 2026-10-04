@@ -63,7 +63,9 @@ function probeFullDiskAccess (io = defaultIo) {
   } catch (e) {
     const code = e && e.code
     if (code === 'EPERM' || code === 'EACCES') {
-      return no('denied by macOS privacy (grant Full Disk Access to the terminal/daemon, then restart it)')
+      // Name the real file. "the terminal/daemon" sent people to add Terminal, which cannot work
+      // for a launchd-started daemon (#184935).
+      return no(`denied by macOS privacy — grant Full Disk Access to ${process.execPath} (not your terminal), then run: iris-daemon grant-access — it restarts the daemon for you`)
     }
     if (code === 'ENOENT') {
       // Genuinely different: nothing to read, so this tells us nothing about the permission.
