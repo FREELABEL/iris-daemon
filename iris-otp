@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+'use strict'
+// `iris-otp <name>` — print the current TOTP code for a node-vault credential (#187916).
+// The seed stays in the vault; a portal robot calls this (path in $IRIS_OTP_JS) at login time.
+require('./lib/node-vault-cli').main(['otp', ...process.argv.slice(2)]).then(code => process.exit(code))

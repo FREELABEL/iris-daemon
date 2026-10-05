@@ -26,6 +26,7 @@ const { URL } = require('url')
 const fs = require('fs')
 const pathLib = require('path')
 const { phiSafeResult } = require('../lib/phi-task')
+const nodeVault = require('../lib/node-vault')
 
 // The node→cloud endpoints that carry what a task produced (#187918). For a PHI task each of
 // these is filtered in post() below — the one door every report goes out through.
@@ -73,6 +74,19 @@ class CloudClient {
 
     // Tasks inside a PHI boundary, id → local directory their full record is kept in (#187918).
     this.phiTasks = new Map()
+
+    // Tasks that opened a node-vault credential, id → the values that must never be sent (#187915).
+    this.secretTasks = new Map()
+  }
+
+  /**
+   * Mark a task as holding node-vault secrets: every progress/output/result/artifact post for it
+   * is deep-redacted in post() — the same one door the PHI filter uses, for the same reason.
+   */
+  markSecretTask (taskId, secrets) {
+    if (!taskId || !secrets) return
+    this.secretTasks.set(String(taskId), secrets)
+    if (this.secretTasks.size > 200) this.secretTasks.delete(this.secretTasks.keys().next().value)
   }
 
   /**
@@ -140,7 +154,12 @@ class CloudClient {
    * @param {Object} extra - Additional data to include (capacity, hardware_profile, paused)
    */
   async sendHeartbeat (extra = {}) {
-    return this.post('/api/v6/node-agent/heartbeat', extra)
+    // #187915: the owner can see WHICH portal logins this machine holds — names, type and whether
+    // a TOTP seed is present, read from the vault's index (never the sealed store). Values never
+    // leave the node. Best-effort: a broken vault must not stop the heartbeat.
+    let vaultCredentials
+    try { vaultCredentials = nodeVault.listNames() } catch { vaultCredentials = undefined }
+    return this.post('/api/v6/node-agent/heartbeat', vaultCredentials ? { ...extra, vault_credentials: vaultCredentials } : extra)
   }
 
   /**
@@ -257,6 +276,9 @@ class CloudClient {
   }
 
   async post (path, body) {
+    // Redact BEFORE the PHI filter, so the local PHI record is clean too (#187915).
+    const m = TASK_RETURN_PATH.exec(path)
+    if (m && this.secretTasks.has(m[1])) body = nodeVault.redactDeep(body, this.secretTasks.get(m[1]))
     const filtered = this._phiFilter(path, body)
     if (filtered.skip) return filtered.skip
     return this._requestWithFailover('POST', path, filtered.body)

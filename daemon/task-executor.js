@@ -23,6 +23,7 @@ const { spawn, execSync, execFileSync, exec: execAsync } = require('child_proces
 const { requireGit } = require('../lib/require-git')
 const { OutputStreamer } = require('./output-streamer')
 const { isPhiTask } = require('../lib/phi-task')
+const nodeVault = require('../lib/node-vault')
 const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
 const path = require('path')
@@ -1151,6 +1152,25 @@ class TaskExecutor {
         }
       } catch (err) {
         console.warn(`[executor] No credentials available for task ${taskId}: ${err.message}`)
+      }
+    }
+
+    // #187915 / #187916: a portal login referenced by NAME from this node's own vault. The values
+    // are opened here, on the machine that types them, and go ONLY into this task's child env
+    // (non-enumerable, so no JSON.stringify of the task — result, log, PHI record — carries them).
+    // Every report for this task is then redacted at the cloud client's one door, and the child's
+    // output is redacted as it arrives. The name is logged; the values never are.
+    const vaultName = task.config?.node_credential
+    if (vaultName) {
+      try {
+        const cred = nodeVault.getCredential(String(vaultName))
+        const secrets = nodeVault.secretsFor(cred, { since: Date.now() })
+        Object.defineProperty(task, '_vaultEnv', { value: nodeVault.envForTask(String(vaultName), cred), enumerable: false, configurable: true })
+        Object.defineProperty(task, '_vaultSecrets', { value: secrets, enumerable: false, configurable: true })
+        if (this.cloud && typeof this.cloud.markSecretTask === 'function') this.cloud.markSecretTask(taskId, secrets)
+        console.log(`[executor] node-vault credential "${vaultName}" opened for task ${taskId}`)
+      } catch (err) {
+        console.warn(`[executor] node-vault credential "${vaultName}" unavailable for task ${taskId}: ${err.message}`)
       }
     }
 
@@ -4499,7 +4519,9 @@ exit 1
         PROJECT_DIR: workspace.projectDir,
         ...accountEnvForScripts(),
         ...(workspace.env || {}),
-        ...(task.config?.env_vars || {})
+        ...(task.config?.env_vars || {}),
+        // Last, so a task's own env_vars cannot shadow the vault's values (#187915).
+        ...(task._vaultEnv || {})
       }
 
       // Timeout config (shared by both paths)
@@ -4517,7 +4539,9 @@ exit 1
       const isGraceful = gracefulTypes.includes(task.type)
 
       // ── tmux path: spawn inside a persistent tmux session ──
-      if (this.tmux.available) {
+      // #187915: a task holding vault secrets skips tmux. That path hands the env to the wrapper
+      // through a file and records output to disk unredacted; direct spawn keeps both in memory.
+      if (this.tmux.available && !task._vaultEnv) {
         let tmuxSession
         try {
           tmuxSession = this.tmux.createForTask(task, cmd, args, spawnEnv, workspace.projectDir)
@@ -4670,7 +4694,9 @@ exit 1
       }
 
       child.stdout.on('data', (data) => {
-        const lines = data.toString().split('\n').filter(Boolean)
+        // Redacted at arrival (#187915): outputLines, the live stream and the daemon log all
+        // read from these lines, so a script that prints the password prints it nowhere.
+        const lines = nodeVault.redactSecrets(data.toString(), task._vaultSecrets).split('\n').filter(Boolean)
         // Kept separately as well as in outputLines. The OS hands us two streams and this used
         // to concatenate them into one array with a "[stderr] " prefix — the same defect as the
         // PTY scrape, one layer up, and the reason `hive selftest` still scored
@@ -4687,7 +4713,7 @@ exit 1
       })
 
       child.stderr.on('data', (data) => {
-        const lines = data.toString().split('\n').filter(Boolean)
+        const lines = nodeVault.redactSecrets(data.toString(), task._vaultSecrets).split('\n').filter(Boolean)
         stderrLines.push(...lines)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
         // Pushed as its own STREAM, not with an invented prefix — the viewer can style it.
@@ -4831,7 +4857,9 @@ exit 1
       }
 
       child.stdout.on('data', (data) => {
-        const lines = data.toString().split('\n').filter(Boolean)
+        // Redacted at arrival (#187915): outputLines, the live stream and the daemon log all
+        // read from these lines, so a script that prints the password prints it nowhere.
+        const lines = nodeVault.redactSecrets(data.toString(), task._vaultSecrets).split('\n').filter(Boolean)
         // Kept separately as well as in outputLines. The OS hands us two streams and this used
         // to concatenate them into one array with a "[stderr] " prefix — the same defect as the
         // PTY scrape, one layer up, and the reason `hive selftest` still scored
@@ -4847,7 +4875,7 @@ exit 1
       })
 
       child.stderr.on('data', (data) => {
-        const lines = data.toString().split('\n').filter(Boolean)
+        const lines = nodeVault.redactSecrets(data.toString(), task._vaultSecrets).split('\n').filter(Boolean)
         stderrLines.push(...lines)
         outputLines.push(...lines.map((l) => `[stderr] ${l}`))
         lines.forEach((line) => {
