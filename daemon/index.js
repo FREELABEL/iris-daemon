@@ -152,6 +152,31 @@ class Daemon {
     }
   }
 
+  /**
+   * Encrypted vaults: (1) once, seal PHI task dirs that #187918 kept as plaintext before vaults
+   * existed (encrypt → verify → delete; failures stay put); (2) daily, crypto-shred PHI working
+   * copies older than HIVE_PHI_RETENTION_DAYS (default 30) and send a counts-only audit event.
+   * Started after registration so the node id is known and the audit post can authenticate.
+   */
+  _startVaultMaintenance () {
+    if (this._vaultTimer) return
+    const phiVault = require('../lib/phi-vault')
+    const running = (id) => !!(this.executor && this.executor.runningTasks && this.executor.runningTasks.has(id))
+    const tasksDir = this.workspaces && this.workspaces.tasksDir
+    if (tasksDir) {
+      phiVault.migratePlain(tasksDir, { nodeId: this.nodeId, running })
+        .then(r => { if (r.tasks) console.log(`[vaults] migrated ${r.tasks} plaintext PHI task dir(s) into vault phi-migrated: ${r.absorbed} file(s), ${r.bytes} bytes${r.failed ? `, ${r.failed} left in place` : ''}`) })
+        .catch(e => console.warn(`[vaults] plaintext PHI migration failed (${e.message}) — nothing was deleted`))
+    }
+    const sweep = () => phiVault.retentionSweep({ cloud: this.cloud })
+      .then(rows => { for (const r of rows) console.log(`[vaults] retention: shredded ${r.files} object(s), ${r.bytes} bytes older than ${r.retention_days}d in vault ${r.vault}`) })
+      .catch(e => console.warn(`[vaults] retention sweep failed: ${e.message}`))
+    const first = setTimeout(sweep, 5 * 60 * 1000)
+    if (first.unref) first.unref()
+    this._vaultTimer = setInterval(sweep, 24 * 60 * 60 * 1000)
+    if (this._vaultTimer.unref) this._vaultTimer.unref()
+  }
+
   _startPermissionProbe () {
     const FIFTEEN_MINUTES = 15 * 60 * 1000
     this._refreshPermissions()
@@ -274,6 +299,8 @@ class Daemon {
       this.executor.nodeId = this.nodeId
       this.executor.nodeName = this.nodeName
     }
+
+    this._startVaultMaintenance()
 
     console.log(`[daemon] Node registered: ${this.nodeId}`)
     console.log(`[daemon] Name: ${this.nodeName}`)
@@ -483,6 +510,14 @@ class Daemon {
           return null
         }
       })(),
+      // Encrypted vaults: is this machine's disk encrypted at rest? The cloud mirrors `encrypted`
+      // into the `disk_encrypted` capability and routes PHI tasks ONLY to nodes reporting true.
+      // null = could not tell, which routes like false. Cached for an hour (FDE rarely changes).
+      disk_encryption: (() => {
+        try { return require('../lib/disk-encryption').diskEncryptionReport() } catch { return null }
+      })(),
+      // Encrypted vaults on this node: names, bloq, locked, size. Never contents or file names.
+      encrypted_vaults: require('../lib/encrypted-vault').heartbeatReport(),
       bridge_capabilities: (() => {
         try {
           return require('./bridge-registry').capabilities()
@@ -904,6 +939,15 @@ class Daemon {
       }
       res.json(this.hardwareProfile || getCachedProfile() || { error: 'No profile detected' })
     })
+
+    // ── Encrypted vaults (`iris hive vaults …`) ──
+    // Behind the same bridge auth as every other route here. The daemon owns vaults because a
+    // passphrase vault's key lives only in THIS process's memory after unlock. Responses carry
+    // summaries only — never contents, never object names.
+    {
+      const vaultRoutes = require('../lib/vault-routes')
+      vaultRoutes.mount(app, prefix, { cloud: () => this.cloud, nodeId: () => this.nodeId })
+    }
 
     // Pause — kill switch (user sovereignty)
     app.post(`${prefix}/pause`, (req, res) => {

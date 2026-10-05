@@ -105,6 +105,18 @@ class CloudClient {
   }
 
   /**
+   * Encrypted vaults: from now on a PHI task's full result is sealed into its vault instead of a
+   * plain 0600 phi-result.json. `sink.putResult(buf)` returns the ref (`vault:<name>/<object id>`)
+   * that goes home as local_ref. The executor attaches it once the task's vault is open.
+   */
+  attachPhiVault (taskId, sink) {
+    if (!taskId || !sink) return
+    if (!this.phiVaults) this.phiVaults = new Map()
+    this.phiVaults.set(String(taskId), sink)
+    if (this.phiVaults.size > 1000) this.phiVaults.delete(this.phiVaults.keys().next().value)
+  }
+
+  /**
    * WHAT A PHI TASK MAY SEND HOME (#187918 — "what the robot saw stays where the robot ran").
    *
    * Applied here rather than at each of the executor's dozen submitResult sites because a guard
@@ -112,11 +124,13 @@ class CloudClient {
    *   output    → not sent. Live stdout is exactly the free text the ticket is about.
    *   artifacts → not sent. Screenshots and recordings stay on disk.
    *   progress  → the percentage only; the status line is the task's last stdout line.
-   *   result    → written in full to <taskDir>/phi-result.json (0600) on this machine; the
-   *               cloud gets phiSafeResult(): status, exit code, booleans and that local path.
-   * @returns {{ skip: object }|{ body: object }}
+   *   result    → sealed in full into the task's encrypted vault (attachPhiVault) — or, for a
+   *               task with no vault (an early refusal), <taskDir>/phi-result.json (0600), which
+   *               the executor's workspace absorb then moves into the vault. The cloud gets
+   *               phiSafeResult(): status, exit code, booleans and that local ref.
+   * @returns {Promise<{ skip: object }|{ body: object }>}
    */
-  _phiFilter (path, body) {
+  async _phiFilter (path, body) {
     const m = TASK_RETURN_PATH.exec(path)
     if (!m || !this.phiTasks.has(m[1])) return { body }
     const [, taskId, kind] = m
@@ -126,6 +140,17 @@ class CloudClient {
 
     const dir = this.phiTasks.get(taskId)
     let localRef = null
+    const sink = this.phiVaults && this.phiVaults.get(taskId)
+    if (sink) {
+      try {
+        localRef = await sink.putResult(Buffer.from(JSON.stringify(body, null, 2)))
+        return { body: phiSafeResult(body, { localRef }) }
+      } catch (e) {
+        // Fall through to the plain local copy: the workspace absorb seals it later. Losing the
+        // result because the vault hiccuped would be worse than a short plaintext window.
+        console.warn(`[cloud] PHI task ${taskId}: vault write failed (${e.message}) — keeping a local copy for the workspace absorb`)
+      }
+    }
     if (dir) {
       try {
         fs.mkdirSync(dir, { recursive: true })
@@ -279,7 +304,7 @@ class CloudClient {
     // Redact BEFORE the PHI filter, so the local PHI record is clean too (#187915).
     const m = TASK_RETURN_PATH.exec(path)
     if (m && this.secretTasks.has(m[1])) body = nodeVault.redactDeep(body, this.secretTasks.get(m[1]))
-    const filtered = this._phiFilter(path, body)
+    const filtered = await this._phiFilter(path, body)
     if (filtered.skip) return filtered.skip
     return this._requestWithFailover('POST', path, filtered.body)
   }

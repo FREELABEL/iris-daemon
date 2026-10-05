@@ -383,9 +383,13 @@ case "${1:-status}" in
         # Node-local credential vault (#187915): portal logins + TOTP seeds that never leave this machine.
         shift
         exec node "$BRIDGE_DIR/lib/node-vault-cli.js" "$@" ;;
+    vaults)
+        # Encrypted, partitioned PHI vaults: list / files / export / sweep on this machine.
+        shift
+        exec node "$BRIDGE_DIR/lib/vault-cli.js" "$@" ;;
     otp)
         # Current TOTP code for a vault credential, generated here (#187916).
         shift
         exec node "$BRIDGE_DIR/lib/node-vault-cli.js" otp "$@" ;;
-    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor|grant-access|creds|otp}" ;;
+    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor|grant-access|creds|vaults|otp}" ;;
 esac

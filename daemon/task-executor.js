@@ -22,7 +22,8 @@
 const { spawn, execSync, execFileSync, exec: execAsync } = require('child_process')
 const { requireGit } = require('../lib/require-git')
 const { OutputStreamer } = require('./output-streamer')
-const { isPhiTask } = require('../lib/phi-task')
+const { isPhiTask, refusalCode } = require('../lib/phi-task')
+const phiVault = require('../lib/phi-vault')
 const nodeVault = require('../lib/node-vault')
 const portalCheckpoint = require('../lib/portal-checkpoint')
 const { planPeerExec } = require('./peer-exec')
@@ -1094,7 +1095,9 @@ class TaskExecutor {
     // reads it through IRIS_PORTAL_LIB / IRIS_PORTAL_CHECKPOINT (lib/portal-checkpoint.js).
     let portalRun = null
     try {
-      portalRun = portalCheckpoint.preparePortalRun(task, workspace.dir)
+      // A PHI run keeps its checkpoint INSIDE the workspace, so the end-of-task absorb seals it
+      // into the bloq's vault with everything else (restored from there before it runs).
+      portalRun = portalCheckpoint.preparePortalRun(task, workspace.dir, phi ? { dir: phiVault.checkpointDir(workspace.dir) } : undefined)
       if (portalRun) {
         workspace.env = { ...(workspace.env || {}), ...portalRun.env }
         console.log(`[executor]   Portal run ${portalRun.runKey}: checkpoint ${portalRun.file}`)
@@ -1197,7 +1200,30 @@ class TaskExecutor {
       }
     }
 
+    // Encrypted vaults: the PHI task's vault, once gate() opened it. Read in `finally`.
+    let phiVaultEntry = null
+
     try {
+      // ── PHI gate: full-disk encryption, the bloq's encrypted vault, escrow ──
+      // Before ANY work: a PHI task that cannot keep what it sees encrypted does not start. The
+      // refusal carries a fixed code (never free text) the server turns into "how to fix this".
+      if (phi) {
+        const g = await phiVault.gate(task, { nodeId: this.nodeId, cloud: this.cloud })
+        if (!g.ok) {
+          console.warn(`[executor] [${ts()}] PHI task ${taskId} refused: ${g.reason}`)
+          clearInterval(progressInterval)
+          outputStream.stop().catch(() => {})
+          await this.cloud.submitResult(taskId, { status: 'failed', error: g.reason, metadata: { phi_refusal: refusalCode(g.reason) } })
+          return
+        }
+        phiVaultEntry = g.entry
+        if (typeof this.cloud.attachPhiVault === 'function') this.cloud.attachPhiVault(taskId, phiVault.resultSink(g.entry, taskId))
+        console.log(`[executor]   PHI vault: ${g.entry.name}${g.created ? ' (created for this bloq)' : ''}`)
+        if (portalRun) {
+          try { if (await phiVault.checkpointRestore(g.entry, portalRun.runKey, workspace.dir)) console.log(`[executor]   Portal checkpoint restored from vault ${g.entry.name}`) } catch (e) { console.warn(`[executor] portal checkpoint restore failed (${e.message}) — the run starts fresh`) }
+        }
+      }
+
       // ── Short-circuit: message type needs no subprocess (any runtime) ──
       if (task.type === 'message') {
         const msgConfig = task.config || {}
@@ -1974,6 +2000,14 @@ class TaskExecutor {
       // being sent — the local_ref in its result points here. Deleting it a minute later would
       // turn "kept on the node" into "kept nowhere".
       if (!phi) setTimeout(() => this.workspaces.cleanup(taskId), 60000)
+      // A PHI task's workspace is sealed into its vault — encrypt, verify, THEN delete — so what
+      // "stays on the node" stays there encrypted. Anything that fails to seal stays as it was.
+      else if (phiVaultEntry) {
+        const entry = phiVaultEntry
+        phiVault.absorbWorkspace(entry, workspace.dir, { taskId, runKey: portalRun ? portalRun.runKey : null })
+          .then(r => console.log(`[executor] PHI task ${taskId}: ${r.absorbed} file(s), ${r.bytes} bytes sealed into vault ${entry.name}${r.failed.length ? ` — ${r.failed.length} left in place: ${r.failed.map(f => f.error).join('; ')}` : ''}`))
+          .catch(e => console.warn(`[executor] PHI task ${taskId}: vault absorb failed (${e.message}) — workspace left in place`))
+      }
     }
   }
 
@@ -5551,27 +5585,8 @@ exit 1
 // Hive inbox decryption — #177946 phase 3
 // =============================================================================================
 
-const ENVELOPE_VERSION = 'ihw.v1'
-const RS = '\x1e'
-const US = '\x1f'
-
-/**
- * The frozen ihw.v1 binding. LENGTH-PREFIXED, not joined.
- *
- * Must match fl-iris-api's EnvelopeCrypto::bind() and the CLI's envelope.ts byte for byte — this
- * is the third implementation of the same 12 lines, which is unavoidable (the daemon is plain
- * Node, separate from the bundled CLI) and is exactly why it is pinned by golden vectors on the
- * other two sides.
- *
- * BYTE length, not string length: PHP's strlen() counts bytes, and JS String.length counts UTF-16
- * code units. Using .length here would derive a different key for any non-ASCII id and surface
- * only as "this file will not open".
- */
-function envelopeBind(purpose, fields) {
-  const parts = [ENVELOPE_VERSION, purpose]
-  for (const value of fields) parts.push(`${Buffer.byteLength(value, 'utf8')}${US}${value}`)
-  return parts.join(RS)
-}
+// The frozen ihw.v1 primitives live in lib/envelope.js (shared with encrypted vaults' escrow wrap).
+const { ENVELOPE_VERSION, envelopeBind, openEnvelopeBuffers, X25519_SPKI_PREFIX, X25519_PKCS8_PREFIX } = require('../lib/envelope')
 
 /** This node's envelope keypair, written by `iris hive keys register`. */
 function loadEnvelopeKeypair() {
@@ -5588,8 +5603,6 @@ function loadEnvelopeKeypair() {
   }
 }
 
-const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex')
-const X25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex')
 
 /**
  * Open an ihw.v1 envelope: fetch this node's wrap, unwrap the DEK, then open the content.
@@ -5728,38 +5741,6 @@ function decryptLegacyCbc(fullPath, safeName, config) {
     console.error(`[hive-inbox] LEGACY DECRYPT FAILED for ${safeName}: ${decryptErr.message}`)
     console.error(`[hive-inbox]   ciphertext kept at ${safeName}.undecryptable — likely a sender on a different api key`)
   }
-}
-
-/**
- * Pure envelope math, exported for testing.
- *
- * This daemon is the THIRD implementation of ihw.v1 (after PHP's EnvelopeCrypto and the CLI's
- * envelope.ts) and cannot be merged with either — it is plain Node, separate from the bundled
- * CLI. Three copies of a frozen format is exactly where drift happens, and drift here does not
- * throw: it produces files the recipient silently cannot open. So the pure parts are exported and
- * pinned against a PHP-produced golden vector in tests/envelope-vector.test.js.
- */
-function openEnvelopeBuffers({ ephPublic, wrapNonce, wrappedDek, wrapTag, recipientSecret, recipientPublic, envelopeId, targetId, contentNonce, contentTag, sealed }) {
-  const shared = crypto.diffieHellman({
-    privateKey: crypto.createPrivateKey({ key: Buffer.concat([X25519_PKCS8_PREFIX, recipientSecret]), format: 'der', type: 'pkcs8' }),
-    publicKey: crypto.createPublicKey({ key: Buffer.concat([X25519_SPKI_PREFIX, ephPublic]), format: 'der', type: 'spki' }),
-  })
-
-  const info = envelopeBind('wrap', [ephPublic.toString('hex'), recipientPublic.toString('hex'), envelopeId, targetId])
-  const wrapKey = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32))
-
-  const wd = crypto.createDecipheriv('aes-256-gcm', wrapKey, wrapNonce, { authTagLength: 16 })
-  wd.setAAD(Buffer.from(envelopeBind('wrap', [envelopeId, targetId]), 'utf8'))
-  wd.setAuthTag(wrapTag)
-  const dek = Buffer.concat([wd.update(wrappedDek), wd.final()])
-
-  if (!sealed) return { dek, plaintext: null }
-
-  const cd = crypto.createDecipheriv('aes-256-gcm', dek, contentNonce, { authTagLength: 16 })
-  cd.setAAD(Buffer.from(envelopeBind('content', [envelopeId]), 'utf8'))
-  cd.setAuthTag(contentTag)
-
-  return { dek, plaintext: Buffer.concat([cd.update(sealed), cd.final()]) }
 }
 
 module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets }
