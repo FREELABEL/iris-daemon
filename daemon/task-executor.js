@@ -24,6 +24,7 @@ const { requireGit } = require('../lib/require-git')
 const { OutputStreamer } = require('./output-streamer')
 const { isPhiTask } = require('../lib/phi-task')
 const nodeVault = require('../lib/node-vault')
+const portalCheckpoint = require('../lib/portal-checkpoint')
 const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
 const path = require('path')
@@ -1088,6 +1089,20 @@ class TaskExecutor {
     const workspace = this.workspaces.create(taskId, task)
     console.log(`[executor]   Workspace: ${workspace.projectDir}`)
 
+    // #187919: a run over records gets a node-local checkpoint keyed by a run key that a retry
+    // shares, so the retry resumes at the first unfinished record instead of record 1. The robot
+    // reads it through IRIS_PORTAL_LIB / IRIS_PORTAL_CHECKPOINT (lib/portal-checkpoint.js).
+    let portalRun = null
+    try {
+      portalRun = portalCheckpoint.preparePortalRun(task, workspace.dir)
+      if (portalRun) {
+        workspace.env = { ...(workspace.env || {}), ...portalRun.env }
+        console.log(`[executor]   Portal run ${portalRun.runKey}: checkpoint ${portalRun.file}`)
+      }
+    } catch (e) {
+      console.warn(`[executor] portal checkpoint unavailable for task ${taskId}: ${e.message}`)
+    }
+
     // Set up progress reporting (every 5s)
     let lastProgress = 0
     let outputLines = []
@@ -1101,11 +1116,19 @@ class TaskExecutor {
     outputStream.start()
 
     const progressInterval = setInterval(async () => {
-      const progress = this.estimateProgress(outputLines, task)
+      // #187919: a portal run's progress is records done / total — counts, never a record. (For
+      // a PHI task the cloud client strips the message anyway and sends the percentage only.)
+      const portalSummary = portalRun ? portalCheckpoint.readSummary(portalRun.file) : null
+      const progress = portalSummary && portalSummary.total
+        ? Math.min(99, Math.floor((portalSummary.done / portalSummary.total) * 100))
+        : this.estimateProgress(outputLines, task)
       if (progress !== lastProgress) {
         lastProgress = progress
         try {
-          await this.cloud.reportProgress(taskId, progress, outputLines[outputLines.length - 1] || 'Working...')
+          const line = portalSummary && portalSummary.total
+            ? `portal run: ${portalSummary.done}/${portalSummary.total} records done`
+            : (outputLines[outputLines.length - 1] || 'Working...')
+          await this.cloud.reportProgress(taskId, progress, line)
         } catch { /* non-critical */ }
       }
     }, 5000)
@@ -1705,6 +1728,9 @@ class TaskExecutor {
         // no matter how carefully the node kept them apart (#182004).
         stdout: cap(result.stdout),
         stderr: cap(result.stderr),
+        // #187919: where the portal run got to, so a retry (and the person deciding on one) knows
+        // it resumes at record N. Counts and indexes only — safe even for a PHI task.
+        ...(portalRun ? { data: { portal_run: portalCheckpoint.safeSummary(portalCheckpoint.readSummary(portalRun.file)) } } : {}),
         metadata: {
           // WHICH MACHINE ACTUALLY RAN THIS (#182312). A task dispatched to one node executed
           // on another, and nothing in the result said so — three selftest runs scored 6/8,
