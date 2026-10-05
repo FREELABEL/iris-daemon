@@ -4,6 +4,11 @@
 /**
  * iris-daemon grant-access — give the daemon Full Disk Access in one guided step, and prove it.
  *
+ * OPERATOR TOOL. It asks macOS to approve the daemon's Node binary, a stock OpenJS-signed
+ * `node`, and that grant covers every Node program on the Mac. Fine on an operator's own
+ * machine; not something to put in front of a client. The IRIS CLI only offers it when
+ * IRIS_OPERATOR=1. The client path is a signed "IRIS" approval (epic #187965).
+ *
  * Nothing can grant this silently: macOS only lets a person flip the switch. So this does
  * everything around the switch. It names the exact file (the one the daemon is pinned to, not
  * "node" or your terminal), copies its path, opens the right pane, shows the file in Finder,
@@ -37,6 +42,7 @@ function nextStep (report) {
 
 function instructions (binary) {
   return [
+    'Operator tool: this approves the daemon\'s node binary, which also covers every other Node program on this Mac.',
     'IRIS needs Full Disk Access to read Mail and Messages. Only you can switch it on.',
     '',
     '  1. In the Settings window that just opened: Full Disk Access → click +',

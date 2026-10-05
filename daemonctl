@@ -333,6 +333,7 @@ case "${1:-status}" in
         sleep 1
         "$0" start ;;
     grant-access)
+        # OPERATOR TOOL (approves the node binary itself; see scripts/grant-access.js).
         # Full Disk Access, guided and verified. Run with the node the daemon is PINNED to
         # (~/.iris/daemon-node), so the script reports on the same file it asks you to approve.
         _GA_NODE="$(head -n 1 "$HOME/.iris/daemon-node" 2>/dev/null | tr -d '[:space:]')"
