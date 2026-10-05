@@ -34,6 +34,7 @@ const { deriveSessionStatus, sessionActivity, sessionReportFields, SESSIONS_PER_
 const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
+const { isPhiTask } = require('../lib/phi-task')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter } = require('./local-llm')
@@ -2195,6 +2196,13 @@ LIMIT ${limit}
             throw fetchErr
           }
         }
+      }
+
+      // #187918: mark a PHI task the moment we know it, BEFORE any report about it can go out —
+      // the refusals, the expiry and the delivery-contract replay below all submit results too,
+      // and a replay carries the earlier run's full stdout.
+      if (task && isPhiTask(task)) {
+        this.cloud.markPhiTask(event.task_id, path.join(this.workspaces.tasksDir, String(event.task_id)))
       }
 
       // Singleton / resource exclusion + browser concurrency are enforced in ONE place:

@@ -23,6 +23,13 @@ const crypto = require('crypto')
 const https = require('https')
 const http = require('http')
 const { URL } = require('url')
+const fs = require('fs')
+const pathLib = require('path')
+const { phiSafeResult } = require('../lib/phi-task')
+
+// The node→cloud endpoints that carry what a task produced (#187918). For a PHI task each of
+// these is filtered in post() below — the one door every report goes out through.
+const TASK_RETURN_PATH = /^\/api\/v6\/node-agent\/tasks\/([^/]+)\/(progress|output|result|artifacts)$/
 
 // Error codes that indicate DNS or connection-level failures (not HTTP errors)
 const CONNECTION_ERROR_CODES = ['ENOTFOUND', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN']
@@ -63,6 +70,60 @@ class CloudClient {
       // Default: opt into enforcement only when a signing secret is configured.
       this.requireSignature = !!process.env.HIVE_SIGNING_SECRET
     }
+
+    // Tasks inside a PHI boundary, id → local directory their full record is kept in (#187918).
+    this.phiTasks = new Map()
+  }
+
+  /**
+   * Mark a task as PHI: from now on nothing it produced leaves the node as free text — see
+   * _phiFilter(). The executor calls this before the task's first report.
+   */
+  markPhiTask (taskId, localDir) {
+    if (!taskId) return
+    this.phiTasks.set(String(taskId), localDir || null)
+    // Bounded: ids only, but a node that runs forever should not hold every id forever.
+    if (this.phiTasks.size > 1000) this.phiTasks.delete(this.phiTasks.keys().next().value)
+  }
+
+  isPhiTask (taskId) {
+    return this.phiTasks.has(String(taskId))
+  }
+
+  /**
+   * WHAT A PHI TASK MAY SEND HOME (#187918 — "what the robot saw stays where the robot ran").
+   *
+   * Applied here rather than at each of the executor's dozen submitResult sites because a guard
+   * that has to be remembered at every call site is a guard the next call site forgets.
+   *   output    → not sent. Live stdout is exactly the free text the ticket is about.
+   *   artifacts → not sent. Screenshots and recordings stay on disk.
+   *   progress  → the percentage only; the status line is the task's last stdout line.
+   *   result    → written in full to <taskDir>/phi-result.json (0600) on this machine; the
+   *               cloud gets phiSafeResult(): status, exit code, booleans and that local path.
+   * @returns {{ skip: object }|{ body: object }}
+   */
+  _phiFilter (path, body) {
+    const m = TASK_RETURN_PATH.exec(path)
+    if (!m || !this.phiTasks.has(m[1])) return { body }
+    const [, taskId, kind] = m
+    if (kind === 'output') return { skip: { ok: false, withheld: 'phi' } }
+    if (kind === 'artifacts') return { skip: { withheld: 'phi', cdn_urls: [] } }
+    if (kind === 'progress') return { body: { progress: body?.progress, message: null } }
+
+    const dir = this.phiTasks.get(taskId)
+    let localRef = null
+    if (dir) {
+      try {
+        fs.mkdirSync(dir, { recursive: true })
+        localRef = pathLib.join(dir, 'phi-result.json')
+        fs.writeFileSync(localRef, JSON.stringify(body, null, 2), { mode: 0o600 })
+      } catch (e) {
+        // Still never send it: a full disk loses the local copy, not the patient's privacy.
+        console.warn(`[cloud] PHI task ${taskId}: could not keep the result locally (${e.message})`)
+        localRef = null
+      }
+    }
+    return { body: phiSafeResult(body, { localRef }) }
   }
 
   /**
@@ -196,7 +257,9 @@ class CloudClient {
   }
 
   async post (path, body) {
-    return this._requestWithFailover('POST', path, body)
+    const filtered = this._phiFilter(path, body)
+    if (filtered.skip) return filtered.skip
+    return this._requestWithFailover('POST', path, filtered.body)
   }
 
   /**

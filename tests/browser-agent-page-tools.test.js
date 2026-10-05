@@ -116,9 +116,12 @@ async function run ({ browserOpts, html = NATIVE_PAGE, actions, config = {} }) {
   frameUrl = `http://localhost:${site.address().port}/frame`
   const url = `http://127.0.0.1:${site.address().port}/`
   const model = await scriptedModel(actions)
-  const env = { key: process.env.OPENAI_API_KEY, base: process.env.OPENAI_API_BASE }
+  const env = { key: process.env.OPENAI_API_KEY, base: process.env.OPENAI_API_BASE, provider: process.env.BROWSER_AGENT_PROVIDER }
   process.env.OPENAI_API_KEY = 'test'
   process.env.OPENAI_API_BASE = model.base
+  // The scripted model is a local OpenAI-compatible server: direct mode, which since #187917 is
+  // opt-in (the default is the IRIS model proxy).
+  process.env.BROWSER_AGENT_PROVIDER = 'direct'
   const browser = await chromium.launch({ headless: true, ...browserOpts })
   try {
     const page = await browser.newPage()
@@ -134,6 +137,8 @@ async function run ({ browserOpts, html = NATIVE_PAGE, actions, config = {} }) {
     process.env.OPENAI_API_KEY = env.key; process.env.OPENAI_API_BASE = env.base
     if (env.key === undefined) delete process.env.OPENAI_API_KEY
     if (env.base === undefined) delete process.env.OPENAI_API_BASE
+    if (env.provider === undefined) delete process.env.BROWSER_AGENT_PROVIDER
+    else process.env.BROWSER_AGENT_PROVIDER = env.provider
   }
 }
 

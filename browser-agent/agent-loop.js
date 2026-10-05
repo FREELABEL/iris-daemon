@@ -16,15 +16,16 @@ const { historyEntry } = require('./history-entry')
 const { ACTION_HELP, truncationHint } = require('./prompt-parts')
 const { PageTools, formatTools } = require('./page-tools')
 const { doneVerdict, changedState, wroteWithTool } = require('./done-check')
+const { resolveModelEndpoint } = require('./model-endpoint')
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
 
 /**
  * Call the OpenAI-compatible API to decide the next action.
+ * `endpoint` comes from resolveModelEndpoint(): the IRIS model proxy unless direct mode was
+ * explicitly configured for a non-PHI task (#187917).
  */
-async function decideAction(task, domText, stepHistory, step, model) {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey) throw new Error('OPENAI_API_KEY not set')
+async function decideAction(task, domText, stepHistory, step, model, endpoint) {
 
   const systemPrompt = `You are a browser automation agent. You control a real browser to complete tasks.
 
@@ -58,13 +59,9 @@ ${truncationHint(domText) ? truncationHint(domText) + '\n\n' : ''}${stepHistory.
 What is the next action? Respond with ONE JSON object only.`
 
   const maxTokens = Number(process.env.BROWSER_AGENT_MAX_TOKENS) || 200
-  const baseUrl = process.env.OPENAI_API_BASE || 'https://api.openai.com/v1'
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(endpoint.url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
+    headers: endpoint.headers,
     body: JSON.stringify({
       model,
       messages: [
@@ -92,7 +89,7 @@ What is the next action? Respond with ONE JSON object only.`
   // Thinking, fences, prose — see parse-action.js.
   const action = parseAction(content)
   if (!action) {
-    console.error(`[agent] Failed to parse LLM response: ${content.slice(0, 200)}`)
+    if (!endpoint.phi) console.error(`[agent] Failed to parse LLM response: ${content.slice(0, 200)}`)
     return { type: 'fail', reason: `Could not parse LLM response: ${content.slice(0, 100)}`, _usage: usage }
   }
   return { ...action, _usage: usage }
@@ -109,6 +106,18 @@ async function agentLoop(page, task, options = {}) {
   const maxSteps = options.maxSteps || task.config?.max_steps || DEFAULT_MAX_STEPS
   const model = options.model || task.config?.model || process.env.BROWSER_AGENT_MODEL || DEFAULT_MODEL
   const outputDir = options.outputDir || process.env.OUTPUT_DIR
+
+  // WHERE the page goes (#187917). Resolved once, before the first observation: a refusal (direct
+  // mode on a PHI task, no IRIS credential) is a property of the run, not of a step, and retrying
+  // it per step would only burn the step budget and report "max steps" instead of the reason.
+  let endpoint
+  try {
+    endpoint = options.endpoint || resolveModelEndpoint({ task })
+  } catch (e) {
+    console.error(`[agent] ${e.message}`)
+    return { success: false, error: e.message, steps: 0, history: [], usage: emptyUsage() }
+  }
+  const phi = endpoint.phi
 
   const history = []
   // What the run spent, from what the API reported — see usage.js.
@@ -131,8 +140,13 @@ async function agentLoop(page, task, options = {}) {
   // its done was refused, booked the same table twelve more times — twelve real reservations.
   // Repeating a successful write is never progress; refuse it and say so.
   const doneWrites = new Map()
-  console.log(`[agent] Starting loop — max ${maxSteps} steps, model: ${model}`)
-  console.log(`[agent] Task: ${task.prompt || task.title}`)
+  console.log(`[agent] Starting loop — max ${maxSteps} steps, model: ${model}, via ${endpoint.mode}${phi ? ' (PHI task)' : ''}`)
+  // A PHI task's prompt, page and actions are not echoed: stdout is captured by the daemon, and
+  // even though it no longer leaves the node for a PHI task (#187918), the log file it lands in
+  // is not where patient data should accumulate either.
+  const say = phi ? () => {} : (...a) => console.log(...a)
+  const warn = phi ? () => {} : (...a) => console.warn(...a)
+  say(`[agent] Task: ${task.prompt || task.title}`)
 
   for (let step = 0; step < maxSteps; step++) {
     const timestamp = new Date().toLocaleTimeString('en-US', { hour12: true })
@@ -144,7 +158,7 @@ async function agentLoop(page, task, options = {}) {
       // Wait briefly for any pending navigation/renders
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
       dom = await extractDOM(page)
-      console.log(`[agent] Page: ${dom.url} — ${dom.elements.length} elements`)
+      say(`[agent] Page: ${dom.url} — ${dom.elements.length} elements`)
     } catch (e) {
       console.error(`[agent] DOM extraction failed: ${e.message}`)
       history.push(`Step ${step + 1}: DOM extraction failed — ${e.message}`)
@@ -154,16 +168,16 @@ async function agentLoop(page, task, options = {}) {
     // The page's tools ride INSIDE the page state: their names and descriptions are the page's
     // words, so they go through the same untrusted fence as its text.
     const tools = pageTools ? await pageTools.list().catch(() => []) : []
-    if (tools.length) console.log(`[agent] Page tools: ${tools.map(t => t.name).join(', ')}`)
+    if (tools.length) say(`[agent] Page tools: ${tools.map(t => t.name).join(', ')}`)
     const toolsText = formatTools(tools)
     const domText = toolsText ? `${toolsText}\n\n${formatDOM(dom)}` : formatDOM(dom)
 
     // THINK
     let action
     try {
-      action = await decideAction(task, domText, history, step, model)
+      action = await decideAction(task, domText, history, step, model, endpoint)
       usage = addUsage(usage, action?._usage)
-      console.log(`[agent] Action: ${JSON.stringify(action)}`)
+      say(`[agent] Action: ${JSON.stringify(action)}`)
     } catch (e) {
       console.error(`[agent] LLM decision failed: ${e.message}`)
       history.push(`Step ${step + 1}: LLM error — ${e.message}`)
@@ -175,7 +189,7 @@ async function agentLoop(page, task, options = {}) {
     if (String(action.type).toLowerCase() === 'done') {
       const verdict = doneVerdict(action, evidence, task.config || {})
       if (!verdict.ok) {
-        console.warn(`[agent] ${verdict.reason}`)
+        warn(`[agent] ${verdict.reason}`)
         history.push(`done "${String(action.result || '').slice(0, 60)}" → ${verdict.reason} [FAILED - try a different approach]`)
         continue
       }
@@ -194,7 +208,7 @@ async function agentLoop(page, task, options = {}) {
       }
       // Includes what an extract actually FOUND — see history-entry.js.
       history.push(historyEntry(action, result, { history }))
-      console.log(`[agent] Result: ${result.message}`)
+      say(`[agent] Result: ${result.message}`)
       // A task that started on a blank page has no site yet: the first one it reaches becomes the
       // boundary, so a page later in the run cannot send it somewhere else (#185962).
       if (!nav.startHost && action.type === 'navigate' && result.ok) nav.startHost = hostOf(page.url())
@@ -208,13 +222,13 @@ async function agentLoop(page, task, options = {}) {
         }
       }
 
-      if (!result.ok) console.warn(`[agent] Action failed: ${result.message}`)
+      if (!result.ok) warn(`[agent] Action failed: ${result.message}`)
 
       // Brief pause between actions
       await page.waitForTimeout(500)
 
     } catch (e) {
-      console.error(`[agent] Action execution error: ${e.message}`)
+      if (!phi) console.error(`[agent] Action execution error: ${e.message}`)
       history.push(`Step ${step + 1}: ${action.type} failed — ${e.message}`)
     }
   }

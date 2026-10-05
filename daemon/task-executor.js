@@ -22,6 +22,7 @@
 const { spawn, execSync, execFileSync, exec: execAsync } = require('child_process')
 const { requireGit } = require('../lib/require-git')
 const { OutputStreamer } = require('./output-streamer')
+const { isPhiTask } = require('../lib/phi-task')
 const { planPeerExec } = require('./peer-exec')
 const fs = require('fs')
 const path = require('path')
@@ -966,6 +967,14 @@ class TaskExecutor {
 
     const isBrowserTask = TaskExecutor.BROWSER_TYPES.includes(task.type)
 
+    // #187918: a PHI task's output, recordings and screenshots stay on this node. Marked first,
+    // before ANY report (including the queue-full refusal just below) can go out — the cloud
+    // client then filters every progress/output/result/artifact post for this id.
+    const phi = isPhiTask(task)
+    if (phi && this.cloud && typeof this.cloud.markPhiTask === 'function') {
+      this.cloud.markPhiTask(taskId, path.join(this.workspaces.tasksDir, String(taskId)))
+    }
+
     if (fromGate) {
       // Re-entry from the gate's queue drain: already admitted + reserved upstream
       // (the reservation persists until this run's finally). Re-running admission would
@@ -1669,7 +1678,8 @@ class TaskExecutor {
       console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
 
       // ── Upload Playwright videos as lead deliverables ──
-      if (task.type === 'custom_playwright' && task.config?.lead_id) {
+      // Never for a PHI task (#187918): the recording IS what the robot saw.
+      if (task.type === 'custom_playwright' && task.config?.lead_id && !phi) {
         try {
           const taskDir = path.join(this.workspaces.tasksDir, taskId)
           const testResultsDir = path.join(taskDir, 'test-results')
@@ -1889,8 +1899,11 @@ class TaskExecutor {
         setTimeout(() => this.execute(next, { fromGate: true }), 2000)
       }
 
-      // Clean up workspace after a delay (keep for debugging)
-      setTimeout(() => this.workspaces.cleanup(taskId), 60000)
+      // Clean up workspace after a delay (keep for debugging). NOT for a PHI task (#187918): its
+      // workspace is where the full result, screenshots and recordings were kept INSTEAD of
+      // being sent — the local_ref in its result points here. Deleting it a minute later would
+      // turn "kept on the node" into "kept nowhere".
+      if (!phi) setTimeout(() => this.workspaces.cleanup(taskId), 60000)
     }
   }
 
@@ -2215,14 +2228,17 @@ class TaskExecutor {
           const timeoutMs = ((task.timeout_seconds || task.config?.timeout_seconds || 600) * 1000)
           const videoDir = path.join(workspace.dir, 'test-videos')
           fs.mkdirSync(videoDir, { recursive: true })
+          // #187918: a PHI task is not recorded at all — custom_playwright used to film every run
+          // (and upload it for a lead). A failure screenshot is kept, on this machine only.
+          const phiRun = isPhiTask(task)
           const pwConfig = [
             "import { defineConfig } from '@playwright/test';",
             'export default defineConfig({',
             `  timeout: ${timeoutMs},`,
             '  use: {',
             '    headless: false,',
-            `    video: { mode: 'on', size: { width: 1280, height: 720 } },`,
-            `    screenshot: 'on',`,
+            phiRun ? `    video: 'off',` : `    video: { mode: 'on', size: { width: 1280, height: 720 } },`,
+            phiRun ? `    screenshot: 'only-on-failure',` : `    screenshot: 'on',`,
             '  },',
             '  outputDir: "test-results",',
             '});'
@@ -3951,6 +3967,14 @@ exit 1
           if (task.config.allowed_domains) {
             task.config.env_vars.ALLOWED_DOMAINS = task.config.allowed_domains
           }
+          // #187917: the agent's model calls go through the IRIS model proxy with THIS node's key
+          // (the proxy resolves it to the owner, bills it, and runs the PHI egress guard). Set
+          // AFTER the task's own env_vars so a task cannot point a PHI run somewhere else or
+          // clear its PHI flag; browser-agent/model-endpoint.js decides proxy vs direct (and refuses
+          // direct for a PHI task).
+          if (this.cloud?.apiUrl) task.config.env_vars.IRIS_MODEL_PROXY_URL = `${this.cloud.apiUrl}/api/v6/openai`
+          if (this.cloud?.apiKey) task.config.env_vars.IRIS_MODEL_PROXY_TOKEN = this.cloud.apiKey
+          if (isPhiTask(task)) task.config.env_vars.IRIS_TASK_PHI = '1'
           workspace.projectDir = workspace.dir
           console.log(`[executor] Browser agent task — prompt: "${(task.prompt || '').slice(0, 80)}"`)
           break
@@ -5139,6 +5163,12 @@ exit 1
     const webhookUrl = process.env.DISCORD_TASK_WEBHOOK_URL ||
       process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL
     if (!webhookUrl) return
+    // #187918: Discord is off the node too. A PHI task's alert carries status and duration only —
+    // no parsed output, no error text.
+    if (isPhiTask(task)) {
+      outputLines = []
+      if (errorMsg) errorMsg = 'details kept on the node (PHI task)'
+    }
 
     const isSuccess = status === 'completed'
     const isStarted = status === 'started'

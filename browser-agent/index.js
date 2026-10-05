@@ -14,6 +14,7 @@ const { agentLoop } = require('./agent-loop')
 const { WEBMCP_LAUNCH_ARGS } = require('./page-tools')
 const fs = require('fs')
 const path = require('path')
+const { isPhiTask } = require('../lib/phi-task')
 
 // ── Parse CLI args ──────────────────────────────────────────────────────────
 
@@ -68,8 +69,13 @@ async function main() {
   const outputDir = opts.outputDir || process.env.OUTPUT_DIR || path.join(process.cwd(), '.output')
   fs.mkdirSync(outputDir, { recursive: true })
 
-  console.log(`[browser-agent] Starting`)
-  console.log(`[browser-agent] Task: ${task.prompt || task.title}`)
+  // #187918: a PHI task's stdout carries no free text — no prompt, no result, no history. The
+  // daemon captures stdout into the task result; the full record stays in result.json on this
+  // machine, and stdout says only where it is.
+  const phi = process.env.IRIS_TASK_PHI === '1' || isPhiTask(task)
+
+  console.log(`[browser-agent] Starting${phi ? ' (PHI task — output kept on this node)' : ''}`)
+  if (!phi) console.log(`[browser-agent] Task: ${task.prompt || task.title}`)
   console.log(`[browser-agent] Headed: ${opts.headed}`)
   console.log(`[browser-agent] Output: ${outputDir}`)
 
@@ -107,7 +113,7 @@ async function main() {
   // Navigate to starting URL if provided
   const startUrl = opts.url || task.config?.start_url
   if (startUrl) {
-    console.log(`[browser-agent] Navigating to: ${startUrl}`)
+    if (!phi) console.log(`[browser-agent] Navigating to: ${startUrl}`)
     await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
   }
 
@@ -137,7 +143,21 @@ async function main() {
     title: await page.title().catch(() => ''),
     timestamp: new Date().toISOString(),
   }
-  fs.writeFileSync(path.join(outputDir, 'result.json'), JSON.stringify(summary, null, 2))
+  const resultPath = path.join(outputDir, 'result.json')
+  fs.writeFileSync(resultPath, JSON.stringify(summary, null, 2), phi ? { mode: 0o600 } : undefined)
+
+  if (phi) {
+    // Structured status only (#187918). One machine-readable line the daemon/server can parse;
+    // nothing in it came from the page.
+    console.log(`[browser-agent] ${result.success ? 'SUCCESS' : 'FAILED'}`)
+    console.log('[browser-agent] PHI_RESULT ' + JSON.stringify({
+      success: !!result.success,
+      steps: Number(result.steps) || 0,
+      local_ref: resultPath,
+    }))
+    await browser.close()
+    process.exit(result.success ? 0 : 1)
+  }
 
   // Output for daemon stdout capture
   console.log(`\n[browser-agent] ──────────────────────────────────`)
