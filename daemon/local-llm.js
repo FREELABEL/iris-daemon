@@ -24,6 +24,8 @@ const https = require('https')
 const DEFAULT_MODEL = 'qwen3:8b'
 
 /** Known servers by their default port. A guess for the profile, never a routing decision. */
+const { requestJson } = require('./http-json')
+
 const KNOWN_PORTS = {
   11434: 'ollama',
   9337: 'mesh-llm',
@@ -167,21 +169,32 @@ function buildConversationBody (args = {}, cfg) {
  * Every failure throws with a NAMED reason — no server, server refused, empty answer — because
  * "the model failed" is three different problems with three different fixes.
  */
-async function chat (args = {}, { env = process.env, timeoutMs = 10 * 60 * 1000, fetchImpl = fetch } = {}) {
+async function chat (args = {}, { env = process.env, timeoutMs = 10 * 60 * 1000 } = {}) {
   const cfg = resolveLocalLlmConfig({ model: args.model }, env)
   const body = buildConversationBody(args, cfg)
+  // What one agent turn costs to READ — counts and characters only, never content. A CPU-only node
+  // reads ~27 prompt tokens/s, so a 20K-token turn is ~12 minutes before the first word
+  // (iris-hive-001, 2026-10-04). Without this line the only clue is Ollama's n_tokens.
+  try {
+    const sizes = body.messages.map((m) => `${m.role}:${String(m.content || '').length}`).join(' ')
+    const toolChars = JSON.stringify(body.tools || []).length
+    console.log(`[local_llm.chat] ${cfg.model} messages=${body.messages.length} [${sizes}] tools=${(body.tools || []).length} (${toolChars} chars)`)
+  } catch { /* a log line must never fail the call */ }
+  // node:http, not fetch(): fetch's hidden 300s headers timeout killed every turn longer than five
+  // minutes at exactly 5m00s (see daemon/http-json.js). timeoutMs is now the only limit.
   let res
   try {
-    res = await fetchImpl(`${cfg.baseUrl}/chat/completions`, {
+    res = await requestJson({
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs)
+      url: `${cfg.baseUrl}/chat/completions`,
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+      body,
+      timeoutMs
     })
   } catch (e) {
     throw new Error(`No local model server answering at ${cfg.baseUrl} (${e.message})`)
   }
-  const parsed = await res.json().catch(() => null)
+  const parsed = res.body
   if (!parsed) throw new Error(`Local model server at ${cfg.baseUrl} answered HTTP ${res.status} with a body that is not JSON`)
   if (parsed.error) {
     const e = parsed.error
