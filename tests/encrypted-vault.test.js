@@ -338,12 +338,20 @@ test('DISK: a PHI task is refused unless full-disk encryption is confirmed ON, w
     [{ encrypted: null }, 'win32', /BitLocker.*manage-bde/],
     [{ encrypted: false }, 'linux', /LUKS.*cryptsetup/],
   ]) {
-    const g = await phiVault.gate(task(1), { diskReport: () => report, platform })
+    const g = await phiVault.gate(task(1, { phi_requires_disk_encryption: true }), { diskReport: () => report, platform })
     assert.equal(g.ok, false)
     assert.match(g.reason, /^phi_requires_disk_encryption:/)
     assert.match(g.reason, how)
   }
   assert.equal(ev.listVaults().length, 0, 'no vault is created for a refused task')
+})
+
+test('DISK (rollout): when the server does not require it, an unencrypted node runs the PHI task and still vaults it', async () => {
+  // The server's rollout answer for escrow while HIVE_VAULT_ESCROW_ENFORCE is off: permitted, no targets.
+  const cloud = { get: async () => ({ policy: 'permitted', reason: 'escrow_not_configured', targets: [] }), post: async () => ({ success: true }) }
+  const g = await phiVault.gate(task(2), { diskReport: () => ({ encrypted: false, method: 'filevault' }), platform: 'darwin', cloud })
+  assert.equal(g.ok, true)
+  assert.ok(g.entry, 'the bloq vault is still opened, so outputs are encrypted at rest')
 })
 
 test('disk probes parse FileVault, BitLocker and LUKS output', () => {
