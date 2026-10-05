@@ -64,6 +64,8 @@ class Daemon {
     this.cloud = new CloudClient(config.apiUrl, config.apiKey, config.apiUrlFallback)
     this.workspaces = new WorkspaceManager(config.dataDir)
     this.executor = new TaskExecutor(this.cloud, this.workspaces)
+    // computer_use (#187922) checks the node's own pause between desktop steps, not only at pickup.
+    this.executor.isNodePaused = () => this.paused === true
 
     // The delivery contract, node side (#187568): ran-once per key, never started late.
     this.keyLedger = new KeyLedger()
@@ -465,7 +467,11 @@ class Daemon {
       // into capabilities and routes the type only to nodes that report it true.
       task_capabilities: (() => {
         try {
-          return { browser_use: require('./browser-use-task').browserUseCapability() }
+          return {
+            browser_use: require('./browser-use-task').browserUseCapability(),
+            // #187922: the type plus which desktops this node can bring up (own / Lume VM / container).
+            ...require('./computer-use-task').computerUseCapabilities()
+          }
         } catch (e) {
           console.error(`[heartbeat] task capability probe failed: ${e.message}`)
           return null

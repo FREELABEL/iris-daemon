@@ -76,7 +76,7 @@ async function getIsolationState () {
  *
  * Add a type here whenever you add one that carries structured config.
  */
-const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use'])
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use', 'computer_use'])
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -1304,6 +1304,30 @@ class TaskExecutor {
       outputStream.stop().catch(() => {})
         const m = payload.metadata || {}
         console.log(`[browser-use] ${task.prompt.split(' ')[0]} → ${payload.status}  run=${m.run_ms ?? '-'}ms  upload=${m.upload_ms ?? '-'}ms${payload.error ? '  ' + payload.error : ''}`)
+        await this.cloud.submitResult(taskId, payload)
+        return
+      }
+
+      // ── Short-circuit: computer_use — drive a desktop app through Cua Driver (#187922) ──
+      //
+      // Logic lives in computer-use-task.js so its tests run the SAME loop this calls. Every step
+      // asks …/steps first: the answer is the kill switch (AgentRunGate / cancel) and the report
+      // feeds the run's live view. PHI was marked above, so the cloud client also drops any
+      // artifact post for this id — the module never makes one for PHI, and this is the backstop.
+      if (task.type === 'computer_use') {
+        const { runComputerUseTask } = require('./computer-use-task')
+        const payload = await runComputerUseTask(task, {
+          step: (body) => this.cloud.post(`/api/v6/node-agent/tasks/${taskId}/steps`, body),
+          upload: async (files) => {
+            const r = await this.cloud.post(`/api/v6/node-agent/tasks/${taskId}/artifacts`, { files })
+            return (r && r.cdn_urls) || []
+          },
+          isPaused: () => typeof this.isNodePaused === 'function' && this.isNodePaused() === true,
+          taskDir: path.join(this.workspaces.tasksDir, String(taskId), 'computer-use'),
+        })
+        clearInterval(progressInterval)
+        outputStream.stop().catch(() => {})
+        console.log(`[computer-use] ${payload.metadata?.desktop || '-'} → ${payload.status}${payload.error ? '  ' + payload.error : ''}`)
         await this.cloud.submitResult(taskId, payload)
         return
       }
