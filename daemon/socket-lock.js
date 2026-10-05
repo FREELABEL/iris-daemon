@@ -52,6 +52,7 @@ function duplicateAgentMessage (holderLabel, requesterLabel) {
  * @param {number}   [o.standbyPollMs]
  * @param {number}   [o.releaseTimeoutMs]
  * @param {Object}   [o.log]
+ * @param {Function} [o.stopStale]    (pid) => Promise — stops a holder that overran its handoff
  * @returns {{ stop: Function }} stop() cancels a standby poll (tests, shutdown)
  */
 function acquireSocketLock (o) {
@@ -113,6 +114,14 @@ function acquireSocketLock (o) {
         check.end()
         if (Date.now() < deadline) {
           setTimeout(waitForRelease, 200)
+        } else if (resp.pid && o.stopStale) {
+          // Cleaning the socket alone left the holder running and invisible (#188006).
+          log.error(`[startup] Previous daemon (PID ${resp.pid}) did not exit in time. Stopping it.`)
+          Promise.resolve(o.stopStale(resp.pid)).catch(() => {}).then((outcome) => {
+            log.log(`[startup] Previous daemon: ${outcome || 'stop attempted'}`)
+            o.cleanupSocket()
+            acquire()
+          })
         } else {
           log.error('[startup] Previous daemon did not exit in time. Force-cleaning socket.')
           o.cleanupSocket()

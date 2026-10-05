@@ -169,10 +169,16 @@ class Daemon {
         const oldStatus = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'))
         if (oldStatus.status === 'active' && oldStatus.pid) {
           // Check if the old PID is still alive
-          try {
-            process.kill(oldStatus.pid, 0) // signal 0 = existence check
-            console.warn(`[daemon] Previous daemon (PID ${oldStatus.pid}) still running — will replace`)
-          } catch {
+          // We hold the IPC socket by now, so a different live daemon here has lost its own —
+          // nothing else can find or stop it. This line used to promise "will replace" and do
+          // nothing; the survivor kept heartbeating as this node (#188006).
+          const { stopStaleDaemon } = require('./stale-daemon')
+          const outcome = await stopStaleDaemon(oldStatus.pid)
+          if (outcome === 'terminated' || outcome === 'killed') {
+            console.warn(`[daemon] Stopped a previous daemon (PID ${oldStatus.pid}) that had lost its socket — ${outcome}`)
+          } else if (outcome === 'survived') {
+            console.error(`[daemon] Previous daemon (PID ${oldStatus.pid}) survived SIGKILL — two daemons may be running`)
+          } else if (outcome === 'not-running') {
             console.log(`[daemon] Cleaning up stale status (PID ${oldStatus.pid} is dead)`)
           }
         }
@@ -2952,8 +2958,16 @@ LIMIT ${limit}
   }
 
   async shutdown (signal) {
-    if (!this.running) return
+    // Guard re-entry, NOT "not running yet" (#188006). A daemon still retrying cloud auth has
+    // running=false; returning here left it alive with its socket already removed — an
+    // invisible second daemon that heartbeated as soon as its retry succeeded.
+    if (this._shuttingDown) return
+    this._shuttingDown = true
     this.running = false
+    // Whatever below hangs, this process exits. A daemon that has given up its socket must
+    // not outlive it.
+    const hardExit = setTimeout(() => process.exit(0), 10000)
+    if (hardExit.unref) hardExit.unref()
 
     console.log(`\n[daemon] Shutting down (${signal})...`)
 
@@ -3001,7 +3015,10 @@ LIMIT ${limit}
 
     // Mark node offline
     try {
-      await this.cloud.markOffline()
+      await Promise.race([
+        this.cloud.markOffline(),
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+      ])
       console.log('[daemon] Marked offline')
     } catch { /* best effort */ }
 

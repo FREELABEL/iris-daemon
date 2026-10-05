@@ -677,7 +677,7 @@ function startDaemon () {
           conn.end(JSON.stringify({ status: 'refused', holder: mine, message: socketLock.duplicateAgentMessage(mine, msg.label) }) + '\n')
           break
         }
-        conn.end(JSON.stringify({ status: 'ok', message: 'Shutting down for replacement' }) + '\n')
+        conn.end(JSON.stringify({ status: 'ok', pid: process.pid, message: 'Shutting down for replacement' }) + '\n')
         // Give the response a moment to flush, then exit
         setTimeout(() => {
           cleanupSocket()
@@ -838,7 +838,8 @@ function acquireSocketLock (onAcquired) {
     sockPath: SOCK_FILE,
     onAcquired,
     cleanupSocket,
-    label: socketLock.supervisorLabel()
+    label: socketLock.supervisorLabel(),
+    stopStale: (pid) => require('./daemon/stale-daemon').stopStaleDaemon(pid)
   })
 }
 

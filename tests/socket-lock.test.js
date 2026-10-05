@@ -129,4 +129,24 @@ describe('taking the socket', () => {
     await took
     assert.equal(s.acquired, true)
   })
+  it('a holder that acks but never exits is STOPPED by pid, not just unlinked (#188006)', async () => {
+    const sock = sockPath()
+    await incumbent(sock, (msg, conn) => {
+      // Acknowledges, then keeps the socket — the daemon that returned from shutdown() alive.
+      conn.end(JSON.stringify({ status: 'ok', pid: 424242, message: 'Shutting down for replacement' }) + '\n')
+    })
+    const stopped = []
+    const s = await lock(sock, { releaseTimeoutMs: 300, stopStale: async (pid) => { stopped.push(pid); return 'terminated' } })
+    assert.equal(s.acquired, true)
+    assert.deepEqual(stopped, [424242], 'the holder must be stopped before we take over')
+  })
+
+  it('an old holder that does not report its pid falls back to the socket clean-up', async () => {
+    const sock = sockPath()
+    await incumbent(sock, (msg, conn) => { conn.end(JSON.stringify({ status: 'ok' }) + '\n') })
+    const stopped = []
+    const s = await lock(sock, { releaseTimeoutMs: 300, stopStale: async (pid) => { stopped.push(pid) } })
+    assert.equal(s.acquired, true)
+    assert.deepEqual(stopped, [])
+  })
 })
