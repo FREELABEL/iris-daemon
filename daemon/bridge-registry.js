@@ -32,6 +32,7 @@
  */
 
 const fs = require('fs')
+const { requestJson } = require('./http-json')
 const os = require('os')
 const path = require('path')
 
@@ -351,8 +352,7 @@ async function call (providerKey, functionName, args = {}) {
   if (token) headers['x-bridge-key'] = token
 
   let url = `${base}${route.path}`
-  const init = { method: route.method, headers, signal: AbortSignal.timeout(route.timeoutMs || 60000) }
-
+  let body
   if (route.method === 'GET') {
     const qs = new URLSearchParams()
     for (const [k, v] of Object.entries(args)) {
@@ -362,26 +362,30 @@ async function call (providerKey, functionName, args = {}) {
     const q = qs.toString()
     if (q) url += `?${q}`
   } else {
-    headers['Content-Type'] = 'application/json'
-    init.body = JSON.stringify(args)
+    body = args
   }
 
+  // node:http, not fetch(): fetch's hidden 300s headers timeout capped every route at five
+  // minutes whatever timeoutMs said — local_llm.chat died at exactly 5m00s (daemon/http-json.js).
   let res
   try {
-    res = await fetch(url, init)
+    res = await requestJson({ method: route.method, url, headers, body, timeoutMs: route.timeoutMs || 60000 })
   } catch (e) {
     // The bridge HTTP server not listening is a DIFFERENT failure from the route
     // erroring, and the caller can act on it (restart the bridge) only if we say so.
-    throw new Error(`Bridge HTTP server is not listening on ${base} (${e.message})`)
+    if (/ECONNREFUSED|ECONNRESET|socket hang up/i.test(e.message)) {
+      throw new Error(`Bridge HTTP server is not listening on ${base} (${e.message})`)
+    }
+    throw new Error(`${providerKey}.${functionName} failed: ${e.message}`)
   }
 
-  const body = await res.json().catch(() => null)
-  if (!res.ok) {
-    const detail = (body && (body.error || body.message)) || `HTTP ${res.status}`
+  if (res.status < 200 || res.status >= 300) {
+    const b = res.body
+    const detail = (b && (b.error || b.message)) || `HTTP ${res.status}`
     throw new Error(`${providerKey}.${functionName} failed: ${detail}`)
   }
 
-  return body
+  return res.body
 }
 
 module.exports = { PROVIDERS, capabilities, listProviders, call, bridgePort }
