@@ -36,4 +36,27 @@ function agentCommand (prompt, opts = {}) {
   return { cmd: iris, args: ['run', prompt], via: 'iris' }
 }
 
-module.exports = { agentCommand }
+/** First executable named `name` on PATH, or null. */
+function onPath (name, env = process.env, exists) {
+  const fs = require('fs')
+  const ok = exists || ((p) => { try { fs.accessSync(p, fs.constants.X_OK); return true } catch { return false } })
+  for (const dir of String(env.PATH || '').split(path.delimiter)) {
+    if (dir && ok(path.join(dir, name))) return path.join(dir, name)
+  }
+  return null
+}
+
+/**
+ * The `opencode` runtime (#188351). The executor ran `opencode --non-interactive --prompt <p>`:
+ * OpenCode has no --non-interactive flag (it printed its help and exited 1 on every task), and its
+ * top-level --prompt starts the interactive TUI — which, with no TTY, never exits and ignores
+ * SIGTERM. The non-interactive form is `opencode run <message>`. No OpenCode on the node: the
+ * node's own `iris` (an OpenCode build) runs it the same way.
+ */
+function opencodeCommand (prompt, opts = {}) {
+  const found = opts.opencode !== undefined ? opts.opencode : onPath('opencode', opts.env)
+  if (found) return { cmd: found, args: ['run', prompt], via: 'opencode' }
+  return agentCommand(prompt, opts)
+}
+
+module.exports = { agentCommand, opencodeCommand, onPath }
