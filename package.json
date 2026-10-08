@@ -12,7 +12,8 @@
     "discover:import-yt-feed": "node som/yt-feed.js",
     "discover:import-yt-feed:dry": "node som/yt-feed.js dry=1",
     "som:all": "node som/som-all.js",
-    "som:run": "node som/som.js"
+    "som:run": "node som/som.js",
+    "test:hive-apps": "cd hive-apps/video-use && python3 -m unittest test_transcribe"
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.13",
