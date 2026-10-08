@@ -3752,7 +3752,8 @@ app.delete('/api/sessions/ollama/:id', (req, res) => {
 // Tested in isolation — see lib/claude-session-name.js for what counts as a real first message.
 const { extractSessionName } = require('./lib/claude-session-name')
 // When a session last SPOKE. The file's mtime is NOT that — measured up to 721 minutes apart.
-const { readLastMessageAt, lastMessageAtFromChunk } = require('./lib/session-times')
+const { lastMessageAtFromChunk, readTailChunk } = require('./lib/session-times')
+const { waitingFromChunk } = require('./lib/session-waiting')
 
 /**
  * Reconstruct project path from Claude Code's directory name.
@@ -3958,7 +3959,11 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           // twelve hours ago showed as "now" with a live dot, then opened on a transcript that
           // ended hours earlier. Null when the tail holds no message: "cannot tell" is not "just
           // now" (lib/session-times.js).
-          const lastMessageAt = readLastMessageAt(fs, file.path, stat.size)
+          const tail = readTailChunk(fs, file.path, stat.size)
+          const lastMessageAt = lastMessageAtFromChunk(tail)
+          // Blocked on a person? An unanswered AskUserQuestion in the same tail (#188536,
+          // lib/session-waiting.js). null = not waiting, or cannot tell — never a guess.
+          const waiting = waitingFromChunk(tail)
 
           sessions.push({
             session_id: sessionId,
@@ -3971,6 +3976,7 @@ app.get('/api/sessions/claude-code', async (req, res) => {
             // The file's own clock, kept: it answers "is anything writing to this at all?"
             touched_at: file.mtime.toISOString(),
             message_count: messageCount,
+            waiting,
             provider: 'claude_code'
           })
         } catch (readErr) {

@@ -53,10 +53,23 @@ function deriveSessionStatus (updatedAt, now = Date.now()) {
  */
 function sessionActivity (s, now = Date.now()) {
   const activity = s && (s.activity === 'working' || s.activity === 'retrying') ? s.activity : null
+  const derived = activity ? 'active' : deriveSessionStatus(s && s.updated_at, now)
   return {
-    status: activity ? 'active' : deriveSessionStatus(s && s.updated_at, now),
+    status: isWaitingOnPerson(s, derived) ? 'needs_you' : derived,
     activity
   }
+}
+
+/**
+ * `needs_you` (#188536): the transcript ends on a question nobody has answered
+ * (lib/session-waiting.js). Only for a session that has spoken TODAY — a question left on a prompt
+ * three days ago is almost always a closed terminal, and paging someone about it is noise. The
+ * question itself still travels in `waiting`; only the status is withheld.
+ */
+function isWaitingOnPerson (s, derived) {
+  const w = s && s.waiting
+  if (!w || w.kind !== 'question' || !Array.isArray(w.questions) || w.questions.length === 0) return false
+  return derived === 'active' || derived === 'idle'
 }
 
 /**

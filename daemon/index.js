@@ -2945,6 +2945,9 @@ LIMIT ${limit}
             // ...and overridden by a MEASURED activity when opencode reports the session working
             // (step 4b): `status` + `activity` (working | retrying | null = not measured).
             ...sessionActivity(s),
+            // The question a person is being waited on for, when there is one (#188536). Carried even
+            // when status is not needs_you (an old, probably-abandoned prompt) so nothing is hidden.
+            waiting: s.waiting || null,
             project_path: s.project_path || null,
             git_branch: s.git_branch || null,
             model: s.model || null,
