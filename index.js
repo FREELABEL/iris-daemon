@@ -2897,6 +2897,24 @@ app.post('/api/sessions/claude-code', async (req, res) => {
   }
 })
 
+// Answer the question a session is WAITING on — not a new message (epic #188549 S4).
+// `/message` above runs `claude -p --resume`, a second process the on-screen prompt never hears.
+// This reaches the prompt itself: via the answer hook when it is holding, or a keystroke into the
+// session's tmux pane when the question is on screen. Refuses, with the reason, otherwise.
+app.post('/api/sessions/claude-code/:id/answer', (req, res) => {
+  const { deliverAnswer } = require('./lib/session-answer')
+  const { execFileSync } = require('child_process')
+  const out = deliverAnswer({
+    fs,
+    home: process.env.HOME,
+    now: () => Date.now(),
+    kill: (pid, sig) => process.kill(pid, sig),
+    tmux: (args) => execFileSync('tmux', args, { encoding: 'utf8', timeout: 5000 })
+  }, req.params.id, (req.body || {}).answers)
+  console.log(`[claude-code] answer ${req.params.id.slice(-8)} -> ${out.status} ${out.body.delivered || out.body.error}`)
+  res.status(out.status).json(out.body)
+})
+
 app.post('/api/sessions/claude-code/:id/message', async (req, res) => {
   const { message } = req.body
   const sid = req.params.id
@@ -3754,6 +3772,8 @@ const { extractSessionName } = require('./lib/claude-session-name')
 // When a session last SPOKE. The file's mtime is NOT that — measured up to 721 minutes apart.
 const { lastMessageAtFromChunk, readTailChunk } = require('./lib/session-times')
 const { waitingFromChunk } = require('./lib/session-waiting')
+const { waitingFromHold } = require('./lib/session-answer')
+const HOLD_DEPS = { fs, home: process.env.HOME, now: () => Date.now(), kill: (pid, sig) => process.kill(pid, sig) }
 
 /**
  * Reconstruct project path from Claude Code's directory name.
@@ -3963,7 +3983,9 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           const lastMessageAt = lastMessageAtFromChunk(tail)
           // Blocked on a person? An unanswered AskUserQuestion in the same tail (#188536,
           // lib/session-waiting.js). null = not waiting, or cannot tell — never a guess.
-          const waiting = waitingFromChunk(tail)
+          // ...or from the answer hook's live hold, which is the ONLY place the question exists while
+          // the hook holds it — Claude Code writes the tool_use to the transcript afterwards.
+          const waiting = waitingFromHold(HOLD_DEPS, sessionId) || waitingFromChunk(tail)
 
           sessions.push({
             session_id: sessionId,

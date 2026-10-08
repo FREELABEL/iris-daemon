@@ -69,6 +69,8 @@ function sessionActivity (s, now = Date.now()) {
 function isWaitingOnPerson (s, derived) {
   const w = s && s.waiting
   if (!w || w.kind !== 'question' || !Array.isArray(w.questions) || w.questions.length === 0) return false
+  // A question held by the answer hook is held by a LIVE process — that is proof of life on its own.
+  if (w.held === true) return true
   return derived === 'active' || derived === 'idle'
 }
 

@@ -156,7 +156,7 @@ test('no waiting, or a malformed one, leaves the old status untouched', () => {
 
 test('both listing paths are wired: the bridge reads it from the tail, the heartbeat carries it', () => {
   const BRIDGE = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
-  assert.match(BRIDGE, /const waiting = waitingFromChunk\(tail\)/)
+  assert.match(BRIDGE, /const waiting = waitingFromHold\(HOLD_DEPS, sessionId\) \|\| waitingFromChunk\(tail\)/)
   assert.match(BRIDGE, /message_count: messageCount,\n\s+waiting,/)
   const DAEMON = fs.readFileSync(path.join(__dirname, '..', 'daemon', 'index.js'), 'utf8')
   assert.match(DAEMON, /waiting: s\.waiting \|\| null,/)

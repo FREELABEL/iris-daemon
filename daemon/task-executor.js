@@ -3975,6 +3975,12 @@ exit 1
             reject(new Error('session_message task requires config.session_id'))
             return
           }
+          // It is interpolated into a shell command line below. Session ids from every provider are
+          // [A-Za-z0-9_-]; anything else is refused rather than quoted and hoped for.
+          if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(sessionId))) {
+            reject(new Error('session_message: config.session_id has characters a session id never has'))
+            return
+          }
 
           const bridgePort = parseInt(process.env.A2A_PORT || process.env.BRIDGE_PORT || '3200', 10)
           const providerSlug = sessionProvider === 'claude_code' ? 'claude-code' : sessionProvider
@@ -4012,8 +4018,23 @@ exit 1
           // absent `from` now means "this text is already labelled, pass it through".
           const senderLabel = String(sessionConfig.from || sessionConfig.sender || '').slice(0, 64)
 
-          const msgBody = JSON.stringify({ message: task.prompt, from: senderLabel }).replace(/'/g, "'\\''")
-          const curlCmd = `curl -sS -f -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/message" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
+          // An ANSWER to the question the session is waiting on goes to /answer, which reaches the
+          // prompt itself (hook or tmux keystroke) and refuses — failing this task — when it cannot.
+          // A message goes to /message as before. (#188549 S4)
+          const isAnswer = sessionConfig.answers && typeof sessionConfig.answers === 'object'
+          if (isAnswer && providerSlug !== 'claude-code') {
+            reject(new Error(`answering a waiting question is only supported for Claude Code sessions, not ${sessionProvider}`))
+            return
+          }
+          const msgBody = (isAnswer
+            ? JSON.stringify({ answers: sessionConfig.answers })
+            : JSON.stringify({ message: task.prompt, from: senderLabel })).replace(/'/g, "'\\''")
+          const route = isAnswer ? 'answer' : 'message'
+          // --fail-with-body for answers: a refusal (409 "not on screen", "not in tmux") must still
+          // fail the task AND carry its reason back. Plain -f drops the body, and the person would
+          // see "error 409" with no idea what to do.
+          const failFlag = isAnswer ? '--fail-with-body' : '-f'
+          const curlCmd = `curl -sS ${failFlag} -X POST "http://localhost:${bridgePort}/api/sessions/${providerSlug}/${sessionId}/${route}" -H "Content-Type: application/json" -H "X-Bridge-Key: ${bridgeToken}" -d '${msgBody}'`
 
           {
             const plan = shellFor(curlCmd)
