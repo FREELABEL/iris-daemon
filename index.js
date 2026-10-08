@@ -3722,6 +3722,19 @@ app.get('/api/sessions/ollama/:id/history', (req, res) => {
 })
 
 // List Ollama sessions
+// Codex CLI sessions (#188539) — read from $CODEX_HOME/sessions, head + tail only. List-only:
+// sending into a Codex session is not supported, and saying so is better than pretending.
+app.get('/api/sessions/codex', (req, res) => {
+  try {
+    const { listCodexSessions } = require('./lib/codex-sessions')
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100)
+    res.json({ sessions: listCodexSessions(fs, process.env, limit) })
+  } catch (err) {
+    console.log(`[codex] List sessions failed: ${err.message}`)
+    res.json({ sessions: [], error: err.message })
+  }
+})
+
 app.get('/api/sessions/ollama', (req, res) => {
   const limit = parseInt(req.query.limit) || 50
   const sessions = []

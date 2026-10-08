@@ -2896,7 +2896,8 @@ LIMIT ${limit}
       const providers = [
         { slug: 'claude-code', name: 'claude_code' },
         { slug: 'opencode', name: 'opencode' },
-        { slug: 'ollama', name: 'ollama' }
+        { slug: 'ollama', name: 'ollama' },
+        { slug: 'codex', name: 'codex' } // #188539 — list-only
       ]
 
       const sessions = []
