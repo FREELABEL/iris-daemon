@@ -326,6 +326,13 @@ function toMp4 (file, run = defaultRun) {
   return file
 }
 
+/** The video's own duration (ffprobe), or null. Wall-clock time overstates it by seconds. */
+function probeSeconds (file, run = defaultRun) {
+  const r = run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file])
+  const n = r && r.status === 0 ? Number(String(r.stdout).trim()) : NaN
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 /** Upload with the node's own `iris cloud:upload` (the genesis-motion publish path). */
 function uploadVideo (file, { title, run = defaultRun, irisBin = 'iris' } = {}) {
   const args = ['cloud:upload', file, '--json']
@@ -353,5 +360,6 @@ module.exports = {
   normalizeSteps,
   recordFlow,
   toMp4,
+  probeSeconds,
   uploadVideo
 }

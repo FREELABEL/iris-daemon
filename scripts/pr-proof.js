@@ -69,6 +69,7 @@ async function main () {
     file = rec.file
     seconds = rec.seconds
     if (!a['no-mp4']) file = P.toMp4(file)
+    seconds = P.probeSeconds(file) || seconds
   }
   if (!fs.existsSync(file) || fs.statSync(file).size === 0) emit({ ok: false, error: `no video at ${file}` }, 1)
 

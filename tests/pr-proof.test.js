@@ -195,3 +195,9 @@ test('task-executor: the built-in and external-runtime coding paths both use pro
   assert.match(src, /task\.type === 'code_generation'\s*\n\s*\? require\('\.\/pr-proof'\)\.promptForCodingTask\(task, \{ phi: isPhiTask\(task\) \}\)/)
   assert.ok(!/args = \['--print', task\.prompt\]/.test(src), 'claude_code runtime must use agentPrompt')
 })
+
+test('probeSeconds: the file\'s duration, or null when ffprobe is absent or says nothing', () => {
+  assert.strictEqual(P.probeSeconds('/v.mp4', () => ({ status: 0, stdout: '4.560000\n' })), 4.56)
+  assert.strictEqual(P.probeSeconds('/v.mp4', () => ({ status: 1, stdout: '' })), null)
+  assert.strictEqual(P.probeSeconds('/v.mp4', () => ({ error: new Error('ENOENT'), status: null })), null)
+})
