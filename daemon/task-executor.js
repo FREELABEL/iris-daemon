@@ -2151,11 +2151,14 @@ class TaskExecutor {
           break
         }
 
-        case 'code_generation':
-          // Use iris-code for code generation tasks
-          cmd = this.findIrisCode()
-          args = ['--non-interactive', '--prompt', task.prompt]
+        case 'code_generation': {
+          // The node's IRIS agent runs the prompt non-interactively — see agent-cli.js for why
+          // this no longer assumes an `iris-code` binary (every task failed with exit 127).
+          const agent = require('./agent-cli').agentCommand(task.prompt)
+          cmd = agent.cmd
+          args = agent.args
           break
+        }
 
         case 'sandbox_execute': {
           // Execute a shell script. THIS is the path `iris hive run <node> "<cmd>"`
@@ -5539,26 +5542,6 @@ exit 1
   /**
    * Find iris-code binary. Checks common install locations.
    */
-  findIrisCode () {
-    const locations = [
-      '/usr/local/bin/iris-code',
-      '/usr/bin/iris-code',
-      path.join(process.env.HOME || '', '.local/bin/iris-code'),
-      'iris-code' // fallback to PATH
-    ]
-
-    for (const loc of locations) {
-      try {
-        if (loc === 'iris-code' || fs.existsSync(loc)) return loc
-      } catch { /* continue */ }
-    }
-
-    // Fall back to the platform's own shell. Returning '/bin/bash' here handed a
-    // path that does not exist on Windows back to the caller.
-    console.warn('[executor] iris-code not found — falling back to the platform shell')
-    return shellFor('').cmd
-  }
-
   /**
    * Estimate task progress from output lines.
    */
