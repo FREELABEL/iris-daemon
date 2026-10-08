@@ -36,3 +36,23 @@ test('no opencode on the node: the node\'s own iris runs it non-interactively', 
   assert.deepStrictEqual(r.args, ['run', 'fix it'])
   assert.strictEqual(r.via, 'iris')
 })
+
+const { unattendedPermissionEnv } = require('../daemon/agent-cli')
+const perm = (r) => JSON.parse(r.OPENCODE_PERMISSION)
+
+test('an unwatched agent is told to stay in its workspace instead of asking nobody (#188292)', () => {
+  assert.deepStrictEqual(perm(unattendedPermissionEnv({ config: {} }, {})), { external_directory: 'deny' })
+})
+
+test("the operator's OPENCODE_PERMISSION is kept, and their external_directory rule is never overridden", () => {
+  assert.deepStrictEqual(perm(unattendedPermissionEnv({}, { OPENCODE_PERMISSION: '{"bash":"allow"}' })), { bash: 'allow', external_directory: 'deny' })
+  assert.deepStrictEqual(unattendedPermissionEnv({}, { OPENCODE_PERMISSION: '{"external_directory":"allow"}' }), {})
+})
+
+test('a task that needs another folder opts out explicitly', () => {
+  assert.deepStrictEqual(unattendedPermissionEnv({ config: { allow_outside_workspace: true } }, {}), {})
+})
+
+test('a malformed operator value is replaced, not crashed on', () => {
+  assert.deepStrictEqual(perm(unattendedPermissionEnv({}, { OPENCODE_PERMISSION: 'not json' })), { external_directory: 'deny' })
+})
