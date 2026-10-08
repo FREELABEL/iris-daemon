@@ -2,14 +2,141 @@
  * Action Executor — maps LLM action decisions to Playwright calls.
  *
  * Supported actions:
- *   tool, click, type, press, scroll, navigate, extract, screenshot, wait, done, fail
+ *   tool, click, type, form_input, press, scroll, navigate, find, extract, screenshot, zoom, wait,
+ *   done, fail
+ *
+ * An action on an element that is gone returns a TYPED result, not an exception string:
+ *   { ok: false, error: 'stale_ref', ref: '@N', hint: 'call find to locate it again', message }
+ * so the next step can recover by looking again instead of retrying a ref that cannot work (#188588).
  */
 
 const fs = require('fs')
 const path = require('path')
-const { getLocatorForElement } = require('./dom-extractor')
+const { resolveElement } = require('./dom-extractor')
 const { navigationAllowed, safeOutputPath } = require('./untrusted')
 const { findInText } = require('./find-in-text')
+
+const STALE_HINT = 'call find to locate it again'
+
+function refError(error, ref) {
+  if (error === 'stale_ref') {
+    return { ok: false, error, ref, hint: STALE_HINT, message: `Element ${ref} no longer exists on the page (stale_ref) — the page changed since it was listed; ${STALE_HINT}, or use the current element list` }
+  }
+  return { ok: false, error, ref, hint: 'use an @N from the current element list', message: `Element ${ref} is not in the current element list (unknown_ref)` }
+}
+
+/** Playwright's ways of saying "that element left the document". */
+const DETACHED = /not attached to the DOM|Element is detached|Execution context was destroyed|Target closed|has been removed/i
+
+/** Resolve action.element, or the typed error for why it cannot be. */
+async function target(page, dom, ref) {
+  const r = await resolveElement(page, dom, ref)
+  return r.handle ? { handle: r.handle } : { fail: refError(r.error, r.ref) }
+}
+
+/** Run an element action; an element that detaches mid-action is stale, not a crash. */
+async function onElement(ref, fn) {
+  try {
+    return await fn()
+  } catch (e) {
+    if (DETACHED.test(e.message || '')) return refError('stale_ref', ref)
+    throw e
+  }
+}
+
+/** "false", "off", "no", "0", "unchecked" → false; anything else truthy → true. */
+function wantChecked(v) {
+  if (typeof v === 'boolean') return v
+  if (v === undefined || v === null) return true
+  return !/^(false|off|no|0|unchecked|uncheck)$/i.test(String(v).trim())
+}
+
+/**
+ * Set a field to a value directly — fill / selectOption / setChecked by what the element is — rather
+ * than typing keystrokes into it. One action per field, and what landed is read back.
+ */
+async function formInput(handle, ref, value) {
+  const kind = await handle.evaluate((el) => ({
+    tag: el.tagName.toLowerCase(),
+    type: (el.getAttribute('type') || '').toLowerCase(),
+    role: (el.getAttribute('role') || '').toLowerCase(),
+    editable: el.isContentEditable,
+  }))
+  await handle.scrollIntoViewIfNeeded().catch(() => {})
+
+  if (kind.tag === 'select') {
+    const values = (Array.isArray(value) ? value : [value]).map(String)
+    // By value first, then by visible label — the model sees labels more often than values.
+    let picked = await handle.selectOption(values, { timeout: 5000 }).catch(() => [])
+    if (!picked.length) picked = await handle.selectOption(values.map((label) => ({ label })), { timeout: 5000 }).catch(() => [])
+    if (!picked.length) {
+      const options = await handle.evaluate((el) => [...el.options].map((o) => o.label || o.value).slice(0, 20))
+      return { ok: false, message: `No option "${values.join(', ')}" in ${ref}. Options: ${options.join(' | ')}` }
+    }
+    return { ok: true, message: `Set ${ref} (select) to ${picked.join(', ')}` }
+  }
+
+  if (kind.type === 'checkbox' || kind.type === 'radio' || kind.role === 'checkbox' || kind.role === 'radio' || kind.role === 'switch') {
+    const checked = wantChecked(value)
+    if (kind.type === 'radio' && !checked) return { ok: false, message: `${ref} is a radio button — it cannot be unchecked directly; set another option in its group instead` }
+    await handle.setChecked(checked, { timeout: 5000 })
+    return { ok: true, message: `Set ${ref} (${kind.type || kind.role}) to ${checked ? 'checked' : 'unchecked'}` }
+  }
+
+  if (kind.tag === 'input' || kind.tag === 'textarea' || kind.editable) {
+    const text = value === undefined || value === null ? '' : String(value)
+    await handle.fill(text, { timeout: 5000 })
+    const landed = await handle.evaluate((el) => (el.isContentEditable ? el.innerText : el.value))
+    return { ok: true, message: `Set ${ref} to "${String(landed).slice(0, 40)}"` }
+  }
+
+  return { ok: false, message: `${ref} is a <${kind.tag}>, not a form field — use click` }
+}
+
+/**
+ * Re-read one region at full resolution. x,y,w,h are in the space of the `screenshot` action: the
+ * viewport by default, the whole document with full_page. The image goes back to the model on the
+ * next step; it is a crop, so coordinates the model gives afterwards stay in the page's space.
+ */
+const MAX_ZOOM_SIDE = 2000
+
+async function zoom(page, action, outputDir) {
+  const region = action.region || action.clip || action
+  const x = Number(region.x), y = Number(region.y)
+  const w = Number(region.w ?? region.width), h = Number(region.h ?? region.height)
+  if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
+    return { ok: false, message: 'zoom needs a region: {"type":"zoom","x":0,"y":0,"w":400,"h":300} (pixels, screenshot space)' }
+  }
+  const fullPage = !!action.full_page
+  const bounds = fullPage
+    ? await page.evaluate(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }))
+    : page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
+  const cx = Math.max(0, Math.floor(x)), cy = Math.max(0, Math.floor(y))
+  const clip = {
+    x: cx,
+    y: cy,
+    width: Math.min(Math.ceil(w), MAX_ZOOM_SIDE, bounds.width - cx),
+    height: Math.min(Math.ceil(h), MAX_ZOOM_SIDE, bounds.height - cy),
+  }
+  if (clip.width <= 0 || clip.height <= 0) {
+    return { ok: false, message: `zoom region is outside the ${fullPage ? 'page' : 'viewport'} (${bounds.width}x${bounds.height})` }
+  }
+  const buffer = await page.screenshot({ clip, fullPage, type: 'png' })
+  let saved = ''
+  if (action.save_as) {
+    const filePath = safeOutputPath(outputDir, action.save_as)
+    if (!filePath) return { ok: false, message: `Refused to save zoom "${action.save_as}": files may only be written inside the task output folder` }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, buffer)
+    saved = `, saved ${action.save_as}`
+  }
+  return {
+    ok: true,
+    message: `Zoomed on ${clip.width}x${clip.height} at (${clip.x},${clip.y})${saved} — the image is attached to the next step; coordinates stay in the full ${fullPage ? 'page' : 'viewport'} space`,
+    clip,
+    image: { mime: 'image/png', base64: buffer.toString('base64') },
+  }
+}
 
 /**
  * Execute a single action on the page.
@@ -32,22 +159,35 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
     }
 
     case 'click': {
-      const handle = await getLocatorForElement(page, dom, action.element)
-      if (!handle) return { ok: false, message: `Element ${action.element} not found` }
-      await handle.scrollIntoViewIfNeeded().catch(() => {})
-      await handle.click({ timeout: 5000 })
-      return { ok: true, message: `Clicked ${action.element}` }
+      const t = await target(page, dom, action.element)
+      if (t.fail) return t.fail
+      return onElement(action.element, async () => {
+        await t.handle.scrollIntoViewIfNeeded().catch(() => {})
+        await t.handle.click({ timeout: 5000 })
+        return { ok: true, message: `Clicked ${action.element}` }
+      })
+    }
+
+    case 'form_input': {
+      if (!action.element) return { ok: false, message: 'form_input needs an "element" (@N) and a "value"' }
+      const t = await target(page, dom, action.element)
+      if (t.fail) return t.fail
+      const value = action.value !== undefined ? action.value : action.text
+      return onElement(action.element, () => formInput(t.handle, action.element, value))
     }
 
     case 'type': {
       if (!action.text) return { ok: false, message: 'No text provided for type action' }
       if (action.element) {
-        const handle = await getLocatorForElement(page, dom, action.element)
-        if (!handle) return { ok: false, message: `Element ${action.element} not found` }
-        await handle.scrollIntoViewIfNeeded().catch(() => {})
-        // Clear existing value first, then fill
-        await handle.evaluate(el => { if (el.value !== undefined) el.value = '' })
-        await handle.type(action.text, { delay: 30 })
+        const t = await target(page, dom, action.element)
+        if (t.fail) return t.fail
+        const r = await onElement(action.element, async () => {
+          await t.handle.scrollIntoViewIfNeeded().catch(() => {})
+          // Clear existing value first, then fill
+          await t.handle.evaluate(el => { if (el.value !== undefined) el.value = '' })
+          await t.handle.type(action.text, { delay: 30 })
+        })
+        if (r && r.ok === false) return r
       } else {
         // Type into currently focused element
         await page.keyboard.type(action.text, { delay: 30 })
@@ -131,6 +271,9 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
       return { ok: true, message: `Screenshot saved: ${filename}` }
     }
 
+    case 'zoom':
+      return zoom(page, action, outputDir)
+
     case 'wait': {
       const ms = Math.min((action.seconds || 2) * 1000, 10000)
       await page.waitForTimeout(ms)
@@ -150,4 +293,4 @@ async function executeAction(page, action, dom, outputDir, opts = {}) {
   }
 }
 
-module.exports = { executeAction }
+module.exports = { executeAction, wantChecked, STALE_HINT }

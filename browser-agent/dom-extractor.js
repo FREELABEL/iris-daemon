@@ -16,7 +16,12 @@ async function extractDOM(page) {
   const url = page.url()
   const title = await page.title()
 
-  const elements = await page.evaluate(({ maxElements, maxText }) => {
+  // Every snapshot gets its own id, and the page keeps a map of @N -> the element itself. Acting on
+  // @N later resolves THAT element, not "whatever is Nth now": when the page changes between
+  // observing and acting, the old index lands silently on a different field (#188588).
+  const snap = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+  const elements = await page.evaluate(({ maxElements, maxText, snap }) => {
     const selectors = [
       'a[href]',
       'button',
@@ -38,6 +43,7 @@ async function extractDOM(page) {
 
     const seen = new Set()
     const results = []
+    const refs = new Map()
 
     for (const selector of selectors) {
       if (results.length >= maxElements) break
@@ -89,14 +95,17 @@ async function extractDOM(page) {
             // Store a selector path for targeting
             _index: results.length,
           })
+          refs.set(`@${results.length}`, el)
         }
       } catch (e) {
         // Skip invalid selectors
       }
     }
 
+    // Non-enumerable so a page iterating window does not trip over it; replaced every snapshot.
+    Object.defineProperty(window, '__irisRefs', { value: { snap, refs }, configurable: true, writable: true, enumerable: false })
     return results
-  }, { maxElements: MAX_ELEMENTS, maxText: MAX_TEXT_LENGTH })
+  }, { maxElements: MAX_ELEMENTS, maxText: MAX_TEXT_LENGTH, snap })
 
   // Assign @IDs
   const indexed = elements.map((el, i) => ({
@@ -112,7 +121,7 @@ async function extractDOM(page) {
     .evaluate(() => (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim())
     .catch(() => '')
 
-  return { url, title, elements: indexed, text }
+  return { url, title, elements: indexed, text, snap }
 }
 
 /**
@@ -155,17 +164,51 @@ function formatDOM(dom, opts = {}) {
 }
 
 /**
- * Get a Playwright locator for an element by its @ID.
- * Uses nth-match against the same selector set used during extraction.
+ * Resolve an @ID from a snapshot to the element it named.
+ *
+ * Returns { handle } on success, or { error } where error is
+ *   'unknown_ref' — the id was never in this snapshot (the model made it up or misread it);
+ *   'stale_ref'   — it was, and that element is gone (removed, re-rendered, or the page navigated).
+ * The distinction matters to the next step: a stale ref is recovered by looking again (find, or the
+ * fresh element list), an unknown one by reading the list it was given.
+ */
+async function resolveElement(page, dom, elementId) {
+  const ref = normalizeRef(elementId)
+  const idx = parseInt(ref.slice(1), 10) - 1
+  if (!dom || !Array.isArray(dom.elements) || !dom.elements[idx]) return { error: 'unknown_ref', ref }
+
+  // Snapshots from extractDOM carry a snap id and a page-side map; resolve through it.
+  if (dom.snap) {
+    const handle = await page.evaluateHandle(({ snap, ref }) => {
+      const r = window.__irisRefs
+      if (!r || r.snap !== snap) return null // navigated, or a newer snapshot replaced this one
+      const el = r.refs.get(ref)
+      return el && el.isConnected ? el : null
+    }, { snap: dom.snap, ref }).catch(() => null)
+    const el = handle && handle.asElement()
+    return el ? { handle: el } : { error: 'stale_ref', ref }
+  }
+
+  // A snapshot without a snap id (built by hand): the old positional lookup.
+  const handle = await getLocatorForElement(page, dom, ref)
+  return handle ? { handle } : { error: 'stale_ref', ref }
+}
+
+function normalizeRef(elementId) {
+  const s = String(elementId ?? '').trim()
+  return s.startsWith('@') ? s : `@${s}`
+}
+
+/**
+ * Get a Playwright locator for an element by its @ID — POSITIONAL: the Nth visible match now.
+ * Kept for snapshots without a snap id; resolveElement() is what the executor uses.
  */
 async function getLocatorForElement(page, dom, elementId) {
-  const id = elementId.replace('@', '')
+  const id = String(elementId).replace('@', '')
   const idx = parseInt(id, 10) - 1
   const el = dom.elements[idx]
   if (!el) return null
 
-  // Use page.locator with the element's original index from the full extraction
-  // We re-query using the same selectors and pick the nth match
   const allSelectors = [
     'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
     '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]',
@@ -199,4 +242,4 @@ async function getLocatorForElement(page, dom, elementId) {
   return handle.asElement()
 }
 
-module.exports = { extractDOM, formatDOM, getLocatorForElement, DEFAULT_TEXT_CHARS }
+module.exports = { extractDOM, formatDOM, getLocatorForElement, resolveElement, DEFAULT_TEXT_CHARS }
