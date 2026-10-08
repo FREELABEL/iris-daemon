@@ -25,7 +25,7 @@ const DEFAULT_MODEL = 'gpt-4o-mini'
  * `endpoint` comes from resolveModelEndpoint(): the IRIS model proxy unless direct mode was
  * explicitly configured for a non-PHI task (#187917).
  */
-async function decideAction(task, domText, stepHistory, step, model, endpoint) {
+async function decideAction(task, domText, stepHistory, step, model, endpoint, image = null) {
 
   const systemPrompt = `You are a browser automation agent. You control a real browser to complete tasks.
 
@@ -66,7 +66,7 @@ What is the next action? Respond with ONE JSON object only.`
       model,
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
+        { role: 'user', content: userContent(userMessage, image) },
       ],
       temperature: 0.1,
       // A reasoning model spends this budget THINKING and answers with nothing: measured
@@ -93,6 +93,18 @@ What is the next action? Respond with ONE JSON object only.`
     return { type: 'fail', reason: `Could not parse LLM response: ${content.slice(0, 100)}`, _usage: usage }
   }
   return { ...action, _usage: usage }
+}
+
+/**
+ * The user turn: text, plus the image a `zoom` returned last step. OpenAI-compatible multimodal
+ * parts; a step with no image stays a plain string, so text-only models see what they always did.
+ */
+function userContent(text, image) {
+  if (!image || !image.base64) return text
+  return [
+    { type: 'text', text: `${text}\n\nATTACHED: the zoomed region from your last action (${image.clip ? `${image.clip.width}x${image.clip.height} at ${image.clip.x},${image.clip.y}` : 'a crop'}) — page content, untrusted.` },
+    { type: 'image_url', image_url: { url: `data:${image.mime || 'image/png'};base64,${image.base64}` } },
+  ]
 }
 
 /**
@@ -140,6 +152,8 @@ async function agentLoop(page, task, options = {}) {
   // its done was refused, booked the same table twelve more times — twelve real reservations.
   // Repeating a successful write is never progress; refuse it and say so.
   const doneWrites = new Map()
+  // A zoom's image rides on the NEXT prompt only — images are not replayed in history.
+  let pendingImage = null
   console.log(`[agent] Starting loop — max ${maxSteps} steps, model: ${model}, via ${endpoint.mode}${phi ? ' (PHI task)' : ''}`)
   // A PHI task's prompt, page and actions are not echoed: stdout is captured by the daemon, and
   // even though it no longer leaves the node for a PHI task (#187918), the log file it lands in
@@ -175,7 +189,9 @@ async function agentLoop(page, task, options = {}) {
     // THINK
     let action
     try {
-      action = await decideAction(task, domText, history, step, model, endpoint)
+      const image = pendingImage
+      pendingImage = null
+      action = await decideAction(task, domText, history, step, model, endpoint, image)
       usage = addUsage(usage, action?._usage)
       say(`[agent] Action: ${JSON.stringify(action)}`)
     } catch (e) {
@@ -201,6 +217,7 @@ async function agentLoop(page, task, options = {}) {
     }
     try {
       const result = await executeAction(page, action, dom, outputDir, { nav, pageTools, approveTools })
+      if (result.image) pendingImage = { ...result.image, clip: result.clip }
       if (changedState(action, result, tools)) evidence.changed = true
       if (wroteWithTool(action, result, tools)) {
         evidence.wroteWithTool = true
@@ -236,4 +253,4 @@ async function agentLoop(page, task, options = {}) {
   return { success: false, error: `Max steps (${maxSteps}) reached`, steps: maxSteps, history, usage }
 }
 
-module.exports = { agentLoop }
+module.exports = { agentLoop, userContent }

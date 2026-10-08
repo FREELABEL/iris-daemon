@@ -19,6 +19,7 @@ function historyEntry(action, result, opts = {}) {
   if (action?.input) line += ` ${JSON.stringify(action.input).slice(0, 80)}`
   if (action?.element) line += ` ${action.element}`
   if (action?.text) line += ` "${String(action.text).slice(0, 30)}"`
+  if (action?.value !== undefined) line += ` = ${JSON.stringify(action.value).slice(0, 40)}`
   if (action?.url) line += ` ${action.url}`
   line += ` → ${result?.message ?? ''}`
   let repeated = false

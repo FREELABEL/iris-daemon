@@ -15,13 +15,15 @@
 /** The action list. `extract` now says where the text goes: back to the model. */
 const ACTION_HELP = `{"type": "tool", "name": "page.book_table", "input": {...}} — call a tool the PAGE declared (listed under PAGE TOOLS). When one fits the task, use it INSTEAD of clicking and typing.
 {"type": "click", "element": "@N"}                    — click an interactive element
-{"type": "type", "element": "@N", "text": "..."}      — type text into an input
+{"type": "type", "element": "@N", "text": "..."}      — type text into an input, key by key
+{"type": "form_input", "element": "@N", "value": "..."} — SET a form field's value directly: text/textarea gets the text, a select gets the option (value or label), a checkbox/radio gets true or false. One action per field — prefer this to type when filling a form.
 {"type": "press", "key": "Enter"}                      — press a keyboard key
 {"type": "scroll", "direction": "down"}                — scroll the page (down/up)
 {"type": "navigate", "url": "https://..."}             — go to a URL
 {"type": "find", "text": "kimi-k3"}                    — SEARCH the page for a word or number; the matching lines and their line numbers come back to you. Use this FIRST on a long page instead of reading it from the top.
 {"type": "extract", "selector": "css-selector"}        — READ text from the page; it is returned to you on the next step. Omit the selector for the whole page, or target one part ("table", "main"). Add "save_as": "file.txt" to also write a file.
 {"type": "screenshot", "save_as": "result.png"}        — take a screenshot
+{"type": "zoom", "x": 0, "y": 0, "w": 400, "h": 300}   — look closely at one region of the viewport (pixels); its image is shown to you on the next step. Coordinates stay in the full viewport space.
 {"type": "wait", "seconds": 2}                         — wait for page to load
 {"type": "done", "result": "..."}                      — task completed
 {"type": "fail", "reason": "..."}                      — task cannot be completed`

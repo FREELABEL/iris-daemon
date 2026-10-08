@@ -19,7 +19,7 @@
 
 const CLAIMS_A_CHANGE = /\b(book(ed|ing)?|reserv(ed|ation)|creat(ed|e)|subscrib(ed|e)|submitt?(ed)?|purchas(ed|e)|order(ed)?|sent|paid|cancell?(ed)?|added|enroll(ed)?|register(ed)?|signed up|confirm(ed|ation)|saved|updated|deleted)\b/i
 
-const STATE_CHANGING_UI = new Set(['click', 'type', 'press'])
+const STATE_CHANGING_UI = new Set(['click', 'type', 'form_input', 'press'])
 
 /**
  * Record one step. `tools` is the list offered that step (for the read-only flag).
