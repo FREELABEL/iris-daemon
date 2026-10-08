@@ -2154,7 +2154,8 @@ class TaskExecutor {
         case 'code_generation': {
           // The node's IRIS agent runs the prompt non-interactively — see agent-cli.js for why
           // this no longer assumes an `iris-code` binary (every task failed with exit 127).
-          const agent = require('./agent-cli').agentCommand(task.prompt)
+          // The prompt carries the default "prove it on the PR" rule (#188292) unless PHI or opted out.
+          const agent = require('./agent-cli').agentCommand(require('./pr-proof').promptForCodingTask(task, { phi: isPhiTask(task) }))
           cmd = agent.cmd
           args = agent.args
           break
@@ -4884,21 +4885,26 @@ exit 1
       // local_llm only: the request body goes on stdin, and the resolved server travels with it.
       let stdinPayload = null
       let llmConfig = null
+      // A coding task run by an external agent gets the same "prove it on the PR" rule as the
+      // built-in path (#188292); every other task's prompt is passed through untouched.
+      const agentPrompt = task.type === 'code_generation'
+        ? require('./pr-proof').promptForCodingTask(task, { phi: isPhiTask(task) })
+        : task.prompt
 
       switch (runtime) {
         case 'claude_code':
           cmd = 'claude'
-          args = ['--print', task.prompt]
+          args = ['--print', agentPrompt]
           break
 
         case 'opencode':
           // `opencode run`, not `--non-interactive --prompt` (no such flag; --prompt opens the TUI). #188351
-          ;({ cmd, args } = require('./agent-cli').opencodeCommand(task.prompt))
+          ;({ cmd, args } = require('./agent-cli').opencodeCommand(agentPrompt))
           break
 
         case 'gemini_cli':
           cmd = 'gemini'
-          args = ['--prompt', task.prompt]
+          args = ['--prompt', agentPrompt]
           break
 
         case 'local_llm': {
@@ -4914,7 +4920,7 @@ exit 1
         case 'openclaw':
           // OpenClaw runs as a Docker container — execute via docker exec
           cmd = 'docker'
-          args = ['exec', 'openclaw', 'openclaw', 'process', '--message', task.prompt]
+          args = ['exec', 'openclaw', 'openclaw', 'process', '--message', agentPrompt]
           break
 
         default:
