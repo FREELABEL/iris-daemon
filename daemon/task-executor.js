@@ -4834,10 +4834,7 @@ exit 1
       })
 
       const timer = setTimeout(() => {
-        child.kill('SIGTERM')
-        setTimeout(() => {
-          if (!child.killed) child.kill('SIGKILL')
-        }, 5000)
+        require('./child-lifecycle').killWithEscalation(child, 5000)
         if (isGraceful) {
           resolve({ exitCode: 124, timedOut: true })
         } else {
@@ -4895,8 +4892,8 @@ exit 1
           break
 
         case 'opencode':
-          cmd = 'opencode'
-          args = ['--non-interactive', '--prompt', task.prompt]
+          // `opencode run`, not `--non-interactive --prompt` (no such flag; --prompt opens the TUI). #188351
+          ;({ cmd, args } = require('./agent-cli').opencodeCommand(task.prompt))
           break
 
         case 'gemini_cli':
@@ -4959,10 +4956,9 @@ exit 1
       child._taskType = task.type
       this.runningTasks.set(task.id, child)
 
-      if (stdinPayload !== null) {
-        child.stdin.on('error', () => { /* curl exited before reading — its exit code says why */ })
-        child.stdin.end(stdinPayload)
-      }
+      // Always close stdin. Leaving the pipe open made `iris run` wait for an EOF that never
+      // came (#188351); a payload, when there is one, is written first.
+      require('./child-lifecycle').closeStdin(child, stdinPayload)
 
       child.stdout.on('data', (data) => {
         // Redacted at arrival (#187915): outputLines, the live stream and the daemon log all
@@ -5004,10 +5000,7 @@ exit 1
       }
       const rtTimeoutLabel = timeout / 1000
       const timer = setTimeout(() => {
-        child.kill('SIGTERM')
-        setTimeout(() => {
-          if (!child.killed) child.kill('SIGKILL')
-        }, 5000)
+        require('./child-lifecycle').killWithEscalation(child, 5000)
         reject(new Error(`Runtime ${runtime} timed out after ${rtTimeoutLabel}s`))
       }, timeout)
 
@@ -5573,10 +5566,7 @@ exit 1
         try { this.tmux.cleanup(entry.sessionName) } catch {}
       } else if (entry?.kill) {
         // Direct child process
-        entry.kill('SIGTERM')
-        setTimeout(() => {
-          if (!entry.killed) entry.kill('SIGKILL')
-        }, 3000)
+        require('./child-lifecycle').killWithEscalation(entry, 3000)
       }
     }
     this.runningTasks.clear()

@@ -24,3 +24,15 @@ test('the prompt is one argument, never split or shell-interpolated', () => {
   const p = 'reply "OK"; rm -rf ~ $(whoami)'
   assert.deepStrictEqual(agentCommand(p, { exists: () => false }).args, ['run', p])
 })
+
+const { opencodeCommand } = require('../daemon/agent-cli')
+
+test('the opencode runtime uses `opencode run`, never the TUI flag that hangs (#188351)', () => {
+  assert.deepStrictEqual(opencodeCommand('fix it', { opencode: '/usr/bin/opencode' }), { cmd: '/usr/bin/opencode', args: ['run', 'fix it'], via: 'opencode' })
+})
+
+test('no opencode on the node: the node\'s own iris runs it non-interactively', () => {
+  const r = opencodeCommand('fix it', { opencode: null, home: '/h', exists: (p) => p === '/h/.iris/bin/iris' })
+  assert.deepStrictEqual(r.args, ['run', 'fix it'])
+  assert.strictEqual(r.via, 'iris')
+})
