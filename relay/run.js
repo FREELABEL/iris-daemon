@@ -31,6 +31,20 @@ const port = Number(process.env.HIVE_RELAY_PORT || 443)
 const certFile = process.env.HIVE_RELAY_CERT || path.join(HOME, '.iris/relay/acme/certificates', `${relayHost}.crt`)
 const keyFile = process.env.HIVE_RELAY_KEY || path.join(HOME, '.iris/relay/acme/certificates', `${relayHost}.key`)
 const secretFile = process.env.HIVE_RELAY_SECRET_FILE || path.join(HOME, '.iris/secrets/hive-relay.secret')
+// Takedown list: one tunnel name per line, # comments. Edits apply within 10 s, no restart.
+const denyFile = process.env.HIVE_RELAY_DENY_FILE || path.join(HOME, '.iris/relay/deny.txt')
+let denied = new Set()
+let denyMtime = 0
+function loadDeny () {
+  try {
+    const st = fs.statSync(denyFile)
+    if (st.mtimeMs === denyMtime) return false
+    denyMtime = st.mtimeMs
+    denied = new Set(fs.readFileSync(denyFile, 'utf8').split('\n').map((l) => l.replace(/#.*/, '').trim().toLowerCase()).filter(Boolean))
+  } catch { if (denied.size === 0 && denyMtime === 0) return false; denied = new Set(); denyMtime = 0 }
+  return true
+}
+loadDeny()
 
 function secret () {
   if (!fs.existsSync(secretFile)) {
@@ -51,7 +65,7 @@ if (process.argv[2] === 'token') {
 const log = (k, why) => console.log(`${new Date().toISOString()} ${k} ${why}`)
 // One options object, kept: the relay reads opts.cert / opts.key for each NEW control connection,
 // so swapping them on SIGHUP picks up a renewed certificate without dropping live tunnels.
-const opts = { zone, relayHost, cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), secret: secret(), log }
+const opts = { zone, relayHost, cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), secret: secret(), log, isDenied: (n) => denied.has(n) }
 const relay = createRelay(opts)
 process.on('SIGHUP', () => {
   try {
@@ -59,6 +73,7 @@ process.on('SIGHUP', () => {
     log('cert', 'reloaded on SIGHUP')
   } catch (e) { log('cert', `reload FAILED, keeping the old one: ${e.message}`) }
 })
+setInterval(() => { if (loadDeny()) log('deny', `list now ${denied.size} name(s); cut ${relay.enforceDenyList()} live`) }, 10000).unref()
 relay.server.listen(port, '0.0.0.0', () => console.log(`${new Date().toISOString()} hive relay on :${port} · zone ${zone} · control ${relayHost}`))
 relay.server.on('error', (e) => { console.error(`relay listen failed: ${e.message}`); process.exit(1) })
 setInterval(() => console.log(`${new Date().toISOString()} stats ${JSON.stringify(relay.stats())}`), 300000).unref()

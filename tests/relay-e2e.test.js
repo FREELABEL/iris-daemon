@@ -437,3 +437,15 @@ test('the REAL pending id with the wrong session is refused — knowing an id is
     visitor.destroy(); ctl.destroy()
   } finally { await w.close() }
 })
+
+test('TAKEDOWN: a denied name cannot register, and a live one is cut when the list changes', async () => {
+  const deny = new Set()
+  const w = await world({ relay: { isDenied: (n) => deny.has(n) } })
+  try {
+    assert.strictEqual((await visit(w.relayPort)).status, 200)
+    deny.add('demo')
+    assert.strictEqual(w.relay.enforceDenyList(), 1)
+    await assert.rejects(visit(w.relayPort))
+    await assert.rejects(connectTunnel({ relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', token: tokenFor(SECRET, 'demo'), cert: NODE_CERT.cert, key: NODE_CERT.key, target: { host: '127.0.0.1', port: w.appPort } }), /suspended/)
+  } finally { await w.close() }
+})

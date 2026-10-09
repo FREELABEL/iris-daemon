@@ -101,6 +101,8 @@ function createRelay (opts) {
   const maxPending = opts.maxPendingPerTunnel ?? 1024
   const maxIdle = opts.maxIdlePerTunnel ?? 64
   const tap = typeof opts.onForward === 'function' ? opts.onForward : null
+  // Operator takedown (#188585): a name on this list cannot register, and is cut if it is live.
+  const isDenied = typeof opts.isDenied === 'function' ? opts.isDenied : () => false
   const log = typeof opts.log === 'function' ? opts.log : () => {}
 
   const tunnels = new Map() // name -> { control, pending: Map(id -> {sock, hello, timer}), alive }
@@ -131,6 +133,7 @@ function createRelay (opts) {
 
     if (msg.op === 'hello') {
       if (!LABEL.test(name) || !tokenOk(opts.secret, name, msg.token)) { send(t, { op: 'err', error: 'bad token' }); return t.end() }
+      if (isDenied(name)) { log('refuse', `denied ${name}`); send(t, { op: 'err', error: 'name in use: suspended by the operator' }); return t.end() }
       const cur = tunnels.get(name)
       if (cur && !cur.control.destroyed) { send(t, { op: 'err', error: 'name in use' }); return t.end() }
       const tun = { control: t, pending: new Map(), idle: [], alive: Date.now(), session: crypto.randomBytes(24).toString('hex') }
@@ -190,6 +193,7 @@ function createRelay (opts) {
   function onVisitor (sock, hello, name) {
     const tun = tunnels.get(name)
     if (!tun || tun.control.destroyed) return refuse(sock, `no tunnel ${name}`)
+    if (isDenied(name)) { tun.control.destroy(); return refuse(sock, `denied ${name}`) }
     while (tun.idle.length) {
       const idle = tun.idle.shift()
       if (idle.destroyed) continue
@@ -236,6 +240,12 @@ function createRelay (opts) {
     server,
     tunnels,
     _sockets: sockets,
+    /** Re-check every live tunnel against the deny-list now (call after the list changes). */
+    enforceDenyList: () => {
+      let cut = 0
+      for (const [name, tun] of tunnels) if (isDenied(name)) { tun.control.destroy(); cut++ }
+      return cut
+    },
     stats: () => ({ ...counters, tunnels: tunnels.size, sockets: sockets.size, idle: [...tunnels.values()].reduce((n, t) => n + t.idle.length, 0) }),
     close: () => new Promise((resolve) => {
       server.close(() => resolve())
