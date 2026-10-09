@@ -1,0 +1,11 @@
+[Unit]
+Description=Hive relay DDNS - keep *.t.heyiris.io on this line's public IP (#188585)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=siralexmayo
+WorkingDirectory=/home/siralexmayo/.iris/relay/app
+ExecStart=/usr/bin/node relay/ddns.js
+NoNewPrivileges=true

@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the Hive relay certificate (DNS-01) and hot-reload it
+
+[Service]
+Type=oneshot
+User=siralexmayo
+ExecStart=/bin/sh -c 'CF_DNS_API_TOKEN=$(cat /home/siralexmayo/.iris/secrets/cloudflare-dns.token) /home/siralexmayo/.iris/relay/bin/lego renew --path /home/siralexmayo/.iris/relay/acme --domains relay.t.heyiris.io --dns cloudflare --dns.resolvers 1.1.1.1:53 --days 30 --log.format text'
+ExecStartPost=+/bin/systemctl reload hive-relay

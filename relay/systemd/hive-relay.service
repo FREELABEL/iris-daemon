@@ -1,0 +1,20 @@
+[Unit]
+Description=Hive relay — public tunnels for Hive nodes, end to end (relay never holds a tunnel key)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=siralexmayo
+WorkingDirectory=/home/siralexmayo/.iris/relay/app
+ExecStart=/usr/bin/node relay/run.js
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+# Port 443 and nothing else: no root, no new privileges.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
