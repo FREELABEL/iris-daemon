@@ -246,6 +246,18 @@ class Daemon {
       }, 10 * 60 * 1000)
     }
 
+    // Step 0b2: Worktree sweep (#188702) — remove agent worktrees that lose nothing (clean, fully
+    // pushed, idle 3+ days, nothing running in them); count the rest for the heartbeat. Off with
+    // IRIS_WORKTREE_SWEEP=0. Guarded like the tmux sweep against start() re-entry.
+    if (process.env.IRIS_WORKTREE_SWEEP !== '0' && !this._worktreeSweepInterval) {
+      const runSweep = () => require('../lib/worktree-sweep').sweep()
+        .then((r) => { this._worktreeReport = r })
+        .catch((e) => console.warn(`[worktrees] sweep failed: ${e.message}`))
+      this._worktreeSweepTimeout = setTimeout(runSweep, 10 * 60 * 1000)
+      this._worktreeSweepInterval = setInterval(runSweep, 6 * 60 * 60 * 1000)
+      if (typeof this._worktreeSweepTimeout.unref === 'function') this._worktreeSweepTimeout.unref()
+    }
+
     // Step 0c: Detect hardware profile (cached after first run)
     console.log('[daemon] Detecting hardware...')
     this.hardwareProfile = await detectProfile()
@@ -538,6 +550,8 @@ class Daemon {
       // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
       // its model can run. From a background cache; omitted until the first probe lands.
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
+      // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
+      ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
       // Live free space on ~/.iris, plus the last failed state write (#188700). Omitted when the
       // platform cannot measure it; the cloud keeps the startup number then.
       ...((() => { try { const d = require('../lib/disk-report').diskReport(); return d ? { disk: d } : {} } catch { return {} } })()),
