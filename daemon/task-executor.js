@@ -2158,6 +2158,9 @@ class TaskExecutor {
           const agent = require('./agent-cli').agentCommand(require('./pr-proof').promptForCodingTask(task, { phi: isPhiTask(task) }))
           cmd = agent.cmd
           args = agent.args
+          // Nobody is there to answer a permission prompt — see unattendedPermissionEnv.
+          task.config = task.config || {}
+          task.config.env_vars = { ...require('./agent-cli').unattendedPermissionEnv(task), ...(task.config.env_vars || {}) }
           break
         }
 
@@ -4947,6 +4950,7 @@ exit 1
           TASK_ID: task.id,
           TASK_TYPE: task.type,
           RUNTIME: runtime,
+          ...(runtime === 'opencode' ? require('./agent-cli').unattendedPermissionEnv(task) : {}),
           ...accountEnvForScripts(),
           ...(task.config?.env_vars || {})
         },

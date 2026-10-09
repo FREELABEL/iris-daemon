@@ -59,4 +59,26 @@ function opencodeCommand (prompt, opts = {}) {
   return agentCommand(prompt, opts)
 }
 
-module.exports = { agentCommand, opencodeCommand, onPath }
+/**
+ * Permissions for an agent nobody is watching (#188292).
+ *
+ * `iris run` / `opencode run` ASK before touching a folder outside the task's workspace. On a Hive
+ * task that question has no one to answer it: the first live coding task cloned into /tmp and sat
+ * on "Permission required: external_directory" until its timeout. So an unattended agent is told
+ * the answer in advance — stay inside the workspace — and a refusal comes back to it as a tool
+ * error it can work around, instead of a prompt that never returns.
+ *
+ * A task that genuinely needs another folder says so with config.allow_outside_workspace = true.
+ * Anything the node operator already put in OPENCODE_PERMISSION is kept; only the unset
+ * external_directory rule is filled in.
+ */
+function unattendedPermissionEnv (task, env = process.env) {
+  if (task && task.config && task.config.allow_outside_workspace === true) return {}
+  let current = {}
+  try { current = env.OPENCODE_PERMISSION ? JSON.parse(env.OPENCODE_PERMISSION) : {} } catch { current = {} }
+  if (!current || typeof current !== 'object' || Array.isArray(current)) current = {}
+  if (current.external_directory !== undefined) return {}
+  return { OPENCODE_PERMISSION: JSON.stringify({ ...current, external_directory: 'deny' }) }
+}
+
+module.exports = { agentCommand, opencodeCommand, onPath, unattendedPermissionEnv }
