@@ -62,3 +62,10 @@ test('a backend that exits non-zero with no output means "no matches", not a fai
   assert.deepStrictEqual(r.rows, [])
   assert.strictEqual(r.note, undefined)
 })
+
+test('a search inside files (grep:) returns each file with its first matching line', async () => {
+  const out = '{"ok":true,"files":[{"path":"/Users/a/pr-proof.js","matches":[{"line":35,"text":"function proofRule (scriptPath) {"}]}]}'
+  assert.deepStrictEqual(parseOutput({ name: 'fsearch' }, out, 5), [{ path: '/Users/a/pr-proof.js', line: 35, text: 'function proofRule (scriptPath) {' }])
+  const r = await searchDisk('grep:proofRule', { backend: { name: 'fsearch', bin: '/x', wholeDisk: true }, run: async () => out })
+  assert.strictEqual(r.rows[0].preview, 'line 35: function proofRule (scriptPath) {')
+})

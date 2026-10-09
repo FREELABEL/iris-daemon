@@ -88,6 +88,13 @@ function parseOutput (backend, stdout, limit) {
     }
     if (!v) return []
     if (v.ok === false) throw new Error(v.error || 'fsearch failed')
+    // `grep:` / `regex:` queries answer with files and their matching lines, not name hits.
+    if (Array.isArray(v.files)) {
+      return v.files.slice(0, n).map((f) => {
+        const m = (f.matches || [])[0]
+        return { path: String(f.path || ''), line: m ? m.line : null, text: m ? String(m.text || '').trim() : null }
+      }).filter((h) => h.path)
+    }
     return (v.hits || []).slice(0, n).map((h) => ({ path: String(h.path || ''), score: h.score ?? null })).filter((h) => h.path)
   }
   return String(stdout).split('\n').map((l) => l.trim()).filter(Boolean).slice(0, n).map((p) => ({ path: p }))
@@ -151,7 +158,7 @@ async function searchDisk (query, { limit = 10, backend = pickBackend(), run = r
     return {
       source: 'files',
       match: h.path,
-      preview: backend.wholeDisk ? `found by ${backend.name} · ${took} ms` : `home-folder scan · ${took} ms`,
+      preview: h.text ? `line ${h.line}: ${h.text.slice(0, 100)}` : backend.wholeDisk ? `found by ${backend.name} · ${took} ms` : `home-folder scan · ${took} ms`,
       date,
     }
   })
