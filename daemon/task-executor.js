@@ -1449,7 +1449,21 @@ class TaskExecutor {
           } catch { /* not macOS or no access */ }
         }
 
-        const limitedResults = results.slice(0, searchLimit)
+        // Whole-disk files (#188665): the node's own index — fsearch, Spotlight, locate, or a
+        // labelled home-folder scan. Kept to its own `limit` so it cannot crowd out the inbox.
+        let fileRows = []
+        if (searchType === 'all' || searchType === 'files') {
+          try {
+            const disk = await require('./disk-search').searchDisk((task.prompt || '').trim(), { limit: searchLimit })
+            fileRows = disk.rows
+            if (disk.note) fileRows.push({ source: 'files', match: '(no file results)', preview: disk.note, date: null })
+            console.log(`[hive-search] files via ${disk.backend || 'none'}: ${disk.rows.length} hit(s)${disk.took_ms != null ? ` in ${disk.took_ms} ms` : ''}`)
+          } catch (e) {
+            console.error(`[hive-search] file search failed: ${e.message}`)
+          }
+        }
+
+        const limitedResults = results.slice(0, searchLimit).concat(fileRows)
         console.log(`[hive-search] Found ${limitedResults.length} result(s) for "${searchQuery}"`)
 
         clearInterval(progressInterval)
