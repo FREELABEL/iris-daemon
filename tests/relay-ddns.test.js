@@ -70,3 +70,25 @@ test('a missing record is reported, never created (this keeps a record current; 
   assert.strictEqual((await w.run()).changed, 0)
   assert.match(w.out.join('\n'), /no A record/)
 })
+
+test('records in DIFFERENT zones are each updated in their own zone', async () => {
+  const patches = []
+  const fetchImpl = async (url, init = {}) => {
+    const j = (o) => new Response(JSON.stringify(o))
+    if (url === 'https://api.ipify.org') return new Response('104.202.243.99')
+    if (url === 'https://1.1.1.1/cdn-cgi/trace') return new Response('ip=104.202.243.99')
+    const zm = /zones\?name=([^&]+)/.exec(url)
+    if (zm) return j({ success: true, result: [{ id: 'Z-' + decodeURIComponent(zm[1]) }] })
+    if (url.includes('/dns_records?')) return j({ success: true, result: [{ id: 'R', content: '104.202.243.97' }] })
+    if (init.method === 'PATCH') { patches.push(url.split('/zones/')[1].split('/')[0]); return j({ success: true, result: {} }) }
+  }
+  const r = await reconcile({ token: 'tok', zone: ['heyiris.io', 'hivemesh.net', 'irishive.net'], records: ['*.t.heyiris.io', '*.hivemesh.net', '*.irishive.net'], fetchImpl, log: () => {} })
+  assert.strictEqual(r.changed, 3)
+  assert.deepStrictEqual(patches, ['Z-heyiris.io', 'Z-hivemesh.net', 'Z-irishive.net'])
+})
+
+test('a record outside every zone is an error, not a write somewhere else', async () => {
+  const w = world()
+  await assert.rejects(w.run({ zone: ['hivemesh.net'], records: ['*.t.heyiris.io'] }), /none of the zones/)
+  assert.strictEqual(w.patches.length, 0)
+})

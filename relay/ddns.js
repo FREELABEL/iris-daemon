@@ -18,7 +18,7 @@
  *     the network, or a carrier that moved us behind NAT — then port-forwarding cannot work anyway).
  *   - Only the named records are touched, and only their content.
  *
- * Env: HIVE_DDNS_ZONE=heyiris.io  HIVE_DDNS_RECORDS="*.t.heyiris.io"
+ * Env: HIVE_DDNS_ZONES="heyiris.io,hivemesh.net,irishive.net"  HIVE_DDNS_RECORDS="*.t.heyiris.io,*.hivemesh.net,*.irishive.net"
  *      CLOUDFLARE_DNS_TOKEN_FILE=~/.iris/secrets/cloudflare-dns.token (0600, DNS edit on the zone)
  */
 
@@ -68,16 +68,29 @@ async function reconcile ({ token, zone, records, check = false, fetchImpl = fet
     if (!r.ok || j.success === false) throw new Error(`cloudflare ${method} ${p.split('?')[0]}: ${(j.errors || []).map((e) => e.message).join('; ') || r.status}`)
     return j.result
   }
-  const z = (await cf('GET', `/zones?name=${encodeURIComponent(zone)}`))[0]
-  if (!z) throw new Error(`zone ${zone} not visible to this token`)
+  // Records may live in different zones (*.t.heyiris.io, *.hivemesh.net, *.irishive.net): each
+  // record's zone is the longest given zone it ends with.
+  const zoneIds = {}
+  const zoneOf = async (name) => {
+    const bare = name.replace(/^\*\./, '')
+    const z = [].concat(zone).filter((zz) => bare === zz || bare.endsWith('.' + zz)).sort((a, b) => b.length - a.length)[0]
+    if (!z) throw new Error(`${name} is in none of the zones ${[].concat(zone).join(', ')}`)
+    if (!zoneIds[z]) {
+      const found = (await cf('GET', `/zones?name=${encodeURIComponent(z)}`))[0]
+      if (!found) throw new Error(`zone ${z} not visible to this token`)
+      zoneIds[z] = found.id
+    }
+    return zoneIds[z]
+  }
   let changed = 0
   for (const name of records) {
-    const recs = await cf('GET', `/zones/${z.id}/dns_records?type=A&name=${encodeURIComponent(name)}`)
+    const zid = await zoneOf(name)
+    const recs = await cf('GET', `/zones/${zid}/dns_records?type=A&name=${encodeURIComponent(name)}`)
     if (!recs.length) { log(`ddns: ${name} has no A record — create it once by hand; this only keeps it current`); continue }
     for (const rec of recs) {
       if (rec.content === ip) { log(`ddns: ${name} → ${ip} (current)`); continue }
       if (check) { log(`ddns: ${name} is ${rec.content}, would set ${ip} (--check: no change)`); continue }
-      await cf('PATCH', `/zones/${z.id}/dns_records/${rec.id}`, { content: ip })
+      await cf('PATCH', `/zones/${zid}/dns_records/${rec.id}`, { content: ip })
       log(`ddns: ${name} ${rec.content} → ${ip} UPDATED`)
       changed++
     }
@@ -92,8 +105,8 @@ if (require.main === module) {
   const token = fs.readFileSync(tokenFile, 'utf8').trim()
   reconcile({
     token,
-    zone: process.env.HIVE_DDNS_ZONE || 'heyiris.io',
-    records: (process.env.HIVE_DDNS_RECORDS || '*.t.heyiris.io').split(',').map((s) => s.trim()).filter(Boolean),
+    zone: (process.env.HIVE_DDNS_ZONES || process.env.HIVE_DDNS_ZONE || 'heyiris.io,hivemesh.net,irishive.net').split(',').map((z) => z.trim()).filter(Boolean),
+    records: (process.env.HIVE_DDNS_RECORDS || '*.t.heyiris.io,*.hivemesh.net,*.irishive.net').split(',').map((s) => s.trim()).filter(Boolean),
     check: process.argv.includes('--check')
   }).then((r) => process.exit(r.error ? 1 : 0), (e) => { console.error(`ddns: ${e.message}`); process.exit(1) })
 }
