@@ -31,6 +31,9 @@ jobs:
       - name: Verify npm-script-backed tasks are shippable (catches missing discover/som scripts)
         run: node test/check-task-scripts.js
 
+      - name: file search engines on real Linux (scan, fallback, injection)
+        run: node --test tests/disk-search-on-this-platform.test.js tests/disk-search.test.js tests/file-search-guard.test.js
+
   # The Windows leg. Separate job, not a matrix entry, because it answers a different
   # question and has different steps.
   #
@@ -80,3 +83,7 @@ jobs:
       - name: shell-for-platform unit tests
         shell: pwsh
         run: node --test tests/shell-for-platform.test.js
+
+      - name: file search engines on real Windows (Windows Search, scan, fallback, injection)
+        shell: pwsh
+        run: node --test tests/disk-search-on-this-platform.test.js
