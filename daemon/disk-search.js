@@ -36,8 +36,23 @@ function onPath (name, env = process.env) {
   return null
 }
 
+const LOCATE_DBS = ['/var/lib/plocate/plocate.db', '/var/lib/mlocate/mlocate.db', '/var/lib/locate/locatedb']
+
+/** When the locate database was last rebuilt (ms), or null. Newer files are invisible until then. */
+function defaultDbMtime () {
+  for (const p of LOCATE_DBS) { try { return fs.statSync(p).mtimeMs } catch {} }
+  return null
+}
+
+function ago (ms) {
+  const m = Math.max(0, Math.round(ms / 60000))
+  if (m < 60) return `${m} min`
+  const h = Math.round(m / 60)
+  return h < 48 ? `${h} h` : `${Math.round(h / 24)} d`
+}
+
 function defaultLocateDb () {
-  return ['/var/lib/plocate/plocate.db', '/var/lib/mlocate/mlocate.db', '/var/lib/locate/locatedb'].some((p) => fs.existsSync(p))
+  return LOCATE_DBS.some((p) => fs.existsSync(p))
 }
 
 const clampLimit = (limit) => String(Math.max(1, Math.min(Number(limit) || 10, 200)))
@@ -119,6 +134,8 @@ function context (over = {}) {
     which: over.which || ((n) => onPath(n)),
     exists: over.exists || ((p) => fs.existsSync(p)),
     locateDb: over.locateDbExists || defaultLocateDb,
+    dbMtime: over.dbMtime || defaultDbMtime,
+    now: over.now || Date.now(),
     home: over.home || os.homedir()
   }
 }
@@ -128,7 +145,12 @@ function listProviders (over = {}) {
   const c = context(over)
   const list = PROVIDERS.filter((p) => p.platforms.includes(c.platform)).map((p) => {
     const bin = p.available(c)
-    return { name: p.name, coverage: p.coverage, available: !!bin, bin: bin || null, reason: bin ? null : p.why }
+    let coverage = p.coverage
+    if (bin && (p.name === 'plocate' || p.name === 'locate')) {
+      const t = c.dbMtime()
+      if (t) coverage = `whole disk · indexed ${ago(c.now - t)} ago`
+    }
+    return { name: p.name, coverage, available: !!bin, bin: bin || null, reason: bin ? null : p.why }
   })
   const chosen = list.find((p) => p.available)
   return { platform: c.platform, chosen: chosen ? chosen.name : null, providers: list }
@@ -216,45 +238,72 @@ function runBackend (bin, args, { limit = 10, lineBased = true, timeoutMs = TIME
   })
 }
 
+/** Every usable provider here, in preference order (or just the named one). */
+function candidates (ctx, wanted) {
+  const c = context(ctx)
+  const out = []
+  for (const p of PROVIDERS) {
+    if (!p.platforms.includes(c.platform)) continue
+    if (wanted && p.name !== wanted) continue
+    const bin = p.available(c)
+    if (bin) out.push({ name: p.name, bin, coverage: p.coverage, wholeDisk: p.name !== 'scan' && p.name !== 'windows-search' })
+  }
+  return out
+}
+
+async function runOne (b, q, limit, run, ctx) {
+  const platform = (ctx && ctx.platform) || process.platform
+  const [bin, args, env] = commandFor(b, q, limit, (ctx && ctx.home) || os.homedir(), platform)
+  const p = byName(b.name, platform)
+  return parseOutput(b, await run(bin, args, { limit, lineBased: p ? p.lineBased : true, env }), limit)
+}
+
 /**
- * Search this node's disk. Returns hive_search result rows plus which provider answered and what
- * it covers, so "no results" from a home-folder scan is never read as "not on this machine".
- * `provider` forces one by name; if it is not usable here the answer says so instead of silently
- * falling back.
+ * Search this node's disk. Tries the best provider first; if it FAILS (Windows Search service off,
+ * fsearch still indexing, an unreadable locate database) the next one answers and the result says
+ * so in `fellBackFrom`. A provider asked for by name is not substituted — the person chose it.
+ * Paths the index remembers but the disk no longer has are dropped (`dropped_stale`).
  */
-async function searchDisk (query, { limit = 10, provider = null, backend, run = runBackend, ctx = {} } = {}) {
+async function searchDisk (query, { limit = 10, provider = null, backend, run = runBackend, ctx = {}, exists = fs.existsSync } = {}) {
   const q = String(query || '').trim()
-  const b = backend !== undefined ? backend : pickBackend(ctx, provider)
-  if (!q) return { backend: b && b.name, rows: [] }
-  if (!b) {
+  const chain = backend !== undefined ? (backend ? [backend] : []) : candidates(ctx, provider)
+  if (!q) return { backend: chain[0] ? chain[0].name : null, rows: [] }
+  if (!chain.length) {
     const note = provider
       ? `provider ${provider} is not available here — ${(listProviders(ctx).providers.find((p) => p.name === provider) || {}).reason || 'not a provider on this platform'}`
       : 'no file index on this node'
     return { backend: null, rows: [], note }
   }
-  const started = Date.now()
-  const [bin, args, env] = commandFor(b, q, limit, (ctx && ctx.home) || os.homedir(), (ctx && ctx.platform) || process.platform)
-  const p = byName(b.name, (ctx && ctx.platform) || process.platform)
-  let hits = []
-  try {
-    hits = parseOutput(b, await run(bin, args, { limit, lineBased: p ? p.lineBased : true, env }), limit)
-  } catch (e) {
-    return { backend: b.name, rows: [], note: `file search failed: ${String(e.message || e).slice(0, 160)}` }
-  }
-  const took = Date.now() - started
-  const coverage = b.coverage || (p && p.coverage) || ''
-  const rows = hits.map((h) => {
-    let date = null
-    try { date = fs.statSync(h.path).mtime.toISOString() } catch {}
-    return {
-      source: 'files',
-      match: h.path,
-      preview: h.text ? `line ${h.line}: ${h.text.slice(0, 100)}` : `${b.name} · ${coverage} · ${took} ms`,
-      date,
-      provider: b.name
+  const failures = []
+  for (const b of chain) {
+    const started = Date.now()
+    let hits
+    try {
+      hits = await runOne(b, q, limit, run, ctx)
+    } catch (e) {
+      failures.push(`${b.name}: ${String(e.message || e).slice(0, 120)}`)
+      continue
     }
-  })
-  return { backend: b.name, coverage, wholeDisk: !!b.wholeDisk, took_ms: took, rows }
+    const took = Date.now() - started
+    const live = hits.filter((h) => { try { return exists(h.path) } catch { return false } })
+    const coverage = b.coverage || (byName(b.name) || {}).coverage || ''
+    const rows = live.map((h) => {
+      let date = null
+      try { date = fs.statSync(h.path).mtime.toISOString() } catch {}
+      return {
+        source: 'files',
+        match: h.path,
+        preview: h.text ? `line ${h.line}: ${h.text.slice(0, 100)}` : `${b.name} · ${coverage} · ${took} ms`,
+        date,
+        provider: b.name
+      }
+    })
+    const out = { backend: b.name, coverage, wholeDisk: !!b.wholeDisk, took_ms: took, rows }
+    if (hits.length !== live.length) out.dropped_stale = hits.length - live.length
+    if (failures.length) out.fellBackFrom = failures.join('; ')
+    return out
+  }
+  return { backend: chain[chain.length - 1].name, rows: [], note: `file search failed: ${failures.join('; ')}` }
 }
 
 module.exports = { PROVIDERS, listProviders, pickBackend, commandFor, parseOutput, searchDisk, runBackend, WINDOWS_SEARCH_PS, WINDOWS_SCAN_PS }

@@ -1477,12 +1477,15 @@ class TaskExecutor {
 
         const limitedResults = results.slice(0, searchLimit).concat(fileRows)
         console.log(`[hive-search] Found ${limitedResults.length} result(s) for "${searchQuery}"`)
+        // What may leave this machine (#188665): never IRIS's patient-data storage, and on a
+        // patient-data task or machine only counts — no file names, message text or inbox names.
+        const guarded = require('../lib/file-search-guard').guardSearchResults(limitedResults, { task })
 
         clearInterval(progressInterval)
       outputStream.stop().catch(() => {})
         await this.cloud.submitResult(taskId, {
           status: 'completed',
-          output: JSON.stringify(limitedResults),
+          output: JSON.stringify(guarded),
           duration_ms: Date.now() - startTime,
         })
         return

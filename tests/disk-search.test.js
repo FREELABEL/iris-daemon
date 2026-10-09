@@ -35,10 +35,10 @@ test('fsearch JSON hits are read; an fsearch error surfaces instead of reading a
 })
 
 test('rows say which index answered, so a home-folder scan is never mistaken for the whole disk', async () => {
-  const r = await searchDisk('invoice', { backend: { name: 'scan', bin: '/bin/find', wholeDisk: false }, run: () => '/home/u/invoice.pdf\n' })
+  const r = await searchDisk('invoice', { backend: { name: 'scan', bin: '/bin/find', wholeDisk: false }, run: () => '/home/u/invoice.pdf\n', exists: () => true })
   assert.strictEqual(r.rows[0].source, 'files')
   assert.match(r.rows[0].preview, /scan/)
-  const s = await searchDisk('invoice', { backend: { name: 'spotlight', bin: '/usr/bin/mdfind', wholeDisk: true }, run: () => '/a\n/b\n/c\n', limit: 2 })
+  const s = await searchDisk('invoice', { backend: { name: 'spotlight', bin: '/usr/bin/mdfind', wholeDisk: true }, run: () => '/a\n/b\n/c\n', limit: 2, exists: () => true })
   assert.strictEqual(s.rows.length, 2)
   assert.match(s.rows[0].preview, /^spotlight · /)
 })
@@ -66,7 +66,7 @@ test('a backend that exits non-zero with no output means "no matches", not a fai
 test('a search inside files (grep:) returns each file with its first matching line', async () => {
   const out = '{"ok":true,"files":[{"path":"/Users/a/pr-proof.js","matches":[{"line":35,"text":"function proofRule (scriptPath) {"}]}]}'
   assert.deepStrictEqual(parseOutput({ name: 'fsearch' }, out, 5), [{ path: '/Users/a/pr-proof.js', line: 35, text: 'function proofRule (scriptPath) {' }])
-  const r = await searchDisk('grep:proofRule', { backend: { name: 'fsearch', bin: '/x', wholeDisk: true }, run: async () => out })
+  const r = await searchDisk('grep:proofRule', { backend: { name: 'fsearch', bin: '/x', wholeDisk: true }, run: async () => out, exists: () => true })
   assert.strictEqual(r.rows[0].preview, 'line 35: function proofRule (scriptPath) {')
 })
 
@@ -104,4 +104,52 @@ test('asking for a provider this machine lacks says why, instead of quietly usin
   assert.match(r.note, /provider fsearch is not available here — not installed/)
   const forced = await searchDisk('x', { provider: 'scan', ctx: { platform: 'darwin', which: has('fsearch', 'mdfind', 'find'), home: '/h' }, run: async () => '/h/x\n' })
   assert.strictEqual(forced.backend, 'scan')
+})
+
+// ── TDD, written before the implementation (#188665: fallback, stale results, index age) ──
+
+test('when the chosen engine fails, the next one answers — and the result says it fell back', async () => {
+  const ctx = { platform: 'win32', which: has('powershell.exe') }
+  const calls = []
+  const run = async (bin, args) => {
+    const script = args[args.length - 1]
+    calls.push(script.includes('SYSTEMINDEX') ? 'windows-search' : 'scan')
+    if (script.includes('SYSTEMINDEX')) throw new Error('The Windows Search service is not running')
+    return 'C:\\Users\\a\\invoice.pdf\r\n'
+  }
+  const r = await searchDisk('invoice', { ctx, run, exists: () => true })
+  assert.deepStrictEqual(calls, ['windows-search', 'scan'])
+  assert.strictEqual(r.backend, 'scan')
+  assert.strictEqual(r.rows[0].match, 'C:\\Users\\a\\invoice.pdf')
+  assert.match(r.fellBackFrom, /windows-search: The Windows Search service is not running/)
+})
+
+test('a provider asked for BY NAME does not fall back — the person asked for that one', async () => {
+  const ctx = { platform: 'darwin', which: has('fsearch', 'mdfind', 'find') }
+  const r = await searchDisk('x', { provider: 'fsearch', ctx, run: async () => { throw new Error('indexing') } })
+  assert.deepStrictEqual(r.rows, [])
+  assert.match(r.note, /indexing/)
+})
+
+test('fsearch still indexing is a failure to fall back from, not "0 results"', async () => {
+  const ctx = { platform: 'darwin', which: has('fsearch', 'mdfind') }
+  const run = async (bin) => (bin.endsWith('fsearch') ? '{"ok":false,"error":"indexing (first run scans the whole disk, ~20s)"}' : '/Users/a/x.pdf\n')
+  const r = await searchDisk('x', { ctx, run, exists: () => true })
+  assert.strictEqual(r.backend, 'spotlight')
+  assert.match(r.fellBackFrom, /fsearch: indexing/)
+})
+
+test('files an index remembers but the disk no longer has are dropped', async () => {
+  const backend = { name: 'plocate', bin: '/bin/plocate', wholeDisk: true, coverage: 'whole disk' }
+  const run = async () => '/home/a/kept.txt\n/home/a/deleted.txt\n'
+  const r = await searchDisk('a', { backend, run, exists: (p) => p !== '/home/a/deleted.txt' })
+  assert.deepStrictEqual(r.rows.map((x) => x.match), ['/home/a/kept.txt'])
+  assert.strictEqual(r.dropped_stale, 1)
+})
+
+test('Linux providers say how old their index is', () => {
+  const now = Date.parse('2026-10-09T12:00:00Z')
+  const lin = listProviders({ platform: 'linux', which: has('plocate', 'find'), locateDbExists: () => true, dbMtime: () => now - 3 * 3600e3, now })
+  const p = lin.providers.find((x) => x.name === 'plocate')
+  assert.match(p.coverage, /indexed 3 h ago/)
 })
