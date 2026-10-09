@@ -5,7 +5,8 @@
  * Run the Hive relay as a service (#188585).
  *
  *   node relay/run.js                       serve (config from env, secrets from files)
- *   node relay/run.js token <name>          print the registration token for one tunnel name
+ *   node relay/run.js token <name> [hours]  print a registration token for one name (default 24 h) —
+ *                                           for operators; people get theirs from the IRIS API
  *
  * Env (defaults are for the heyiris.io deployment on iris-hive-001):
  *   HIVE_RELAY_ZONE=t.heyiris.io  HIVE_RELAY_HOST=relay.t.heyiris.io  HIVE_RELAY_PORT=443
@@ -42,7 +43,8 @@ function secret () {
 if (process.argv[2] === 'token') {
   const name = String(process.argv[3] || '')
   if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name)) { console.error('usage: relay/run.js token <name>  (lowercase letters, digits, dashes)'); process.exit(2) }
-  console.log(tokenFor(secret(), name))
+  const hours = Math.min(Math.max(Number(process.argv[4] || 24), 1), 24 * 30)
+  console.log(tokenFor(secret(), name, Math.floor(Date.now() / 1000) + Math.round(hours * 3600)))
   process.exit(0)
 }
 

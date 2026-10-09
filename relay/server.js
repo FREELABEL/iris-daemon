@@ -26,13 +26,31 @@ const { readClientHello, MAX_HELLO } = require('./sni')
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 const MAX_LINE = 4096
 
-function tokenFor (secret, name) {
-  return crypto.createHmac('sha256', String(secret)).update('hive-relay:v1:' + String(name)).digest('hex')
+/**
+ * A registration token for ONE name until ONE time: `<expUnixSeconds>.<hmac>`. Issued by the IRIS
+ * API to the account that owns the name (fl-iris-api HiveTunnelController mirrors this exactly);
+ * the relay only checks it. Expiry is what makes revoking a name take effect without a revocation
+ * list. A live tunnel is not cut at expiry — its data connections use the per-registration session.
+ */
+function tokenFor (secret, name, expSec) {
+  const exp = Number.isInteger(expSec) ? expSec : Math.floor(Date.now() / 1000) + 86400
+  const mac = crypto.createHmac('sha256', String(secret)).update(`hive-relay:v2:${String(name)}:${exp}`).digest('hex')
+  return `${exp}.${mac}`
 }
 
-function tokenOk (secret, name, token) {
-  const want = Buffer.from(tokenFor(secret, name))
-  const got = Buffer.from(String(token || ''))
+function tokenOk (secret, name, token, nowMs = Date.now()) {
+  const m = /^(\d{1,12})\.([0-9a-f]{64})$/.exec(String(token || ''))
+  if (!m) return false
+  const exp = Number(m[1])
+  if (exp * 1000 <= nowMs) return false
+  const want = Buffer.from(tokenFor(secret, name, exp))
+  const got = Buffer.from(String(token))
+  return got.length === want.length && crypto.timingSafeEqual(got, want)
+}
+
+const sessionOk = (tun, s) => {
+  const got = Buffer.from(String(s || ''))
+  const want = Buffer.from(tun.session)
   return got.length === want.length && crypto.timingSafeEqual(got, want)
 }
 
@@ -115,10 +133,10 @@ function createRelay (opts) {
       if (!LABEL.test(name) || !tokenOk(opts.secret, name, msg.token)) { send(t, { op: 'err', error: 'bad token' }); return t.end() }
       const cur = tunnels.get(name)
       if (cur && !cur.control.destroyed) { send(t, { op: 'err', error: 'name in use' }); return t.end() }
-      const tun = { control: t, pending: new Map(), idle: [], alive: Date.now() }
+      const tun = { control: t, pending: new Map(), idle: [], alive: Date.now(), session: crypto.randomBytes(24).toString('hex') }
       tunnels.set(name, tun)
       counters.registered++
-      send(t, { op: 'ok', host: `${name}.${zone}` })
+      send(t, { op: 'ok', host: `${name}.${zone}`, session: tun.session })
       let lines = rest
       t.on('data', (d) => {
         lines = Buffer.concat([lines, d]); tun.alive = Date.now()
@@ -145,7 +163,7 @@ function createRelay (opts) {
       // WARM POOL: a pre-handshaked connection from the node, parked until a visitor arrives. Saves
       // the visitor a node↔relay TLS handshake (measured: 1000-burst went 15 s → see tests).
       const tun = tunnels.get(name)
-      if (!tun || !tokenOk(opts.secret, name, msg.token) || tun.idle.length >= maxIdle) return t.destroy()
+      if (!tun || !sessionOk(tun, msg.session) || tun.idle.length >= maxIdle) return t.destroy()
       tun.idle.push(t)
       t.on('close', () => { const i = tun.idle.indexOf(t); if (i >= 0) tun.idle.splice(i, 1) })
       return
@@ -153,7 +171,7 @@ function createRelay (opts) {
 
     if (msg.op === 'data') {
       const tun = tunnels.get(name)
-      if (!tun || !tokenOk(opts.secret, name, msg.token)) { send(t, { op: 'err', error: 'unknown tunnel' }); return t.end() }
+      if (!tun || !sessionOk(tun, msg.session)) { send(t, { op: 'err', error: 'unknown tunnel' }); return t.end() }
       const p = tun.pending.get(String(msg.id || ''))
       if (!p) { send(t, { op: 'err', error: 'unknown id' }); return t.end() }
       tun.pending.delete(String(msg.id))

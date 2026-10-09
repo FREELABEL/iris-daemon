@@ -286,14 +286,15 @@ test('with a visitor WAITING, a data connection carrying a forged id is refused 
     const ctl = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert })
     await new Promise((r) => ctl.on('secureConnect', r))
     ctl.write(JSON.stringify({ op: 'hello', name: 'demo', token: tokenFor(SECRET, 'demo') }) + '\n')
-    await new Promise((r) => ctl.once('data', r))
+    const { session } = JSON.parse(String(await new Promise((r) => ctl.once('data', r))).split('\n')[0])
+    assert.ok(session, 'registration returns a session key')
     const visitor = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: 'demo.' + ZONE, ca: NODE_CERT.cert })
     visitor.on('error', () => {})
     await new Promise((r) => setTimeout(r, 200))
     assert.strictEqual([...w.relay.tunnels.get('demo').pending.keys()].length, 1, 'visitor is pending')
     const forged = await new Promise((resolve) => {
       const s = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert }, () => {
-        s.write(JSON.stringify({ op: 'data', id: 'not-the-real-id', name: 'demo', token: tokenFor(SECRET, 'demo') }) + '\n')
+        s.write(JSON.stringify({ op: 'data', id: 'not-the-real-id', name: 'demo', session }) + '\n')
       })
       let buf = ''
       s.on('data', (d) => { buf += d })
@@ -301,6 +302,138 @@ test('with a visitor WAITING, a data connection carrying a forged id is refused 
     })
     assert.match(forged, /unknown id/)
     assert.strictEqual([...w.relay.tunnels.get('demo').pending.keys()].length, 1, 'visitor was not spliced to the forged connection')
+    visitor.destroy(); ctl.destroy()
+  } finally { await w.close() }
+})
+
+// ── Expiring tokens + per-registration sessions ─────────────────────────────────────────────────
+
+test('an EXPIRED token is refused, and a token is bound to its expiry (editing it breaks the signature)', async () => {
+  const w = await world({ noTunnel: true })
+  const base = { relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', cert: NODE_CERT.cert, key: NODE_CERT.key, target: { host: '127.0.0.1', port: w.appPort } }
+  try {
+    const past = Math.floor(Date.now() / 1000) - 5
+    await assert.rejects(connectTunnel({ ...base, token: tokenFor(SECRET, 'demo', past) }), /token/)
+    const t = tokenFor(SECRET, 'demo', past)
+    const pushed = String(past + 86400) + t.slice(t.indexOf('.'))
+    await assert.rejects(connectTunnel({ ...base, token: pushed }), /token/)
+    const ok = await connectTunnel({ ...base, token: tokenFor(SECRET, 'demo', Math.floor(Date.now() / 1000) + 60) })
+    ok.close()
+  } finally { await w.close() }
+})
+
+test('a valid TOKEN alone does not open a data connection — it needs the live registration\'s session', async () => {
+  const w = await world()
+  try {
+    await new Promise((r) => setTimeout(r, 200))
+    const before = w.relay.stats().idle
+    const got = await new Promise((resolve) => {
+      const s = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert }, () => {
+        s.write(JSON.stringify({ op: 'idle', name: 'demo', token: tokenFor(SECRET, 'demo') }) + '\n')
+      })
+      s.on('close', () => resolve('closed')); s.on('error', () => resolve('closed'))
+      s.setTimeout(1500, () => { s.destroy(); resolve('left open') })
+    })
+    assert.strictEqual(got, 'closed')
+    assert.strictEqual(w.relay.stats().idle, before, 'a token-only connection was parked in the pool')
+  } finally { await w.close() }
+})
+
+test('a live tunnel keeps serving after its registration token expires', async () => {
+  const w = await world({ noTunnel: true })
+  try {
+    const exp = Math.floor(Date.now() / 1000) + 2
+    const t = await connectTunnel({ relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', token: tokenFor(SECRET, 'demo', exp), cert: NODE_CERT.cert, key: NODE_CERT.key, target: { host: '127.0.0.1', port: w.appPort }, poolSize: 0 })
+    await new Promise((r) => setTimeout(r, 3200))
+    assert.strictEqual((await visit(w.relayPort, { pathName: '/after-expiry' })).text, 'SECRET-PAGE GET /after-expiry ')
+    t.close()
+  } finally { await w.close() }
+})
+
+test('getToken() is asked for a fresh token on every (re)connect', async () => {
+  const w = await world({ noTunnel: true })
+  let asked = 0
+  try {
+    const t = await connectTunnel({ relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', getToken: async () => { asked++; return tokenFor(SECRET, 'demo') }, cert: NODE_CERT.cert, key: NODE_CERT.key, target: { host: '127.0.0.1', port: w.appPort }, reconnect: true })
+    assert.strictEqual(asked, 1)
+    w.relay.tunnels.get('demo').control.destroy()
+    for (let i = 0; i < 40 && asked < 2; i++) await new Promise((r) => setTimeout(r, 100))
+    assert.ok(asked >= 2, 'asked again on reconnect')
+    t.close()
+  } finally { await w.close() }
+})
+
+// ── Certificates through the blind relay (TLS-ALPN-01) ──────────────────────────────────────────
+
+const x509 = require('../relay/x509')
+const ACME_ID_OID = Buffer.from([0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f])
+
+function alpnVisit (port, alpn) {
+  return new Promise((resolve) => {
+    const s = tls.connect({ host: '127.0.0.1', port, servername: 'demo.' + ZONE, ALPNProtocols: alpn, rejectUnauthorized: false }, () => {
+      const peer = s.getPeerCertificate(true)
+      resolve({ ok: true, alpn: s.alpnProtocol, raw: peer && peer.raw })
+      s.destroy()
+    })
+    s.on('error', (e) => resolve({ ok: false, err: e.code || e.message }))
+    s.setTimeout(3000, () => { s.destroy(); resolve({ ok: false, err: 'timeout' }) })
+  })
+}
+
+test('TLS-ALPN-01: an acme-tls/1 visitor gets the CHALLENGE certificate; a normal visitor still gets the node\'s', async () => {
+  const w = await world()
+  try {
+    const key = x509.newKey()
+    w.tunnel.setChallenge('demo.' + ZONE, { cert: x509.alpnChallengeCert(key, 'demo.' + ZONE, 'tok.thumb'), key })
+    const v = await alpnVisit(w.relayPort, ['acme-tls/1'])
+    assert.ok(v.ok, `handshake: ${v.err}`)
+    assert.strictEqual(v.alpn, 'acme-tls/1')
+    const digest = crypto.createHash('sha256').update('tok.thumb').digest()
+    assert.ok(v.raw.includes(ACME_ID_OID) && v.raw.includes(digest), 'served the acmeIdentifier for THIS key authorization')
+    assert.strictEqual((await visit(w.relayPort, { pathName: '/normal' })).text, 'SECRET-PAGE GET /normal ')
+    w.tunnel.setChallenge('demo.' + ZONE, null)
+    assert.strictEqual((await alpnVisit(w.relayPort, ['acme-tls/1'])).ok, false, 'no challenge pending → closed, never the real cert')
+  } finally { await w.close() }
+})
+
+test('a tunnel can come up BEFORE it has a certificate; visitors are closed until setCertificate()', async () => {
+  const w = await world({ noTunnel: true })
+  try {
+    const t = await connectTunnel({ relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', token: tokenFor(SECRET, 'demo'), target: { host: '127.0.0.1', port: w.appPort } })
+    assert.strictEqual(t.hasCertificate(), false)
+    await assert.rejects(visit(w.relayPort))
+    t.setCertificate(NODE_CERT.cert, NODE_CERT.key)
+    assert.strictEqual((await visit(w.relayPort, { pathName: '/now' })).text, 'SECRET-PAGE GET /now ')
+    t.close()
+  } finally { await w.close() }
+})
+
+test('the REAL pending id with the wrong session is refused — knowing an id is not enough', async () => {
+  const w = await world({ noTunnel: true, dataTimeoutMs: 3000 })
+  try {
+    const ctl = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert })
+    await new Promise((r) => ctl.on('secureConnect', r))
+    ctl.write(JSON.stringify({ op: 'hello', name: 'demo', token: tokenFor(SECRET, 'demo') }) + '\n')
+    let lines = ''
+    ctl.on('data', (d) => { lines += d })
+    while (!lines.includes('"ok"')) await new Promise((r) => setTimeout(r, 20))
+    const visitor = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: 'demo.' + ZONE, ca: NODE_CERT.cert })
+    visitor.on('error', () => {})
+    for (let i = 0; i < 50 && !lines.includes('"open"'); i++) await new Promise((r) => setTimeout(r, 20))
+    const id = lines.split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((m) => m.op === 'open').id
+    for (const session of ['wrong', undefined]) {
+      const got = await new Promise((resolve) => {
+        const s = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert }, () => {
+          s.write(JSON.stringify({ op: 'data', id, name: 'demo', session, token: tokenFor(SECRET, 'demo') }) + '\n')
+        })
+        let buf = ''
+        s.on('data', (d) => { buf += d })
+        s.on('close', () => resolve(buf)); s.on('error', () => resolve(buf))
+        s.setTimeout(1500, () => { s.destroy(); resolve(buf || 'left open') })
+      })
+      assert.match(got, /unknown tunnel/)
+    }
+    assert.strictEqual(w.relay.tunnels.get('demo').pending.size, 1, 'the visitor was not handed over')
     visitor.destroy(); ctl.destroy()
   } finally { await w.close() }
 })
