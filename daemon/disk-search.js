@@ -285,6 +285,14 @@ async function searchDisk (query, { limit = 10, provider = null, backend, run = 
       continue
     }
     const took = Date.now() - started
+    // An engine that covers only PART of the disk (Windows Search: indexed folders, and it lags
+    // new files) finding nothing is not the answer — measured on a real Windows runner, a file
+    // made seconds earlier came back 0. Let the next engine look. A whole-disk engine's empty
+    // answer IS the answer.
+    if (!hits.length && b.name === 'windows-search' && chain.indexOf(b) < chain.length - 1) {
+      failures.push(`${b.name}: no matches in indexed folders`)
+      continue
+    }
     const live = hits.filter((h) => { try { return exists(h.path) } catch { return false } })
     const coverage = b.coverage || (byName(b.name) || {}).coverage || ''
     const rows = live.map((h) => {

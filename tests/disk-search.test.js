@@ -153,3 +153,22 @@ test('Linux providers say how old their index is', () => {
   const p = lin.providers.find((x) => x.name === 'plocate')
   assert.match(p.coverage, /indexed 3 h ago/)
 })
+
+test('Windows Search finding NOTHING is not the last word — it covers indexed folders only, and lags new files', async () => {
+  // Measured on a real Windows runner: a file made seconds earlier → windows-search 0 rows, no error.
+  const ctx = { platform: 'win32', which: has('powershell.exe') }
+  const run = async (bin, args) => (args[args.length - 1].includes('SYSTEMINDEX') ? '' : 'C:\\Users\\a\\new.txt\r\n')
+  const r = await searchDisk('new', { ctx, run, exists: () => true })
+  assert.strictEqual(r.backend, 'scan')
+  assert.deepStrictEqual(r.rows.map((x) => x.match), ['C:\\Users\\a\\new.txt'])
+  assert.match(r.fellBackFrom, /windows-search: no matches in indexed folders/)
+})
+
+test('a whole-disk engine finding nothing IS the answer — no pointless 8 s scan after it', async () => {
+  const ctx = { platform: 'linux', which: has('plocate', 'find'), locateDbExists: () => true }
+  const calls = []
+  const run = async (bin) => { calls.push(bin); return '' }
+  const r = await searchDisk('nothing', { ctx, run, exists: () => true })
+  assert.deepStrictEqual(calls, ['/bin/plocate'])
+  assert.strictEqual(r.backend, 'plocate')
+})
