@@ -6,7 +6,7 @@ const { pickBackend, commandFor, parseOutput, searchDisk } = require('../daemon/
 const has = (...names) => (n) => (names.includes(n) ? `/bin/${n}` : null)
 
 test('a Mac with fsearch uses it; without, Spotlight — both cover the whole disk (#188665)', () => {
-  assert.deepStrictEqual(pickBackend({ platform: 'darwin', which: has('fsearch', 'mdfind') }), { name: 'fsearch', bin: '/bin/fsearch', wholeDisk: true })
+  assert.deepStrictEqual(pickBackend({ platform: 'darwin', which: has('fsearch', 'mdfind') }), { name: 'fsearch', bin: '/bin/fsearch', coverage: 'whole disk', wholeDisk: true })
   assert.strictEqual(pickBackend({ platform: 'darwin', which: has('mdfind') }).name, 'spotlight')
 })
 
@@ -37,10 +37,10 @@ test('fsearch JSON hits are read; an fsearch error surfaces instead of reading a
 test('rows say which index answered, so a home-folder scan is never mistaken for the whole disk', async () => {
   const r = await searchDisk('invoice', { backend: { name: 'scan', bin: '/bin/find', wholeDisk: false }, run: () => '/home/u/invoice.pdf\n' })
   assert.strictEqual(r.rows[0].source, 'files')
-  assert.match(r.rows[0].preview, /home-folder scan/)
+  assert.match(r.rows[0].preview, /scan/)
   const s = await searchDisk('invoice', { backend: { name: 'spotlight', bin: '/usr/bin/mdfind', wholeDisk: true }, run: () => '/a\n/b\n/c\n', limit: 2 })
   assert.strictEqual(s.rows.length, 2)
-  assert.match(s.rows[0].preview, /found by spotlight/)
+  assert.match(s.rows[0].preview, /^spotlight · /)
 })
 
 test('a failing backend reports why, and no backend at all says so', async () => {
@@ -68,4 +68,40 @@ test('a search inside files (grep:) returns each file with its first matching li
   assert.deepStrictEqual(parseOutput({ name: 'fsearch' }, out, 5), [{ path: '/Users/a/pr-proof.js', line: 35, text: 'function proofRule (scriptPath) {' }])
   const r = await searchDisk('grep:proofRule', { backend: { name: 'fsearch', bin: '/x', wholeDisk: true }, run: async () => out })
   assert.strictEqual(r.rows[0].preview, 'line 35: function proofRule (scriptPath) {')
+})
+
+const { listProviders, WINDOWS_SEARCH_PS, WINDOWS_SCAN_PS } = require('../daemon/disk-search')
+
+test('each platform lists its own providers in order, and names the one it will use', () => {
+  const mac = listProviders({ platform: 'darwin', which: has('mdfind', 'find'), exists: () => false })
+  assert.deepStrictEqual(mac.providers.map((p) => p.name), ['fsearch', 'spotlight', 'scan'])
+  assert.strictEqual(mac.chosen, 'spotlight')
+  assert.match(mac.providers[0].reason, /iris locate setup/)
+  const lin = listProviders({ platform: 'linux', which: has('find'), locateDbExists: () => false })
+  assert.deepStrictEqual(lin.providers.map((p) => p.name), ['plocate', 'locate', 'scan'])
+  assert.strictEqual(lin.chosen, 'scan')
+  const win = listProviders({ platform: 'win32', which: has('powershell.exe') })
+  assert.deepStrictEqual(win.providers.map((p) => p.name), ['windows-search', 'scan'])
+  assert.strictEqual(win.chosen, 'windows-search')
+  assert.match(win.providers[0].coverage, /indexed folders/)
+})
+
+test('Windows passes the query through the environment — the script text never contains it', () => {
+  const evil = "x'; Remove-Item C:\\ -Recurse; '"
+  for (const name of ['windows-search', 'scan']) {
+    const [bin, args, env] = commandFor({ name, bin: 'powershell.exe' }, evil, 5, 'C:\\Users\\a', 'win32')
+    assert.strictEqual(bin, 'powershell.exe')
+    assert.ok(!args.join(' ').includes('Remove-Item'), name)
+    assert.deepStrictEqual(env, { IRIS_Q: evil, IRIS_N: '5' })
+  }
+  assert.match(WINDOWS_SEARCH_PS, /-replace "'", "''"/, 'single quotes are doubled for the SQL string')
+  assert.match(WINDOWS_SCAN_PS, /WildcardPattern\]::Escape\(\$env:IRIS_Q\)/)
+})
+
+test('asking for a provider this machine lacks says why, instead of quietly using another', async () => {
+  const r = await searchDisk('x', { provider: 'fsearch', ctx: { platform: 'darwin', which: has('mdfind', 'find'), exists: () => false } })
+  assert.deepStrictEqual(r.rows, [])
+  assert.match(r.note, /provider fsearch is not available here — not installed/)
+  const forced = await searchDisk('x', { provider: 'scan', ctx: { platform: 'darwin', which: has('fsearch', 'mdfind', 'find'), home: '/h' }, run: async () => '/h/x\n' })
+  assert.strictEqual(forced.backend, 'scan')
 })

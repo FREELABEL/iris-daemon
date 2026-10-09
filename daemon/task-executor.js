@@ -1389,6 +1389,18 @@ class TaskExecutor {
         const searchLimit = searchConfig.limit || 10
         const results = []
 
+        // `iris locate providers`: which file-search engine this node uses and what else it has.
+        if (searchConfig.op === 'providers') {
+          clearInterval(progressInterval)
+          outputStream.stop().catch(() => {})
+          await this.cloud.submitResult(taskId, {
+            status: 'completed',
+            output: JSON.stringify(require('./disk-search').listProviders()),
+            duration_ms: Date.now() - startTime,
+          })
+          return
+        }
+
         console.log(`[hive-search] Searching for "${searchQuery}" (type=${searchType})`)
 
         // Search Hive inbox
@@ -1454,7 +1466,7 @@ class TaskExecutor {
         let fileRows = []
         if (searchType === 'all' || searchType === 'files') {
           try {
-            const disk = await require('./disk-search').searchDisk((task.prompt || '').trim(), { limit: searchLimit })
+            const disk = await require('./disk-search').searchDisk((task.prompt || '').trim(), { limit: searchLimit, provider: searchConfig.provider || null })
             fileRows = disk.rows
             if (disk.note) fileRows.push({ source: 'files', match: '(no file results)', preview: disk.note, date: null })
             console.log(`[hive-search] files via ${disk.backend || 'none'}: ${disk.rows.length} hit(s)${disk.took_ms != null ? ` in ${disk.took_ms} ms` : ''}`)
