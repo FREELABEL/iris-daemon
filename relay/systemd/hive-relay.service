@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Environment=HIVE_RELAY_ZONES=hivemesh.net,irishive.net,t.heyiris.io
+Environment=HIVE_RELAY_HOST=relay.t.heyiris.io
 User=siralexmayo
 WorkingDirectory=/home/siralexmayo/.iris/relay/app
 ExecStart=/usr/bin/node relay/run.js

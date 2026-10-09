@@ -27,7 +27,9 @@ const { createRelay, tokenFor } = require('./server')
 const HOME = os.homedir()
 const zones = (process.env.HIVE_RELAY_ZONES || process.env.HIVE_RELAY_ZONE || 't.heyiris.io').split(',').map((z) => z.trim()).filter(Boolean)
 const zone = zones[0]
-const relayHost = process.env.HIVE_RELAY_HOST || `relay.${zone}`
+// The control host every client dials — fixed, NOT derived from the first zone: putting a new zone
+// first once pointed it at relay.hivemesh.net, which has no certificate, and the relay would not start.
+const relayHost = process.env.HIVE_RELAY_HOST || 'relay.t.heyiris.io'
 const port = Number(process.env.HIVE_RELAY_PORT || 443)
 const certFile = process.env.HIVE_RELAY_CERT || path.join(HOME, '.iris/relay/acme/certificates', `${relayHost}.crt`)
 const keyFile = process.env.HIVE_RELAY_KEY || path.join(HOME, '.iris/relay/acme/certificates', `${relayHost}.key`)
