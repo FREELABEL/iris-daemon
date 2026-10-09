@@ -56,3 +56,9 @@ test('a line-based backend is stopped as soon as it has enough paths, not at the
   assert.ok(out.split('\n').filter(Boolean).length >= 2)
   assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`)
 })
+
+test('a backend that exits non-zero with no output means "no matches", not a failure', async () => {
+  const r = await searchDisk('zzz', { backend: { name: 'scan', bin: '/bin/false', wholeDisk: false } })
+  assert.deepStrictEqual(r.rows, [])
+  assert.strictEqual(r.note, undefined)
+})

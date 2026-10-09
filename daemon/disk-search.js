@@ -121,7 +121,10 @@ function runBackend (bin, args, { limit = 10, lineBased = true, timeoutMs = TIME
       else if (lineBased && out.split('\n').filter(Boolean).length >= limit) finish(null)
     })
     child.on('error', (e) => finish(e))
-    child.on('close', (code) => finish(code === 0 || out ? null : new Error(`${path.basename(bin)} exited ${code}`)))
+    // A non-zero exit with nothing printed means "no matches" for these tools (`find` exits 1 on
+    // any unreadable folder, locate exits 1 on no match) — not a failure to report. A backend
+    // that could not START is the error case, and that arrives on 'error' above.
+    child.on('close', () => finish(null))
   })
 }
 
