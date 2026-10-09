@@ -89,7 +89,12 @@ function splice (a, b, tap) {
 }
 
 function createRelay (opts) {
-  const zone = String(opts.zone).toLowerCase()
+  // Several public zones may point at one relay (t.heyiris.io, hivemesh.net, irishive.net): a
+  // tunnel NAME is the identity, reachable under every zone. Longest suffix wins, so a zone that
+  // sits inside another can never be shadowed by it.
+  const zones = (Array.isArray(opts.zones) && opts.zones.length ? opts.zones : [opts.zone])
+    .map((z) => String(z).toLowerCase()).filter(Boolean).sort((a, b) => b.length - a.length)
+  const primary = String((Array.isArray(opts.zones) && opts.zones.length ? opts.zones[0] : opts.zone)).toLowerCase()
   const relayHost = String(opts.relayHost).toLowerCase()
   const helloTimeoutMs = opts.helloTimeoutMs ?? 5000
   // 30 s: under load the node, not the relay, is slow — measured 230/500 refused at 10 s on a
@@ -139,7 +144,7 @@ function createRelay (opts) {
       const tun = { control: t, pending: new Map(), idle: [], alive: Date.now(), session: crypto.randomBytes(24).toString('hex') }
       tunnels.set(name, tun)
       counters.registered++
-      send(t, { op: 'ok', host: `${name}.${zone}`, session: tun.session })
+      send(t, { op: 'ok', host: `${name}.${primary}`, hosts: zones.map((z) => `${name}.${z}`), session: tun.session })
       let lines = rest
       t.on('data', (d) => {
         lines = Buffer.concat([lines, d]); tun.alive = Date.now()
@@ -227,9 +232,11 @@ function createRelay (opts) {
       sock.pause()
       if (r.status !== 'ok') return refuse(sock, r.status)
       if (r.sni === relayHost) return onRelayHost(sock, buf)
-      if (r.sni.endsWith('.' + zone)) {
-        const name = r.sni.slice(0, -(zone.length + 1))
+      for (const z of zones) {
+        if (!r.sni.endsWith('.' + z)) continue
+        const name = r.sni.slice(0, -(z.length + 1))
         if (LABEL.test(name)) return onVisitor(sock, buf, name)
+        break
       }
       refuse(sock, `outside zone: ${r.sni}`)
     }

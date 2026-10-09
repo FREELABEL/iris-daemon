@@ -25,7 +25,8 @@ const crypto = require('crypto')
 const { createRelay, tokenFor } = require('./server')
 
 const HOME = os.homedir()
-const zone = process.env.HIVE_RELAY_ZONE || 't.heyiris.io'
+const zones = (process.env.HIVE_RELAY_ZONES || process.env.HIVE_RELAY_ZONE || 't.heyiris.io').split(',').map((z) => z.trim()).filter(Boolean)
+const zone = zones[0]
 const relayHost = process.env.HIVE_RELAY_HOST || `relay.${zone}`
 const port = Number(process.env.HIVE_RELAY_PORT || 443)
 const certFile = process.env.HIVE_RELAY_CERT || path.join(HOME, '.iris/relay/acme/certificates', `${relayHost}.crt`)
@@ -65,7 +66,7 @@ if (process.argv[2] === 'token') {
 const log = (k, why) => console.log(`${new Date().toISOString()} ${k} ${why}`)
 // One options object, kept: the relay reads opts.cert / opts.key for each NEW control connection,
 // so swapping them on SIGHUP picks up a renewed certificate without dropping live tunnels.
-const opts = { zone, relayHost, cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), secret: secret(), log, isDenied: (n) => denied.has(n) }
+const opts = { zone, zones, relayHost, cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), secret: secret(), log, isDenied: (n) => denied.has(n) }
 const relay = createRelay(opts)
 process.on('SIGHUP', () => {
   try {
@@ -74,7 +75,7 @@ process.on('SIGHUP', () => {
   } catch (e) { log('cert', `reload FAILED, keeping the old one: ${e.message}`) }
 })
 setInterval(() => { if (loadDeny()) log('deny', `list now ${denied.size} name(s); cut ${relay.enforceDenyList()} live`) }, 10000).unref()
-relay.server.listen(port, '0.0.0.0', () => console.log(`${new Date().toISOString()} hive relay on :${port} · zone ${zone} · control ${relayHost}`))
+relay.server.listen(port, '0.0.0.0', () => console.log(`${new Date().toISOString()} hive relay on :${port} · zones ${zones.join(', ')} · control ${relayHost}`))
 relay.server.on('error', (e) => { console.error(`relay listen failed: ${e.message}`); process.exit(1) })
 setInterval(() => console.log(`${new Date().toISOString()} stats ${JSON.stringify(relay.stats())}`), 300000).unref()
 process.on('SIGTERM', () => relay.close().then(() => process.exit(0)))

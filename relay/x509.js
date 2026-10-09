@@ -58,7 +58,7 @@ function utcTime (d) {
 
 const ECDSA_SHA256 = seq(oid('1.2.840.10045.4.3.2'))
 const nameCN = (cn) => seq(set(seq(oid('2.5.4.3'), utf8(cn))))
-const san = (dns) => seq(oid('2.5.29.17'), octet(seq(tlv(0x82, Buffer.from(dns, 'latin1')))))
+const san = (dns) => seq(oid('2.5.29.17'), octet(seq(...[].concat(dns).map((d) => tlv(0x82, Buffer.from(d, 'latin1'))))))
 const spki = (key) => crypto.createPublicKey(key).export({ type: 'spki', format: 'der' })
 const sign = (key, tbs) => crypto.sign('sha256', tbs, { key, dsaEncoding: 'der' })
 
@@ -71,10 +71,11 @@ function toPem (der, label) {
   return `-----BEGIN ${label}-----\n${b64}\n-----END ${label}-----\n`
 }
 
-/** PKCS#10 CSR for `name`, as DER (ACME wants it base64url-encoded). */
-function csr (key, name) {
-  const extReq = seq(oid('1.2.840.113549.1.9.14'), set(seq(san(name))))
-  const info = seq(int(0), nameCN(name), spki(key), tlv(0xa0, extReq))
+/** PKCS#10 CSR for one name or several (all in the SAN; the first is the CN), as DER. */
+function csr (key, names) {
+  const list = [].concat(names)
+  const extReq = seq(oid('1.2.840.113549.1.9.14'), set(seq(san(list))))
+  const info = seq(int(0), nameCN(list[0]), spki(key), tlv(0xa0, extReq))
   return seq(info, ECDSA_SHA256, bits(sign(key, info)))
 }
 

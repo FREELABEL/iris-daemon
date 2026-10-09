@@ -167,3 +167,51 @@ test('ACME flow: a 4xx is NOT retried — it is a real refusal and says so', asy
   await assert.rejects(obtainCertificate({ name: 'demo.t.heyiris.io', accountKey, certKey: x509.newKey(), directory: ca.dir, fetch: refusing, pollMs: 1, busyWaitMs: 1, setChallenge: () => {} }), /rejectedIdentifier: nope/)
   assert.strictEqual(calls, 1)
 })
+
+test('CSR with several names: every name is in the SAN, the first is the CN (openssl reads it)', () => {
+  const pem = x509.toPem(x509.csr(x509.newKey(), ['demo.hivemesh.net', 'demo.irishive.net', 'demo.t.heyiris.io']), 'CERTIFICATE REQUEST')
+  const out = openssl(['req', '-verify', '-noout', '-text'], pem)
+  assert.match(out, /verify OK/)
+  assert.match(out, /CN\s*=\s*demo\.hivemesh\.net/)
+  for (const h of ['demo.hivemesh.net', 'demo.irishive.net', 'demo.t.heyiris.io']) assert.match(out, new RegExp('DNS:' + h.replace(/\./g, '\\.')))
+})
+
+test('ACME flow with several names: one challenge PER host, each answered for its own host, all cleared', async () => {
+  const names = ['demo.hivemesh.net', 'demo.irishive.net']
+  const accountKey = x509.newKey()
+  const set = new Map()
+  const log = []
+  let n = 0
+  const st = { a1: 'pending', a2: 'pending' }
+  const res = (status, body, headers = {}) => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'replay-nonce': 'n' + (++n), ...headers } })
+  const B = 'https://ca.test'
+  let csr = null
+  const f = async (url, init = {}) => {
+    if (url === `${B}/dir`) return res(200, { newNonce: `${B}/nonce`, newAccount: `${B}/acct`, newOrder: `${B}/order` })
+    if (url === `${B}/nonce`) return res(200, '')
+    const payload = JSON.parse(init.body).payload
+    const body = payload ? JSON.parse(Buffer.from(payload, 'base64url')) : null
+    if (url === `${B}/acct`) return res(201, {}, { location: `${B}/acct/1` })
+    if (url === `${B}/order`) { assert.deepStrictEqual(body.identifiers.map((i) => i.value), names); return res(201, { status: 'pending', authorizations: [`${B}/a1`, `${B}/a2`], finalize: `${B}/fin` }, { location: `${B}/o` }) }
+    for (const [k, host] of [['a1', names[0]], ['a2', names[1]]]) {
+      if (url === `${B}/${k}`) return res(200, { status: st[k], identifier: { type: 'dns', value: host }, challenges: [{ type: 'tls-alpn-01', url: `${B}/c-${k}`, token: 'T' + k }] })
+      if (url === `${B}/c-${k}`) {
+        const c = set.get(host)
+        const want = crypto.createHash('sha256').update(`T${k}.${thumbprint(accountKey)}`).digest()
+        st[k] = c && new crypto.X509Certificate(c.cert).raw.includes(want) && new crypto.X509Certificate(c.cert).checkHost(host) ? 'valid' : 'invalid'
+        log.push(host)
+        return res(200, {})
+      }
+    }
+    if (url === `${B}/fin`) { csr = body.csr; return res(200, {}) }
+    if (url === `${B}/o`) return res(200, { status: csr ? 'valid' : 'ready', certificate: `${B}/cert` })
+    if (url === `${B}/cert`) return res(200, x509.alpnChallengeCert(x509.newKey(), names[0], 'x'))
+    return res(404, {})
+  }
+  const r = await obtainCertificate({ names, accountKey, certKey: x509.newKey(), directory: `${B}/dir`, fetch: f, pollMs: 1, setChallenge: (h, c) => { if (c) set.set(h, c); else set.delete(h) } })
+  assert.match(r.cert, /BEGIN CERTIFICATE/)
+  assert.deepStrictEqual(log, names, 'each host validated with its own challenge')
+  assert.strictEqual(set.size, 0, 'all challenges cleared')
+  const out = openssl(['req', '-noout', '-text'], x509.toPem(Buffer.from(csr, 'base64url'), 'CERTIFICATE REQUEST'))
+  for (const h of names) assert.match(out, new RegExp('DNS:' + h.replace(/\./g, '\\.')))
+})

@@ -83,7 +83,9 @@ async function obtainCertificate (o) {
   const acct = await post(dir.newAccount, { termsOfServiceAgreed: true, ...(o.email ? { contact: [`mailto:${o.email}`] } : {}) })
   kid = acct.headers.get('location')
 
-  const orderRes = await post(dir.newOrder, { identifiers: [{ type: 'dns', value: o.name }] })
+  const names = [].concat(o.names || o.name)
+  const label = names.join(', ')
+  const orderRes = await post(dir.newOrder, { identifiers: names.map((value) => ({ type: 'dns', value })) })
   const orderUrl = orderRes.headers.get('location')
   let order = await orderRes.json()
 
@@ -91,37 +93,38 @@ async function obtainCertificate (o) {
     for (const authzUrl of order.authorizations) {
       let authz = await (await post(authzUrl, '')).json()
       if (authz.status === 'valid') continue
+      const host = (authz.identifier && authz.identifier.value) || names[0]
       const ch = (authz.challenges || []).find((c) => c.type === 'tls-alpn-01')
-      if (!ch) throw new Error('the CA offered no tls-alpn-01 challenge for ' + o.name)
+      if (!ch) throw new Error('the CA offered no tls-alpn-01 challenge for ' + host)
       const keyAuth = `${ch.token}.${thumbprint(o.accountKey)}`
-      o.setChallenge(o.name, { cert: x509.alpnChallengeCert(o.certKey, o.name, keyAuth), key: o.certKey })
-      log('acme', `challenge ready for ${o.name}`)
+      o.setChallenge(host, { cert: x509.alpnChallengeCert(o.certKey, host, keyAuth), key: o.certKey })
+      log('acme', `challenge ready for ${host}`)
       await post(ch.url, {})
       while (authz.status === 'pending' || authz.status === 'processing') {
-        if (Date.now() > deadline) throw new Error('timed out waiting for the CA to validate ' + o.name)
+        if (Date.now() > deadline) throw new Error('timed out waiting for the CA to validate ' + host)
         await sleep(pollMs)
         authz = await (await post(authzUrl, '')).json()
       }
       if (authz.status !== 'valid') {
         const why = (authz.challenges || []).map((c) => c.error && c.error.detail).filter(Boolean).join('; ')
-        throw new Error(`the CA could not validate ${o.name}: ${why || authz.status}`)
+        throw new Error(`the CA could not validate ${host}: ${why || authz.status}`)
       }
     }
   } finally {
-    o.setChallenge(o.name, null)
+    for (const n of names) o.setChallenge(n, null)
   }
 
-  await post(order.finalize, { csr: b64u(x509.csr(o.certKey, o.name)) })
+  await post(order.finalize, { csr: b64u(x509.csr(o.certKey, names)) })
   order = await (await post(orderUrl, '')).json()
   while (order.status === 'processing' || order.status === 'ready') {
     if (Date.now() > deadline) throw new Error('timed out waiting for the certificate')
     await sleep(pollMs)
     order = await (await post(orderUrl, '')).json()
   }
-  if (order.status !== 'valid') throw new Error(`order for ${o.name} ended ${order.status}`)
+  if (order.status !== 'valid') throw new Error(`order for ${label} ended ${order.status}`)
   const cert = await (await post(order.certificate, '')).text()
   const notAfter = new Date(new crypto.X509Certificate(cert).validTo)
-  log('acme', `certificate for ${o.name} valid until ${notAfter.toISOString()}`)
+  log('acme', `certificate for ${label} valid until ${notAfter.toISOString()}`)
   return { cert, notAfter }
 }
 

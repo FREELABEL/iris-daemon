@@ -34,8 +34,10 @@ const say = (event, extra = {}) => process.stdout.write(JSON.stringify({ event, 
 const name = String(arg('name', '')).toLowerCase()
 const port = Number(arg('port', 0))
 const host = arg('host', '127.0.0.1')
-const zone = process.env.HIVE_RELAY_ZONE || 't.heyiris.io'
-const relayHost = process.env.HIVE_RELAY_HOST || `relay.${zone}`
+// Every zone the relay serves; the FIRST is the one shown. One certificate covers all of them.
+const zones = (process.env.HIVE_RELAY_ZONES || process.env.HIVE_RELAY_ZONE || 't.heyiris.io').split(',').map((z) => z.trim().toLowerCase()).filter(Boolean)
+const zone = zones[0]
+const relayHost = process.env.HIVE_RELAY_HOST || 'relay.t.heyiris.io'
 const relayAddr = process.env.HIVE_RELAY_ADDR || relayHost
 const staging = flag('staging')
 const RENEW_DAYS = 30
@@ -46,6 +48,7 @@ if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name) || !(port > 0 && port <
 }
 
 const fqdn = `${name}.${zone}`
+const hosts = zones.map((z) => `${name}.${z}`)
 const dir = path.join(os.homedir(), '.iris', 'tunnels', name + (staging ? '.staging' : ''))
 fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
 const file = (f) => path.join(dir, f)
@@ -61,7 +64,8 @@ function savedCert () {
   try {
     const pem = fs.readFileSync(file('cert.pem'), 'utf8')
     const c = new crypto.X509Certificate(pem)
-    if (!c.checkHost(fqdn)) return null
+    // A saved certificate that misses a zone (one was added) is re-issued, not served half-valid.
+    if (!hosts.every((h) => c.checkHost(h))) return null
     return { pem, notAfter: new Date(c.validTo) }
   } catch { return null }
 }
@@ -117,7 +121,7 @@ async function getToken () {
     renewing = true
     try {
       const r = await obtainCertificate({
-        name: fqdn, accountKey, certKey, directory: staging ? 'staging' : 'production',
+        names: hosts, accountKey, certKey, directory: staging ? 'staging' : 'production',
         setChallenge: (n, ch) => tunnel.setChallenge(n, ch)
       })
       fs.writeFileSync(file('cert.pem'), r.cert, { mode: 0o600 })

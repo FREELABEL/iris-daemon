@@ -449,3 +449,35 @@ test('TAKEDOWN: a denied name cannot register, and a live one is cut when the li
     await assert.rejects(connectTunnel({ relay: { host: '127.0.0.1', port: w.relayPort }, relayHost: RELAY_HOST, relayCa: RELAY_CERT.cert, name: 'demo', token: tokenFor(SECRET, 'demo'), cert: NODE_CERT.cert, key: NODE_CERT.key, target: { host: '127.0.0.1', port: w.appPort } }), /suspended/)
   } finally { await w.close() }
 })
+
+// ── Several public zones on one relay (t.heyiris.io + hivemesh.net + irishive.net) ──────────────
+
+test('MULTI-ZONE: the same tunnel answers under every zone; the longest zone wins; outsiders still refused', async () => {
+  const w = await world({ relay: { zones: [ZONE, 'alt.test', 'deep.alt.test'] } })
+  try {
+    const before = w.relay.stats().routed
+    const reach = (host) => new Promise((resolve) => {
+      const s = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: host, rejectUnauthorized: false }, () => { s.destroy(); resolve(true) })
+      s.on('error', () => resolve(false))
+      s.setTimeout(3000, () => { s.destroy(); resolve(false) })
+    })
+    assert.strictEqual((await visit(w.relayPort)).status, 200, 'primary zone')
+    assert.strictEqual(await reach('demo.alt.test'), true, 'second zone reaches the same node')
+    assert.strictEqual(await reach('demo.deep.alt.test'), true, 'a zone inside another zone: routed as name "demo", not "demo.deep"')
+    assert.strictEqual(await reach('demo.other.test'), false)
+    assert.ok(w.relay.stats().routed >= before + 3)
+  } finally { await w.close() }
+})
+
+test('MULTI-ZONE: registration tells the node every host it is reachable at; the first zone is the one shown', async () => {
+  const w = await world({ noTunnel: true, relay: { zones: ['first.test', ZONE] } })
+  try {
+    const ctl = tls.connect({ host: '127.0.0.1', port: w.relayPort, servername: RELAY_HOST, ca: RELAY_CERT.cert })
+    await new Promise((r) => ctl.on('secureConnect', r))
+    ctl.write(JSON.stringify({ op: 'hello', name: 'demo', token: tokenFor(SECRET, 'demo') }) + '\n')
+    const ok = JSON.parse(String(await new Promise((r) => ctl.once('data', r))).split('\n')[0])
+    assert.strictEqual(ok.host, 'demo.first.test')
+    assert.deepStrictEqual(ok.hosts.sort(), ['demo.first.test', 'demo.' + ZONE].sort())
+    ctl.destroy()
+  } finally { await w.close() }
+})
