@@ -51,7 +51,7 @@ async function obtainCertificate (o) {
   let kid = null
   const freshNonce = async () => (await fetchImpl(dir.newNonce, { method: 'HEAD' })).headers.get('replay-nonce')
 
-  async function post (url, payload, { retried = false } = {}) {
+  async function post (url, payload, { retried = false, busy = 0 } = {}) {
     if (!nonce) nonce = await freshNonce()
     const protectedHeader = { alg: 'ES256', nonce, url, ...(kid ? { kid } : { jwk: jwkOf(o.accountKey) }) }
     const p64 = b64u(JSON.stringify(protectedHeader))
@@ -65,7 +65,14 @@ async function obtainCertificate (o) {
     nonce = res.headers.get('replay-nonce')
     if (res.status >= 400) {
       const err = await res.json().catch(() => ({}))
-      if (err.type === 'urn:ietf:params:acme:error:badNonce' && !retried) return post(url, payload, { retried: true })
+      if (err.type === 'urn:ietf:params:acme:error:badNonce' && !retried) return post(url, payload, { retried: true, busy })
+      // "503 Service busy; retry later" — measured from LE staging on the first live run. Transient:
+      // wait (Retry-After if given, else backoff) and try again, a few times, inside the deadline.
+      if (res.status >= 500 && busy < (o.busyRetries ?? 4)) {
+        const ra = Number(res.headers.get('retry-after'))
+        const wait = Math.min(Number.isFinite(ra) && ra > 0 ? ra * 1000 : 2000 * 2 ** busy, 30000)
+        if (Date.now() + wait < deadline) { await sleep(o.busyWaitMs ?? wait); return post(url, payload, { retried, busy: busy + 1 }) }
+      }
       const e = new Error(`ACME ${res.status} ${err.type || ''}: ${err.detail || 'request failed'}`.trim())
       e.acme = err
       throw e

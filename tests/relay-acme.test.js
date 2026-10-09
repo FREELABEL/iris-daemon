@@ -140,3 +140,30 @@ test('ACME flow: a failed validation says why, and the challenge is still cleare
   }), /could not validate demo\.t\.heyiris\.io: Connection refused/)
   assert.strictEqual(last, null)
 })
+
+test('ACME flow: a 503 "Service busy" is retried, not fatal (measured on LE staging)', async () => {
+  const ca = fakeCA()
+  const accountKey = x509.newKey()
+  ca.opts.accountKey = accountKey
+  let busy = 2
+  const flaky = async (url, init) => {
+    if (url.endsWith('/order') && busy-- > 0) return new Response(JSON.stringify({ type: 'urn:ietf:params:acme:error:rateLimited', detail: 'Service busy; retry later.' }), { status: 503, headers: { 'replay-nonce': 'b' + busy } })
+    return ca.fetchImpl(url, init)
+  }
+  const r = await obtainCertificate({ name: 'demo.t.heyiris.io', accountKey, certKey: x509.newKey(), directory: ca.dir, fetch: flaky, pollMs: 1, busyWaitMs: 1, setChallenge: (n, c) => { ca.opts.current = c } })
+  assert.match(r.cert, /BEGIN CERTIFICATE/)
+  assert.strictEqual(busy, -1, 'both busy answers were retried through')
+})
+
+test('ACME flow: a 4xx is NOT retried — it is a real refusal and says so', async () => {
+  const ca = fakeCA()
+  const accountKey = x509.newKey()
+  ca.opts.accountKey = accountKey
+  let calls = 0
+  const refusing = async (url, init) => {
+    if (url.endsWith('/order')) { calls++; return new Response(JSON.stringify({ type: 'urn:ietf:params:acme:error:rejectedIdentifier', detail: 'nope' }), { status: 400, headers: { 'replay-nonce': 'r' } }) }
+    return ca.fetchImpl(url, init)
+  }
+  await assert.rejects(obtainCertificate({ name: 'demo.t.heyiris.io', accountKey, certKey: x509.newKey(), directory: ca.dir, fetch: refusing, pollMs: 1, busyWaitMs: 1, setChallenge: () => {} }), /rejectedIdentifier: nope/)
+  assert.strictEqual(calls, 1)
+})

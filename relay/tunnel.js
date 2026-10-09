@@ -110,6 +110,7 @@ async function getToken () {
   say('ready', { url: `https://${fqdn}`, certificate: have ? 'saved' : 'requesting' })
 
   let renewing = false
+  let failures = 0
   async function ensureCert () {
     const c = savedCert()
     if (renewing || (c && c.notAfter - Date.now() > RENEW_DAYS * 86400e3)) return
@@ -122,9 +123,13 @@ async function getToken () {
       fs.writeFileSync(file('cert.pem'), r.cert, { mode: 0o600 })
       tunnel.setCertificate(r.cert, certKey)
       say('cert', { notAfter: r.notAfter.toISOString(), issuer: staging ? 'staging' : 'letsencrypt' })
+      failures = 0
     } catch (e) {
-      // Keep serving the old certificate if there is one; try again later.
-      say('error', { message: `certificate: ${e.message}`, retry: true })
+      // Keep serving the old certificate if there is one; try again soon — 2, 4, 8 … max 60 min.
+      failures++
+      const inMin = Math.min(2 ** failures, 60)
+      say('error', { message: `certificate: ${e.message}`, retryInMinutes: inMin })
+      setTimeout(ensureCert, inMin * 60e3)
     } finally { renewing = false }
   }
   await ensureCert()
