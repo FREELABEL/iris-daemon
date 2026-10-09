@@ -538,6 +538,9 @@ class Daemon {
       // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
       // its model can run. From a background cache; omitted until the first probe lands.
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
+      // Live free space on ~/.iris, plus the last failed state write (#188700). Omitted when the
+      // platform cannot measure it; the cloud keeps the startup number then.
+      ...((() => { try { const d = require('../lib/disk-report').diskReport(); return d ? { disk: d } : {} } catch { return {} } })()),
       hardware_capabilities: (() => {
         try {
           return { gpu: require('./hardware-profile').gpuCapability() }
