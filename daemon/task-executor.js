@@ -5595,6 +5595,24 @@ exit 1
   }
 
   /**
+   * Stop ONE running task (#188699) — the platform timed it out or cancelled it, and the node is
+   * still running it. Same kill as killAll, for one entry. Returns true when something was
+   * running under that id. The task's own exit path reports the failure; the platform keeps
+   * the status it already set.
+   */
+  killTask (taskId, reason = 'stopped') {
+    const entry = this.runningTasks.get(taskId)
+    if (!entry) return false
+    console.log(`[executor] Stopping task ${taskId}: ${reason}`)
+    if (entry?.tmux && entry.sessionName) {
+      try { this.tmux.cleanup(entry.sessionName) } catch {}
+    } else if (entry?.kill) {
+      require('./child-lifecycle').killWithEscalation(entry, 3000)
+    }
+    return true
+  }
+
+  /**
    * Kill all running tasks (used during shutdown).
    */
   killAll () {

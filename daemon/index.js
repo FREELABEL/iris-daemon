@@ -598,7 +598,15 @@ class Daemon {
     // not reveal it (it counts only what the heartbeat itself dispatched). So after each successful
     // heartbeat, when there is room, ask for our own assigned/dispatched tasks. Dedup drops doubles.
     this._lastPendingPollAt = 0
-    this.heartbeat.onHeartbeatOk = () => {
+    this.heartbeat.onHeartbeatOk = (result) => {
+      // #188699: tasks the platform already ended (timed out, cancelled) that this node is still
+      // running. Before this nothing ever told the node, so they ran to the end anyway.
+      const stop = Array.isArray(result?.cancel_task_ids) ? result.cancel_task_ids : []
+      for (const id of stop) {
+        if (this.executor && this.executor.killTask(String(id), 'ended by the platform (timed out or cancelled)')) {
+          console.log(`[heartbeat] stopped task ${String(id).slice(0, 8)} — the platform already ended it`)
+        }
+      }
       const active = this.executor ? this.executor.runningTasks.size : 0
       if (!shouldPollPending({ now: Date.now(), lastPollAt: this._lastPendingPollAt, active, max: this._maxConcurrent(), paused: this.paused })) return
       this._lastPendingPollAt = Date.now()
