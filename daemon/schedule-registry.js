@@ -8,6 +8,7 @@
 const cron = require('node-cron')
 const { spawn } = require('child_process')
 const fs = require('fs')
+const { writeFileAtomic } = require('../lib/atomic-write')
 const path = require('path')
 
 /**
@@ -28,12 +29,9 @@ const path = require('path')
  * keep it forever, so upgrading would silently not fix anyone.
  */
 function writePrivate (filePath, contents) {
-  fs.writeFileSync(filePath, contents, { encoding: 'utf-8', mode: 0o600 })
-  try {
-    fs.chmodSync(filePath, 0o600)
-  } catch {
-    // Best effort — a platform without chmod must not lose the write itself.
-  }
+  // Atomic: a full disk must not truncate every schedule (EVAL #188663). writeFileAtomic sets
+  // 0600 on the temp file before the rename, so an old 0644 file is still fixed on upgrade.
+  writeFileAtomic(filePath, contents, { mode: 0o600 })
 }
 
 class ScheduleRegistry {

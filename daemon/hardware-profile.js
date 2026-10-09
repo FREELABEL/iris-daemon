@@ -78,11 +78,18 @@ async function detectProfile (options = {}) {
   }
 
   // Cache the result
-  const cacheDir = path.dirname(CACHE_PATH)
-  if (!fs.existsSync(cacheDir)) {
-    fs.mkdirSync(cacheDir, { recursive: true })
+  // A cache. Its write failing (full disk) used to throw out of start(), which daemon.js reads
+  // as "Cloud auth failed" and retries forever — the node stayed offline under the wrong
+  // reason (EVAL #188663). The profile is still returned; only the cache is skipped.
+  try {
+    const cacheDir = path.dirname(CACHE_PATH)
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true })
+    }
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(profile, null, 2))
+  } catch (err) {
+    console.warn(`[hardware] could not cache the profile (${err.code || err.message}) — continuing`)
   }
-  fs.writeFileSync(CACHE_PATH, JSON.stringify(profile, null, 2))
 
   return profile
 }

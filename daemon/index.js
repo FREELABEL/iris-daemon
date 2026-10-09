@@ -35,6 +35,7 @@ const { sessionLabel } = require('./session-label')
 const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { isPhiTask } = require('../lib/phi-task')
+const { writeFileAtomic } = require('../lib/atomic-write')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter } = require('./local-llm')
@@ -665,7 +666,7 @@ class Daemon {
       config.node_id = nodeId
       const dir = path.dirname(CONFIG_FILE)
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
+      writeFileAtomic(CONFIG_FILE, JSON.stringify(config, null, 2))
       console.log(previous
         ? `[daemon] node_id changed in config: ${previous} -> ${nodeId}`
         : `[daemon] node_id persisted to config: ${nodeId}`)
@@ -683,7 +684,7 @@ class Daemon {
       config.paused = this.paused
       const dir = path.dirname(CONFIG_FILE)
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
+      writeFileAtomic(CONFIG_FILE, JSON.stringify(config, null, 2))
     } catch (err) {
       console.error('[daemon] Failed to save pause state:', err.message)
     }

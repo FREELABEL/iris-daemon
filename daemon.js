@@ -46,6 +46,7 @@ require('./daemon/slow-fs-probe').install()
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
+const { writeFileAtomic } = require('./lib/atomic-write')
 const net = require('net')
 const socketGuard = require('./daemon/socket-guard')
 const socketLock = require('./daemon/socket-lock')
@@ -185,7 +186,7 @@ function updateConfigPaused (paused) {
     }
   } catch { /* fresh */ }
   config.paused = paused
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
+  writeFileAtomic(CONFIG_FILE, JSON.stringify(config, null, 2))
 }
 
 // ─── Status command ──────────────────────────────────────────────
@@ -440,7 +441,7 @@ function startDaemon () {
       // Auto-fix config.json so this only happens once
       if (fileConfig.api_url && STALE_URLS.some(s => fileConfig.api_url.includes(s))) {
         fileConfig.api_url = PRODUCTION_URL
-        try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(fileConfig, null, 2)) } catch {}
+        try { writeFileAtomic(CONFIG_FILE, JSON.stringify(fileConfig, null, 2)) } catch {}
       }
       return PRODUCTION_URL
     }
