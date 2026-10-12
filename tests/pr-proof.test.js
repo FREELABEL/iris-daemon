@@ -189,11 +189,16 @@ test('steps: accepted shapes, and a bad step names its index', () => {
 })
 
 // ── wiring: both paths that run a code_generation task carry the rule ──────
-test('task-executor: the built-in and external-runtime coding paths both use promptForCodingTask', () => {
+test('task-executor: the built-in and external-runtime coding paths both carry the proof rule', () => {
+  // Both paths go through fail-first's codingPrompt (#189149), which wraps promptForCodingTask —
+  // so the proof rule still reaches both, and a third copy of the wiring cannot drift.
   const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'daemon', 'task-executor.js'), 'utf-8')
-  assert.match(src, /agentCommand\(require\('\.\/pr-proof'\)\.promptForCodingTask\(task, \{ phi: isPhiTask\(task\) \}\)\)/)
-  assert.match(src, /task\.type === 'code_generation'\s*\n\s*\? require\('\.\/pr-proof'\)\.promptForCodingTask\(task, \{ phi: isPhiTask\(task\) \}\)/)
+  assert.match(src, /agentCommand\(require\('\.\/fail-first'\)\.codingPrompt\(task, \{ phi: isPhiTask\(task\) \}\)\)/)
+  assert.match(src, /task\.type === 'code_generation'\s*\n\s*\? require\('\.\/fail-first'\)\.codingPrompt\(task, \{ phi: isPhiTask\(task\) \}\)/)
   assert.ok(!/args = \['--print', task\.prompt\]/.test(src), 'claude_code runtime must use agentPrompt')
+  const out = require('../daemon/fail-first').codingPrompt({ prompt: 'fix it', config: {} })
+  assert.match(out, /## Hive rule: prove it on the PR/)
+  assert.strictEqual(require('../daemon/fail-first').codingPrompt({ prompt: 'p', config: {} }, { phi: true }).includes('record a video'), false)
 })
 
 test('probeSeconds: the file\'s duration, or null when ffprobe is absent or says nothing', () => {
