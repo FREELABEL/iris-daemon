@@ -80,3 +80,32 @@ test('every coding task carries the rule, PHI included; it is added once and can
   assert.strictEqual(F.withFailFirstRule(p), p)
   assert.doesNotMatch(F.codingPrompt({ prompt: 'x', config: { fail_first: false } }), /prove the test bites/)
 })
+
+test('end to end: run from a package folder, the command runs in that folder on base and tip', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-mono-'))
+  const g = (...a) => assert.strictEqual(spawnSync('git', a, { cwd: dir }).status, 0, a.join(' '))
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't')
+  const pkg = path.join(dir, 'packages', 'calc')
+  fs.mkdirSync(pkg, { recursive: true })
+  fs.writeFileSync(path.join(pkg, 'add.js'), 'module.exports = (a, b) => a - b\n')
+  g('add', '.'); g('commit', '-qm', 'base')
+  const base = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' }).stdout.trim()
+  fs.writeFileSync(path.join(pkg, 'add.js'), 'module.exports = (a, b) => a + b\n')
+  fs.mkdirSync(path.join(pkg, 'test'))
+  fs.writeFileSync(path.join(pkg, 'test', 'add.test.js'), "const t=require('node:test');const a=require('node:assert');t('adds',()=>a.strictEqual(require('../add')(2,2),4))\n")
+  g('add', '.'); g('commit', '-qm', 'fix')
+  const r = spawnSync(process.execPath, [SCRIPT, '--base', base, '--json', '--', process.execPath, '--test', 'test/'], { cwd: pkg, encoding: 'utf-8' })
+  assert.strictEqual(JSON.parse(r.stdout.trim().split('\n').pop()).verdict, 'BITES', r.stdout + r.stderr)
+})
+
+test('the verdict row: one check on one commit, the ticket read from a wt branch, author from the env', () => {
+  const v = F.verdict({ testFiles: ['a.test.js'], baseExit: 1, tipExit: 0 })
+  const row = F.verdictRecord({ v, repo: 'FREELABEL/iris-daemon', base: 'b'.repeat(40), tip: 'abcdef1234567890', branch: 'wt/189149-fail-first', env: { IRIS_AUTHOR_VENDOR: 'codex' }, host: 'node-1', now: new Date('2026-10-12T00:00:00Z') })
+  assert.strictEqual(row.verdict_id, 'FREELABEL/iris-daemon@abcdef123456:fail-first')
+  assert.strictEqual(row.ticket, '#189149')
+  assert.strictEqual(row.passed, true)
+  assert.strictEqual(row.verdict, 'BITES')
+  assert.strictEqual(row.author_vendor, 'codex')
+  assert.strictEqual(row.measured_at, '2026-10-12T00:00:00.000Z')
+  assert.strictEqual('pr' in row, false) // an absent PR is left out, not sent as an empty url
+})

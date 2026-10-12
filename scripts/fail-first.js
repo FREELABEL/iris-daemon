@@ -8,6 +8,7 @@
  *   node scripts/fail-first.js --base origin/main -- bun test test/bug-dedupe.test.ts
  *   node scripts/fail-first.js --tests tests/Unit/FooTest.php -- vendor/bin/phpunit tests/Unit/FooTest.php
  *   node scripts/fail-first.js --json -- npm test
+ *   node scripts/fail-first.js --record --ticket 189149 -- npm test     (adds a row to hive-gate-verdicts)
  *
  * Run from the repo, on the fix branch. The tests the change added or edited (base..HEAD) are
  * copied onto a throwaway checkout of the base commit and the command runs there — it must FAIL.
@@ -33,9 +34,11 @@ function parseArgs (argv) {
   const out = { cmd, tests: [] }
   for (let i = 0; i < own.length; i++) {
     const a = own[i]
-    if (a === '--json' || a === '--help' || a === '-h') { out[a.replace(/^-+/, '')] = true; continue }
+    if (a === '--json' || a === '--help' || a === '-h' || a === '--record') { out[a.replace(/^-+/, '')] = true; continue }
     if (a === '--base') { out.base = own[++i]; continue }
     if (a === '--tests') { out.tests.push(...String(own[++i] || '').split(',').filter(Boolean)); continue }
+    if (a === '--ticket') { out.ticket = String(own[++i] || '').replace(/^#/, ''); continue }
+    if (a === '--pr') { out.pr = own[++i]; continue }
     if (a === '--timeout') { out.timeout = Number(own[++i]); continue }
     throw new Error(`unknown option ${a}`)
   }
@@ -70,9 +73,12 @@ function main () {
     process.exit(a.help ? 0 : 2)
   }
   const cwd = process.cwd()
-  let root, base, tip, testFiles
+  let root, base, tip, testFiles, prefix
   try {
     root = git(['rev-parse', '--show-toplevel'], cwd)
+    // Run where the caller ran it: a command like `bun test test/x.test.ts` is relative to the
+    // package folder, not the repo root. Found by running this on a monorepo.
+    prefix = git(['rev-parse', '--show-prefix'], cwd)
     tip = git(['rev-parse', 'HEAD'], root)
     base = a.base ? git(['rev-parse', a.base], root) : defaultBase(root)
     const changed = git(['diff', '--name-only', '--diff-filter=AMR', `${base}..${tip}`], root).split('\n')
@@ -95,18 +101,21 @@ function main () {
         fs.copyFileSync(src, path.join(wt, f))
       }
       // Same dependencies, not none: a base run that fails on a missing package is not evidence.
-      for (const d of ['node_modules', 'vendor']) {
-        const src = path.join(root, d)
-        if (fs.existsSync(src) && !fs.existsSync(path.join(wt, d))) fs.symlinkSync(src, path.join(wt, d), process.platform === 'win32' ? 'junction' : 'dir')
+      for (const rel of new Set(['', prefix])) {
+        for (const d of ['node_modules', 'vendor']) {
+          const src = path.join(root, rel, d)
+          const dst = path.join(wt, rel, d)
+          if (fs.existsSync(src) && !fs.existsSync(dst)) fs.symlinkSync(src, dst, process.platform === 'win32' ? 'junction' : 'dir')
+        }
       }
-      baseRun = run(a.cmd, wt, timeoutMs)
+      baseRun = run(a.cmd, path.join(wt, prefix), timeoutMs)
     } catch (e) {
       baseRun = { exit: null, tail: e.message }
     } finally {
       try { git(['worktree', 'remove', '--force', wt], root) } catch {}
       fs.rmSync(tmp, { recursive: true, force: true })
     }
-    tipRun = run(a.cmd, root, timeoutMs)
+    tipRun = run(a.cmd, cwd, timeoutMs)
   }
 
   const v = F.verdict({ testFiles, baseExit: baseRun.exit, tipExit: tipRun.exit })
@@ -119,7 +128,27 @@ function main () {
       if (t) console.log(t.split('\n').map((l) => '  | ' + l).join('\n'))
     }
   }
+  if (a.record) record(a, v, { root, base, tip })
   process.exit(v.ok ? 0 : 1)
+}
+
+/**
+ * Add this verdict to the hive-gate-verdicts dataset (#189146). A failure to record is reported
+ * and never changes the verdict or the exit code — the check happened either way.
+ */
+function record (a, v, { root, base, tip }) {
+  let repo = ''
+  let branch = ''
+  try {
+    const u = git(['remote', 'get-url', 'origin'], root)
+    const m = u.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)
+    repo = m ? m[1] : u
+  } catch {}
+  try { branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], root) } catch {}
+  const row = F.verdictRecord({ v, repo, base, tip, branch, ticket: a.ticket, pr: a.pr, env: process.env, host: os.hostname() })
+  const r = spawnSync('iris', ['datasets', 'records', 'upsert', '-s', 'hive-gate-verdicts', '--bloq', '381', '--external-id', row.verdict_id, '--data', JSON.stringify(row)], { encoding: 'utf-8', timeout: 60000 })
+  if (r.status === 0) console.error(`  recorded ${row.verdict_id} in hive-gate-verdicts`)
+  else console.error(`  could not record the verdict (${(r.error && r.error.message) || (r.stderr || r.stdout || '').trim().split('\n').pop()}) — the verdict above stands`)
 }
 
 if (require.main === module) main()

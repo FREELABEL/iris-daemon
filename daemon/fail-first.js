@@ -106,4 +106,34 @@ function codingPrompt (task, { phi = false } = {}) {
   return withFailFirstRule(withProof, { enabled: !(task && task.config && task.config.fail_first === false) })
 }
 
-module.exports = { TEST_PATTERNS, testFilesIn, verdict, summary, FAIL_FIRST_SCRIPT, failFirstRule, withFailFirstRule, codingPrompt }
+/**
+ * The row this run adds to the `hive-gate-verdicts` dataset (bloq 381) — one check on one commit,
+ * with who wrote the change, so pass rates can later be read per vendor, model and playbook
+ * (`iris datasets aggregate`). Pure; the caller supplies what it measured.
+ */
+function verdictRecord ({ v, repo, base, tip, branch, ticket, pr, env = {}, host, now = new Date() }) {
+  const t = ticket || (String(branch || '').match(/(?:^|\/)(\d{5,})-/) || [])[1] || ''
+  const row = {
+    verdict_id: `${repo || 'unknown'}@${String(tip).slice(0, 12)}:fail-first`,
+    repo: repo || '',
+    sha: String(tip || ''),
+    base_sha: String(base || ''),
+    ticket: t ? `#${t}` : '',
+    check: 'fail-first',
+    verdict: v.verdict,
+    passed: Boolean(v.ok),
+    caught_regression: false,
+    author_vendor: env.IRIS_AUTHOR_VENDOR || '',
+    author_model: env.IRIS_AUTHOR_MODEL || '',
+    author_session: env.IRIS_AUTHOR_SESSION || '',
+    author_node: host || '',
+    gate_session: env.IRIS_GATE_SESSION || '',
+    playbook: env.IRIS_PLAYBOOK || '',
+    measured_at: now.toISOString(),
+    note: v.why,
+  }
+  if (pr) row.pr = pr
+  return row
+}
+
+module.exports = { verdictRecord, TEST_PATTERNS, testFilesIn, verdict, summary, FAIL_FIRST_SCRIPT, failFirstRule, withFailFirstRule, codingPrompt }
