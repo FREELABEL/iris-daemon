@@ -15,12 +15,19 @@
  *   const brand = await iris.tools.invoke('websiteBrandExtractor', { url: 'https://stripe.com' })
  *   await iris.leads.update(123, { contact_info: { brand_theme: brand } })
  *
+ *   // Heartbeats + Pulse (#189245) — the same rules as the Desktop Heartbeats panel
+ *   const { matches } = await iris.heartbeats.query({ states: ['late', 'silent', 'failing'], since: '7d' })
+ *   const linear = iris.sources.custom({ id: 'linear', read: async (q, { iris }) => ({ hits: 3, items: [] }) })
+ *   const { lines } = await iris.pulse.run({ sources: [linear, iris.sources.heartbeats({ states: ['failing'] })] })
+ *
  * Every method returns parsed JSON. Errors throw with status code + message.
  */
 
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+// @heyiris/pulse-core, vendored and golden-checked (see vendor/README.md)
+const core = require('./vendor/pulse-core.cjs')
 
 // ============================================================================
 // SDK Client
@@ -43,14 +50,33 @@ class IRIS {
     this.irisApiUrl = (opts.irisApiUrl || env.IRIS_API_URL || process.env.IRIS_API_URL || 'https://freelabel.net').replace(/\/$/, '')
     this.userId = opts.userId || parseInt(env.IRIS_USER_ID || process.env.IRIS_USER_ID || '0', 10)
     this.timeout = opts.timeout || 30000
+    this._readOnly = false
+    this._bindResources()
+  }
 
-    // Bind resource namespaces
+  _bindResources () {
     this.leads = new LeadsResource(this)
     this.tools = new ToolsResource(this)
     this.bloqs = new BloqsResource(this)
     this.pages = new PagesResource(this)
     this.schedule = new ScheduleResource(this)
     this.agents = new AgentsResource(this)
+    this.heartbeats = new HeartbeatsResource(this)
+    this.sources = new SourcesResource(this)
+    this.pulse = new PulseResource(this)
+  }
+
+  /**
+   * A client that only reads: any write is refused here, before it leaves the machine, and every
+   * request carries `X-Iris-Read-Only: 1` so the server can refuse it too. This is what a pulse
+   * run hands its sources — reading must never change what it measures. The original client is
+   * untouched and can still write.
+   */
+  readOnly () {
+    const ro = Object.create(this)
+    ro._readOnly = true
+    ro._bindResources()
+    return ro
   }
 
   /** Read ~/.iris/sdk/.env */
@@ -80,11 +106,18 @@ class IRIS {
    */
   async fetch (urlPath, options = {}, base) {
     const url = `${base || this.apiUrl}${urlPath}`
+    const method = String(options.method || 'GET').toUpperCase()
+    if (this._readOnly && method !== 'GET' && method !== 'HEAD') {
+      const err = new Error(`read-only: ${method} ${urlPath} refused — this client only reads (inside a pulse run)`)
+      err.readOnly = true
+      throw err
+    }
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       ...(options.headers || {})
     }
+    if (this._readOnly) headers['X-Iris-Read-Only'] = '1'
     if (this.apiKey) {
       headers.Authorization = `Bearer ${this.apiKey}`
     }
@@ -399,5 +432,158 @@ class AgentsResource {
 // ============================================================================
 // Export
 // ============================================================================
+
+// ============================================================================
+// Resource: Heartbeats (#189245)
+// ============================================================================
+
+/**
+ * Your agents' heartbeats, with the Desktop panel's own rules (@heyiris/pulse-core): a state
+ * here is the state the panel draws. A list that cannot be read THROWS (err.measured = false) —
+ * it is never returned as an empty fleet.
+ */
+class HeartbeatsResource {
+  constructor (client) { this.c = client }
+
+  /** Every live heartbeat as a HeartbeatRow, each with its runs. Unread runs are marked, not empty. */
+  async rows () {
+    let list
+    try {
+      list = await this.c.get(this.c._userPath('bloqs/scheduled-jobs'), { agent_jobs_only: '1' })
+    } catch (err) {
+      err.measured = false
+      err.message = `heartbeats not measured — ${err.message}`
+      throw err
+    }
+    const jobs = core.unwrap(list).filter((j) => core.isHeartbeatJob(j) && core.LIVE_STATUSES.has(String(j.status)))
+    return Promise.all(jobs.map(async (j) => {
+      try {
+        const runs = await this.c.get(this.c._userPath(`bloqs/scheduled-jobs/${j.id}/executions`), { limit: String(core.RUNS_PER_ROW) })
+        return core.readHeartbeat(j, core.unwrap(runs))
+      } catch {
+        return core.readHeartbeat(j, null)
+      }
+    }))
+  }
+
+  /**
+   * @param {Object} [q]
+   * @param {string[]} [q.states] - late, silent, failing, running, ok, paused
+   * @param {string|number} [q.since] - only states that began since: '30m', '24h', '7d', '2w', ISO or ms
+   * @param {(number|string)[]} [q.agents] - agent ids or pieces of names
+   * @param {number} [q.now] - the clock (ms), for a reproducible answer
+   * @returns {Promise<{measured: true, now: string, counts: Object, matches: Object[]}>}
+   */
+  async query (q = {}) {
+    const now = q.now ?? Date.now()
+    // refuse a question that cannot be answered before spending a request on it
+    core.queryHeartbeats([], { ...q, now })
+    const res = core.queryHeartbeats(await this.rows(), { ...q, now })
+    return {
+      measured: true,
+      now: res.now,
+      counts: res.counts,
+      matches: res.matches.map((m) => ({
+        jobId: m.row.jobId,
+        agentId: m.row.agentId,
+        agentName: m.row.agentName,
+        state: m.state,
+        since: m.since,
+        line: m.line,
+        problems: m.problems,
+        runsMeasured: m.row.runsMeasured
+      }))
+    }
+  }
+}
+
+// ============================================================================
+// Resource: Sources + Pulse (#189245)
+// ============================================================================
+
+const CUSTOM = 'custom · read-only not enforced'
+
+/** What a custom read returned → a SourceResult. Anything unreadable throws (→ the stop is shut). */
+function toResult (id, v, provenance) {
+  if (typeof v === 'number' && Number.isFinite(v)) return { hits: v, items: [], measured: true, provenance }
+  if (Array.isArray(v)) return { hits: v.length, items: v, measured: true, provenance }
+  if (v && typeof v === 'object' && (Number.isFinite(v.hits) || Array.isArray(v.items))) {
+    return {
+      hits: Number.isFinite(v.hits) ? v.hits : v.items.length,
+      items: Array.isArray(v.items) ? v.items : [],
+      measured: v.measured !== false,
+      reason: v.reason,
+      floor: !!v.floor,
+      provenance: [...(Array.isArray(v.provenance) ? v.provenance : []), ...provenance]
+    }
+  }
+  throw new Error(`source "${id}" returned nothing readable — return a number, an array, or { hits, items }`)
+}
+
+class SourcesResource {
+  constructor (client) { this.c = client }
+
+  /**
+   * Your own source. `read(query, { iris })` gets a READ-ONLY client; anything else it reaches
+   * cannot be policed, so its numbers are labelled 'custom · read-only not enforced'.
+   */
+  custom (def = {}) {
+    if (!def.id || typeof def.id !== 'string') throw new Error('sources.custom: needs an id')
+    if (typeof def.read !== 'function') throw new Error(`sources.custom "${def.id}": needs a read(query, ctx) function`)
+    const c = this.c
+    const ctx = () => ({ iris: c.readOnly() })
+    return {
+      id: def.id,
+      label: def.label || def.id,
+      custom: true,
+      read: async (query) => toResult(def.id, await def.read(query, ctx()), [CUSTOM]),
+      isAvailable: def.isAvailable ? (query) => def.isAvailable(query, ctx()) : undefined
+    }
+  }
+
+  /** Your agents' heartbeats as a source: hits = heartbeats matching `q` (see heartbeats.query). */
+  heartbeats (q = {}) {
+    const c = this.c
+    return {
+      id: 'heartbeats',
+      label: 'Heartbeats',
+      read: async () => {
+        const r = await c.readOnly().heartbeats.query(q)
+        return { hits: r.matches.length, items: r.matches, measured: true, counts: r.counts, provenance: [`fl-api ${c.apiUrl}${c._userPath('bloqs/scheduled-jobs')} (read-only)`] }
+      }
+    }
+  }
+}
+
+class PulseResource {
+  constructor (client) { this.c = client }
+
+  /**
+   * Walk sources (or full stops) and report each one. Read-only by construction; one source
+   * failing never stops the route — it is SHUT with its reason, and never counted as 0.
+   *
+   * @param {Object} opts
+   * @param {Object[]} [opts.sources] - from iris.sources.*
+   * @param {Object[]} [opts.stops] - { id, source, extract(result, q), unavailable(reason, q) }
+   * @param {*} [opts.query] - handed to every source's read
+   * @param {'sequential'|'parallel'} [opts.mode]
+   * @returns {Promise<{readOnly: true, outcomes: Object[], lines: string[]}>}
+   */
+  async run (opts = {}) {
+    const stops = [
+      ...(opts.stops || []),
+      ...(opts.sources || []).map((source) => ({
+        id: source.id,
+        source,
+        extract: (r) => ({ hits: r.hits, items: r.items, floor: !!r.floor }),
+        unavailable: () => null
+      }))
+    ]
+    if (!stops.length) throw new Error('pulse.run: give it sources or stops')
+    const outcomes = await core.runScript({ route: 'custom', stops, readOnly: true, mode: opts.mode }, opts.query)
+    const lines = outcomes.map((o) => `${o.id}: ${core.formatCount(o, o.output && Number.isFinite(o.output.hits) ? o.output.hits : 0)}`)
+    return { readOnly: true, outcomes, lines }
+  }
+}
 
 module.exports = IRIS
