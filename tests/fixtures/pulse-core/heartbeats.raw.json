@@ -1,0 +1,1233 @@
+{
+ "capturedAt": "2026-10-12T21:12:14.341Z",
+ "rows": [
+  {
+   "job": {
+    "id": 764,
+    "agent_id": 604,
+    "bloq_id": 300,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "every_8_hours",
+    "next_run_at": "2026-10-09T03:00:00.000000Z",
+    "last_run_at": "2026-10-08T19:00:10.000000Z",
+    "run_count": 212,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Market Watch Agent",
+     "report_emails": [
+      "person1@example.com",
+      "person2@example.com"
+     ],
+     "required_tools": [
+      "agent_memory",
+      "searchKnowledgeBase",
+      "manageLeads",
+      "simulate_market_scan",
+      "alpaca_account",
+      "alpaca_place_order",
+      "alpaca_positions",
+      "alpaca_close_position",
+      "alpaca_orders"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 604,
+     "name": "Market Watch Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 3,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": {
+       "enabled": true,
+       "timezone": "America/New_York",
+       "working_days": [
+        "tuesday",
+        "wednesday",
+        "thursday"
+       ],
+       "active_hours": {
+        "end": "16:00",
+        "start": "07:00"
+       }
+      },
+      "heartbeat_frequency": "every_5_minutes"
+     }
+    },
+    "bloq": {
+     "id": 300,
+     "name": "Board 1"
+    },
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 10929,
+     "status": "completed",
+     "started_at": "2026-10-08T18:59:25+00:00",
+     "completed_at": "2026-10-08T19:00:25+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 50327,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent",
+     "response": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent_memory**: memory stored\n\n---\n*4 iterations | 50327 tokens*",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 894,
+    "agent_id": 701,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "every_6_hours",
+    "next_run_at": "2026-10-12T21:25:00.000000Z",
+    "last_run_at": "2026-10-12T15:25:33.000000Z",
+    "run_count": 235,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Chief of Staff",
+     "report_emails": [],
+     "required_tools": [
+      "CallIntegrationTool",
+      "upsert_dataset_records",
+      "analyze_dataset",
+      "manageBloqItems"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 701,
+     "name": "Chief of Staff",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 16839,
+     "status": "completed",
+     "started_at": "2026-10-12T15:24:44+00:00",
+     "completed_at": "2026-10-12T15:25:44+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 0,
+     "model_used": "gpt-5.6-terra",
+     "response_preview": "Error: AI API error: 402",
+     "response": "Error: AI API error: 402",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    },
+    {
+     "id": 16269,
+     "status": "completed",
+     "started_at": "2026-08-21T03:22:58+00:00",
+     "completed_at": "2026-08-21T03:23:58+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 53430,
+     "model_used": "gpt-5.6-terra",
+     "response_preview": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent",
+     "response": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent_memory**: memory stored\n\n---\n*4 iterations | 50327 tokens*",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 848,
+    "agent_id": 621,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "every_6_hours",
+    "next_run_at": "2026-10-12T21:25:00.000000Z",
+    "last_run_at": "2026-10-12T15:25:28.000000Z",
+    "run_count": 505,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Discovery Agent",
+     "report_emails": [],
+     "required_tools": [
+      "httpRequest",
+      "agent_memory",
+      "manageBloqItems"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 621,
+     "name": "Discovery Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 10996,
+     "status": "completed",
+     "started_at": "2026-10-12T15:24:35+00:00",
+     "completed_at": "2026-10-12T15:25:35+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 0,
+     "model_used": "grok-4-1-fast-reasoning",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 865,
+    "agent_id": 473,
+    "bloq_id": null,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "every_2_hours",
+    "next_run_at": "2026-10-12T21:39:00.000000Z",
+    "last_run_at": "2026-10-12T19:30:01.000000Z",
+    "run_count": 315,
+    "data": {
+     "type": "heartbeat",
+     "mode": "co-pilot",
+     "agent_name": "Music Curator",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 473,
+     "name": "Music Curator",
+     "active": false,
+     "heartbeat_mode": "co-pilot",
+     "consecutive_failures": 3,
+     "settings": {
+      "heartbeat_working_days": [
+       "mon",
+       "tue",
+       "wed",
+       "thu",
+       "fri"
+      ],
+      "schedule": {
+       "enabled": true,
+       "timezone": "America/New_York",
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ],
+       "active_hours": {
+        "end": "17:00",
+        "start": "09:00"
+       }
+      },
+      "heartbeat_frequency": "every_30_minutes"
+     }
+    },
+    "bloq": null,
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 12124,
+     "status": "completed",
+     "started_at": "2026-10-12T13:04:23+00:00",
+     "completed_at": "2026-10-12T13:05:23+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 59178,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 720,
+    "agent_id": 366,
+    "bloq_id": null,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "hourly",
+    "next_run_at": "2026-10-12T22:00:00.000000Z",
+    "last_run_at": "2026-10-12T21:01:07.000000Z",
+    "run_count": 1475,
+    "data": {
+     "type": "heartbeat",
+     "mode": "co-pilot",
+     "agent_name": "Store Assistant",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 366,
+     "name": "Store Assistant",
+     "active": true,
+     "heartbeat_mode": "co-pilot",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": [
+       "mon",
+       "tue",
+       "wed",
+       "thu",
+       "fri"
+      ],
+      "schedule": {
+       "enabled": true,
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ]
+      },
+      "heartbeat_frequency": "every_30_minutes"
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 10896,
+     "status": "completed",
+     "started_at": "2026-10-12T21:00:20+00:00",
+     "completed_at": "2026-10-12T21:01:20+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 57738,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 744,
+    "agent_id": 596,
+    "bloq_id": null,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "hourly",
+    "next_run_at": "2026-10-12T22:00:00.000000Z",
+    "last_run_at": "2026-10-12T21:01:09.000000Z",
+    "run_count": 1472,
+    "data": {
+     "type": "heartbeat",
+     "mode": "co-pilot",
+     "agent_name": "Clinic Assistant",
+     "report_emails": [],
+     "required_tools": [
+      "manageLeads",
+      "agent_memory",
+      "searchKnowledgeBase",
+      "sendEmail"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 596,
+     "name": "Clinic Assistant",
+     "active": true,
+     "heartbeat_mode": "co-pilot",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": [
+       "mon",
+       "tue",
+       "wed",
+       "thu",
+       "fri"
+      ],
+      "schedule": {
+       "enabled": true,
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ]
+      },
+      "heartbeat_frequency": "every_4_hours"
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 10900,
+     "status": "completed",
+     "started_at": "2026-10-12T21:00:22+00:00",
+     "completed_at": "2026-10-12T21:01:22+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 45074,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 890,
+    "agent_id": 671,
+    "bloq_id": null,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "every_6_hours",
+    "next_run_at": "2026-10-12T22:12:00.000000Z",
+    "last_run_at": "2026-10-12T16:07:11.000000Z",
+    "run_count": 165,
+    "data": {
+     "type": "heartbeat",
+     "mode": "passive",
+     "agent_name": "Referrals Agent",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 671,
+     "name": "Referrals Agent",
+     "active": true,
+     "heartbeat_mode": "passive",
+     "consecutive_failures": 2,
+     "settings": {
+      "heartbeat_working_days": [
+       "mon",
+       "tue",
+       "wed",
+       "thu",
+       "fri"
+      ],
+      "schedule": {
+       "enabled": true,
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ]
+      },
+      "heartbeat_frequency": "every_6_hours"
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 15802,
+     "status": "completed",
+     "started_at": "2026-10-12T03:59:57+00:00",
+     "completed_at": "2026-10-12T04:00:57+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 23782,
+     "model_used": "minimax-m3",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 868,
+    "agent_id": 631,
+    "bloq_id": null,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "every_2_hours",
+    "next_run_at": "2026-10-12T22:22:00.000000Z",
+    "last_run_at": "2026-10-12T20:22:39.000000Z",
+    "run_count": 1532,
+    "data": {
+     "type": "heartbeat",
+     "mode": "co-pilot",
+     "agent_name": "Contest Manager",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 631,
+     "name": "Contest Manager",
+     "active": true,
+     "heartbeat_mode": "co-pilot",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 12148,
+     "status": "completed",
+     "started_at": "2026-10-12T20:21:53+00:00",
+     "completed_at": "2026-10-12T20:22:53+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 50050,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 829,
+    "agent_id": 528,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T01:47:00.000000Z",
+    "last_run_at": "2026-10-12T01:47:23.000000Z",
+    "run_count": 229,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Newsletter Agent",
+     "report_emails": [],
+     "required_tools": [
+      "manageBloqItems",
+      "httpRequest",
+      "agent_memory"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 528,
+     "name": "Newsletter Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": [
+       "mon",
+       "tue",
+       "wed",
+       "thu",
+       "fri"
+      ],
+      "schedule": {
+       "enabled": false
+      },
+      "heartbeat_frequency": "daily"
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 11090,
+     "status": "completed",
+     "started_at": "2026-10-12T01:47:05+00:00",
+     "completed_at": "2026-10-12T01:48:05+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 126571,
+     "model_used": "gpt-4o-mini",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    },
+    {
+     "id": 11089,
+     "status": "completed",
+     "started_at": "2026-05-09T15:27:51+00:00",
+     "completed_at": "2026-05-09T15:27:51+00:00",
+     "duration_ms": 0,
+     "duration_seconds": 0,
+     "tokens_used": 0,
+     "model_used": "hive_dispatch",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    },
+    {
+     "id": 11088,
+     "status": "failed",
+     "started_at": "2026-05-09T15:21:23+00:00",
+     "completed_at": "2026-05-09T15:21:23+00:00",
+     "duration_ms": 0,
+     "duration_seconds": 0,
+     "tokens_used": null,
+     "model_used": null,
+     "response_preview": null,
+     "response": null,
+     "error_message": "Hive dispatch failed: HTTP 422",
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    },
+    {
+     "id": 11036,
+     "status": "completed",
+     "started_at": "2026-05-09T02:48:28+00:00",
+     "completed_at": "2026-05-09T02:48:28+00:00",
+     "duration_ms": 0,
+     "duration_seconds": 0,
+     "tokens_used": 0,
+     "model_used": "hive_dispatch",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 900,
+    "agent_id": 702,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "every_8_hours",
+    "next_run_at": "2026-10-13T03:15:00.000000Z",
+    "last_run_at": "2026-10-12T19:15:41.000000Z",
+    "run_count": 183,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Newsroom Agent",
+     "report_emails": [],
+     "required_tools": [
+      "manageBloqItems",
+      "httpRequest",
+      "agent_memory"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 702,
+     "name": "Newsroom Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 16628,
+     "status": "completed",
+     "started_at": "2026-10-12T19:14:45+00:00",
+     "completed_at": "2026-10-12T19:15:45+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 0,
+     "model_used": "gpt-5.6-luna",
+     "response_preview": "Error: AI API error: 401",
+     "response": "Error: AI API error: 401",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 858,
+    "agent_id": 624,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "every_8_hours",
+    "next_run_at": "2026-10-13T03:16:00.000000Z",
+    "last_run_at": "2026-10-12T19:15:39.000000Z",
+    "run_count": 372,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Healthcare Content Agent",
+     "report_emails": [],
+     "required_tools": [
+      "manageBloqItems",
+      "httpRequest",
+      "agent_memory"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 624,
+     "name": "Healthcare Content Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 3,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": []
+  },
+  {
+   "job": {
+    "id": 857,
+    "agent_id": 623,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "every_8_hours",
+    "next_run_at": "2026-10-13T03:41:00.000000Z",
+    "last_run_at": "2026-10-12T19:40:51.000000Z",
+    "run_count": 377,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Beauty Content Agent",
+     "report_emails": [],
+     "required_tools": [
+      "manageBloqItems",
+      "httpRequest",
+      "agent_memory"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 623,
+     "name": "Beauty Content Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 1,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 11288,
+     "status": "completed",
+     "started_at": "2026-10-12T19:40:39+00:00",
+     "completed_at": "2026-10-12T19:41:39+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 60095,
+     "model_used": "minimax-m3",
+     "response_preview": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent",
+     "response": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent_memory**: memory stored\n\n---\n*4 iterations | 50327 tokens*",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 768,
+    "agent_id": 606,
+    "bloq_id": 300,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "every_8_hours",
+    "next_run_at": "2026-10-13T04:09:00.000000Z",
+    "last_run_at": "2026-10-12T20:00:38.000000Z",
+    "run_count": 169,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Oversight Agent",
+     "report_emails": [
+      "person1@example.com",
+      "person2@example.com"
+     ],
+     "required_tools": [
+      "agent_memory",
+      "searchKnowledgeBase"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 606,
+     "name": "Oversight Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": {
+       "enabled": true,
+       "timezone": "America/New_York",
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ],
+       "active_hours": {
+        "end": "17:00",
+        "start": "16:00"
+       }
+      },
+      "heartbeat_frequency": "daily_430pm"
+     }
+    },
+    "bloq": {
+     "id": 300,
+     "name": "Board 1"
+    },
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 10930,
+     "status": "completed",
+     "started_at": "2026-10-07T20:00:46+00:00",
+     "completed_at": "2026-10-07T20:01:46+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 0,
+     "model_used": "grok-4-1-fast-non-reasoning",
+     "response_preview": "Error: AI API error: 403",
+     "response": "Error: AI API error: 403",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 817,
+    "agent_id": 603,
+    "bloq_id": 337,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T09:00:00.000000Z",
+    "last_run_at": "2026-10-12T09:01:34.000000Z",
+    "run_count": 172,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Ranch Assistant",
+     "report_emails": [],
+     "required_tools": [
+      "manageLeads",
+      "agent_memory",
+      "searchKnowledgeBase"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 603,
+     "name": "Ranch Assistant",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 4,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": {
+     "id": 337,
+     "name": "Board 2"
+    },
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 10954,
+     "status": "completed",
+     "started_at": "2026-10-12T09:10:15+00:00",
+     "completed_at": "2026-10-12T09:11:15+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 10980,
+     "model_used": "grok-4-1-fast-non-reasoning",
+     "response_preview": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent",
+     "response": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent_memory**: memory stored\n\n---\n*4 iterations | 50327 tokens*",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 766,
+    "agent_id": 605,
+    "bloq_id": 300,
+    "task_name": "heartbeat",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T10:00:00.000000Z",
+    "last_run_at": "2026-10-12T10:01:47.000000Z",
+    "run_count": 165,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Backtest Agent",
+     "report_emails": [
+      "person1@example.com",
+      "person2@example.com"
+     ],
+     "required_tools": [
+      "agent_memory",
+      "searchKnowledgeBase",
+      "deepResearch"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 605,
+     "name": "Backtest Agent",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 3,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": {
+       "enabled": true,
+       "timezone": "America/New_York",
+       "working_days": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+       ],
+       "active_hours": {
+        "end": "16:00",
+        "start": "06:00"
+       }
+      },
+      "heartbeat_frequency": "daily_6am"
+     }
+    },
+    "bloq": {
+     "id": 300,
+     "name": "Board 1"
+    },
+    "timezone": "UTC"
+   },
+   "runs": [
+    {
+     "id": 10928,
+     "status": "completed",
+     "started_at": "2026-10-12T10:04:35+00:00",
+     "completed_at": "2026-10-12T10:05:35+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 57841,
+     "model_used": "grok-4-1-fast-non-reasoning",
+     "response_preview": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent",
+     "response": "**Workflow Complete**\n\n\n**Tools Used:**\n- ✓ **agent_memory**: 10 memories retrieved\n- ✓ **SearchKnowledgeBaseTool**: 5 KB results (top score: 0.705)\n- ✓ **agent_memory**: memory stored\n\n---\n*4 iterations | 50327 tokens*",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  },
+  {
+   "job": {
+    "id": 881,
+    "agent_id": 642,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T12:00:00.000000Z",
+    "last_run_at": "2026-10-12T12:06:03.000000Z",
+    "run_count": 0,
+    "data": {
+     "type": "heartbeat",
+     "mode": null,
+     "agent_name": "Sales Agent",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": null,
+     "error": null
+    },
+    "agent": {
+     "id": 642,
+     "name": "Sales Agent",
+     "active": true,
+     "heartbeat_mode": "briefing",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": []
+  },
+  {
+   "job": {
+    "id": 877,
+    "agent_id": 632,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T13:00:00.000000Z",
+    "last_run_at": "2026-10-12T13:04:58.000000Z",
+    "run_count": 0,
+    "data": {
+     "type": "heartbeat",
+     "mode": null,
+     "agent_name": "Article Writer",
+     "report_emails": [],
+     "required_tools": []
+    },
+    "last_result": {
+     "success": false,
+     "error": "Heartbeat Stage 3 endpoint unavailable"
+    },
+    "agent": {
+     "id": 632,
+     "name": "Article Writer",
+     "active": true,
+     "heartbeat_mode": "briefing",
+     "consecutive_failures": 0,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": []
+  },
+  {
+   "job": {
+    "id": 811,
+    "agent_id": 609,
+    "bloq_id": null,
+    "task_name": "Daily content run",
+    "status": "scheduled",
+    "frequency": "daily",
+    "next_run_at": "2026-10-13T13:00:00.000000Z",
+    "last_run_at": "2026-10-12T13:05:09.000000Z",
+    "run_count": 93,
+    "data": {
+     "type": "heartbeat",
+     "mode": "autonomous",
+     "agent_name": "Lead Monitor",
+     "report_emails": [],
+     "required_tools": [
+      "manageLeads",
+      "agent_memory"
+     ]
+    },
+    "last_result": {
+     "success": true,
+     "error": null
+    },
+    "agent": {
+     "id": 609,
+     "name": "Lead Monitor",
+     "active": true,
+     "heartbeat_mode": "autonomous",
+     "consecutive_failures": 4,
+     "settings": {
+      "heartbeat_working_days": null,
+      "schedule": null,
+      "heartbeat_frequency": null
+     }
+    },
+    "bloq": null,
+    "timezone": "America/New_York"
+   },
+   "runs": [
+    {
+     "id": 10973,
+     "status": "completed",
+     "started_at": "2026-10-12T13:04:32+00:00",
+     "completed_at": "2026-10-12T13:05:32+00:00",
+     "duration_ms": null,
+     "duration_seconds": null,
+     "tokens_used": 17473,
+     "model_used": "gpt-4.1-nano",
+     "response_preview": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed*",
+     "response": "**Status** — The project is progressing; two new items were drafted.\n\n**Key Numbers** — Total items: 344 (329 active, 0 pending, 11 completed).\n\n**What Changed** — Two new articles were added to the deliverables list:\n1. **First article** - a summary of a local development.\n2. **Second article** - a summary of a funding decision.\n\n**Actions** — \n- Created two articles from current sources.\n- Checked every claim against its source.\n\nTASKS: []\nNEXT_STEPS: []",
+     "error_message": null,
+     "bloq_item_id": null,
+     "deliverable_id": null,
+     "public_url": null,
+     "email_sent": null
+    }
+   ]
+  }
+ ]
+}
