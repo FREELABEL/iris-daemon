@@ -66,7 +66,7 @@ test('macOS: a Bluetooth controller that is switched off still counts, but says 
 })
 
 test('macOS: virtual cameras and camera extensions are not cameras', () => {
-  assert.deepStrictEqual(parseMacProfiler(MAC).camera, { count: 2, virtual: 2 })
+  assert.deepStrictEqual(parseMacProfiler(MAC).camera, { count: 2, virtual: 2, names: ['FaceTime HD Camera'] })
 })
 
 test('macOS: only builtin audio is physical; virtual, aggregate and Continuity are not', () => {
@@ -80,14 +80,16 @@ test('macOS: an empty report is zeros, and no Bluetooth controller means powered
   assert.deepStrictEqual(r, {
     wifi: { count: 0 },
     bluetooth: { count: 0, powered: null },
-    camera: { count: 0, virtual: 0 },
+    camera: { count: 0, virtual: 0, names: [] },
     audio_in: { count: 0, virtual: 0 },
     audio_out: { count: 0, virtual: 0 }
   })
 })
 
-test('macOS: no device names leave the machine', () => {
-  const json = JSON.stringify(parseMacProfiler(MAC))
+test("macOS: no device names leave the machine — except a physical camera's product name", () => {
+  const r = parseMacProfiler(MAC)
+  const json = JSON.stringify({ ...r, camera: { ...r.camera, names: [] } })
+  assert.deepStrictEqual(r.camera.names, ['FaceTime HD Camera'])
   for (const name of ['FaceTime', 'MacBook', 'Phone', 'BlackHole', 'OBS']) {
     assert.ok(!json.includes(name), `report leaked device name "${name}": ${json}`)
   }
@@ -115,7 +117,7 @@ test('linux: a desktop with no Bluetooth directory reports 0 Bluetooth (iris-hiv
   assert.deepStrictEqual(probeLinux(root), {
     wifi: { count: 0 },
     bluetooth: { count: 0, powered: null },
-    camera: { count: 0, virtual: 0 },
+    camera: { count: 0, virtual: 0, names: [] },
     audio_in: { count: 1, virtual: 0 },
     audio_out: { count: 2, virtual: 0 }
   })
@@ -139,7 +141,7 @@ test('linux: a Pi with Wi-Fi, Bluetooth and a USB camera', () => {
   assert.deepStrictEqual(r.wifi, { count: 1 })
   // Nothing in sysfs proves an adapter is ON, so powered stays unknown rather than a guessed true.
   assert.deepStrictEqual(r.bluetooth, { count: 1, powered: null })
-  assert.deepStrictEqual(r.camera, { count: 1, virtual: 1 })
+  assert.deepStrictEqual(r.camera, { count: 1, virtual: 1, names: ['USB Camera'] })
 })
 
 test('linux: an rfkill-blocked Bluetooth adapter is reported as not powered', () => {
@@ -159,4 +161,16 @@ test('linux: snd-aloop loopback audio is virtual', () => {
   const r = probeLinux(root)
   assert.deepStrictEqual(r.audio_in, { count: 0, virtual: 1 })
   assert.deepStrictEqual(r.audio_out, { count: 0, virtual: 1 })
+})
+
+// #189589 — the one name that may leave: a camera's FACTORY product name, never a person's.
+test('camera names: product names pass, anything that can name a person does not', () => {
+  const { productCameraName } = require('../daemon/device-capabilities')
+  assert.strictEqual(productCameraName('OBSBOT Tiny Camera'), 'OBSBOT Tiny Camera')
+  assert.strictEqual(productCameraName("Alex's iPhone Camera"), null)
+  assert.strictEqual(productCameraName('Alex’s Camera'), null)
+  assert.strictEqual(productCameraName('Phone Camera', 'iPhone17,2'), null)
+  assert.strictEqual(productCameraName('Desk View Camera'), null)
+  assert.strictEqual(productCameraName(require('os').userInfo().username + ' cam'), null)
+  assert.strictEqual(productCameraName('x'.repeat(65)), null)
 })
