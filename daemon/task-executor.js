@@ -2249,9 +2249,17 @@ class TaskExecutor {
             break
           }
 
+          // #189589 — the run's settings, as IRIS_ARG_<NAME>. Carried to both paths: the host
+          // spawn (below, in spawnEnv) and the sandbox, which inherits NOTHING and is handed them.
+          task._scriptArgEnv = require('./script-args').scriptArgEnv(task.config?.args)
+          if (Object.keys(task._scriptArgEnv).length) {
+            console.log(`[executor] user_script '${slug}' settings: ${Object.keys(task._scriptArgEnv).join(', ')}`)
+          }
+
           const plan = planScriptExecution({
             runtime,
             scriptPath,
+            env: task._scriptArgEnv,
             outputDir: workspace.outputDir || path.join(workspace.dir, '.output'),
             manifest: script.manifest || task.config?.manifest || {},
             policy: nodePolicyFromEnv(),
@@ -4661,6 +4669,8 @@ exit 1
         ...accountEnvForScripts(),
         ...(workspace.env || {}),
         ...(task.config?.env_vars || {}),
+        // A script's settings (#189589): IRIS_ARG_* only, so they cannot shadow PATH or anything above.
+        ...(task._scriptArgEnv || {}),
         // Last, so a task's own env_vars cannot shadow the vault's values (#187915).
         ...(task._vaultEnv || {})
       }
