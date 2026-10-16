@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert')
-const { scriptArgEnv } = require('../daemon/script-args')
+const { scriptArgEnv, runEnv } = require('../daemon/script-args')
 
 // #189589 — a run's settings reach the script as IRIS_ARG_<NAME>, and nothing else does.
 test('maps settings to IRIS_ARG_ env vars', () => {
@@ -20,4 +20,12 @@ test('refuses names that are not plain identifiers, and non-text values', () => 
 
 test('caps a value at 2000 characters', () => {
   assert.strictEqual(scriptArgEnv({ big: 'x'.repeat(5000) }).IRIS_ARG_BIG.length, 2000)
+})
+
+test('hands the script its task id and the Gate receipt it ran under', () => {
+  const receipt = { by: 'Constellation Gate', verdict: 'clean', scan_id: 'scn_1', approved_by: 193 }
+  const env = runEnv({ id: '01a144dd-ec7', config: { gate: receipt } })
+  assert.strictEqual(env.IRIS_TASK_ID, '01a144dd-ec7')
+  assert.deepStrictEqual(JSON.parse(env.IRIS_GATE_RECEIPT), receipt)
+  assert.deepStrictEqual(runEnv({ id: 'x;rm', config: { gate: ['no'] } }), {})
 })

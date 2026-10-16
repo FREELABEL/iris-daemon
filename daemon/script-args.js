@@ -23,4 +23,20 @@ function scriptArgEnv (args) {
   return env
 }
 
-module.exports = { scriptArgEnv, MAX_VALUE }
+/**
+ * What the run itself is (#189589): its task id, and the receipt of the Constellation Gate scan
+ * that cleared it (config.gate — set by the hub in the signed config, absent when Gate is off).
+ * A script can then name, in its own records, the scan and the approval it ran under.
+ */
+function runEnv (task) {
+  const env = {}
+  if (task && /^[A-Za-z0-9-]{1,64}$/.test(String(task.id || ''))) env.IRIS_TASK_ID = String(task.id)
+  const receipt = task?.config?.gate
+  if (receipt && typeof receipt === 'object' && !Array.isArray(receipt)) {
+    const json = JSON.stringify(receipt)
+    if (json.length <= 4000) env.IRIS_GATE_RECEIPT = json
+  }
+  return env
+}
+
+module.exports = { scriptArgEnv, runEnv, MAX_VALUE }

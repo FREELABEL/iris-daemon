@@ -2251,7 +2251,7 @@ class TaskExecutor {
 
           // #189589 — the run's settings, as IRIS_ARG_<NAME>. Carried to both paths: the host
           // spawn (below, in spawnEnv) and the sandbox, which inherits NOTHING and is handed them.
-          task._scriptArgEnv = require('./script-args').scriptArgEnv(task.config?.args)
+          task._scriptArgEnv = { ...require('./script-args').runEnv(task), ...require('./script-args').scriptArgEnv(task.config?.args) }
           if (Object.keys(task._scriptArgEnv).length) {
             console.log(`[executor] user_script '${slug}' settings: ${Object.keys(task._scriptArgEnv).join(', ')}`)
           }
