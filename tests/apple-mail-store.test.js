@@ -47,6 +47,7 @@ function build() {
     ['', 'Display Name Only'], // 6 display-name-only sender
     ["o'brien%_x@odd.io", "O'Brien; DROP TABLE"], // 7 hostile characters
     ['hpk@m42.com.evil.io', 'Lookalike'], // 8 must NOT match hpk@m42.com
+    ['amayo@mypathwaysai.com', 'Alex Mayo'], // 9 a Gmail account whose sent mail is ONLY a labelled All Mail row
   ]
   addrs.forEach(([a, c], i) => sql.push(`INSERT INTO addresses VALUES (${i + 1}, '${q(a)}', '${q(c)}');`))
   const subj = ['Following up', 'Iris demo and discussion', 'Re: Iris demo and discussion', 'Gate pilots', 'Newsletter', 'Hello from nobody', "100% ready; it's_done", 'Draft reply', 'Phish']
@@ -81,6 +82,8 @@ function build() {
   // message_id 0 (Mail did not hash it) — dedupe must fall back to the row, not collapse all zeros.
   msg(1013, 0, 1, 4, 3, INBOX); rcpt(1013, 2, 0)
   msg(1014, 0, 1, 5, 2, INBOX); rcpt(1014, 2, 0)
+  // Sent from a second Gmail account: no Sent mailbox row exists, only the label.
+  msg(1015, 1515, 9, 4, 1, ALLMAIL); rcpt(1015, 3, 0); label(1015, SENT)
 
   execFileSync('/usr/bin/sqlite3', [db, sql.join('\n')])
 
@@ -278,14 +281,15 @@ test('route: an empty / whitespace query is a 400, not every message', async () 
 // Sent side of every account, including Gmail, which keeps sent mail in All Mail with a label.
 test('from_me=1 returns what this Mac sent — Gmail labelled-Sent included, drafts excluded, deduped', async () => {
   const rows = await store.searchEmails({ fromMe: true, days: 30, limit: 50 })
-  assert.deepStrictEqual(rows.map((r) => r.message_id), ['333'])
-  assert.deepStrictEqual(rows[0].to, ['hpk@m42.com'])
-  assert.strictEqual(rows[0].from_me, true)
+  assert.deepStrictEqual(rows.map((r) => r.message_id), ['1515', '333'])
+  assert.deepStrictEqual(rows[1].to, ['hpk@m42.com'])
+  assert.deepStrictEqual(rows[0].to, ['dc@m42.com'])
+  assert.ok(rows.every((r) => r.from_me === true))
 })
 
 test('route: from_me=1 is accepted alone (no from/subject needed)', async () => {
   const { code, body } = await call({ from_me: '1', days: '30', limit: '10' })
   assert.strictEqual(code, 200)
   assert.ok(body.capabilities.includes('from_me'))
-  assert.strictEqual(body.emails.length, 1)
+  assert.strictEqual(body.emails.length, 2)
 })
