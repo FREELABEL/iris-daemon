@@ -285,7 +285,7 @@ async function searchEmails({ from = '', participant = '', subject = '', fromMe 
   const fetchN = Math.min(2000, lim * 6)
   const rows = await query(`
     SELECT m.ROWID      AS rowid,
-           m.message_id AS mid,
+           CAST(m.message_id AS TEXT) AS mid, -- TEXT: a 64-bit hash; JSON numbers round it
            s.subject    AS subject,
            a.address    AS sender,
            a.comment    AS sender_name,
