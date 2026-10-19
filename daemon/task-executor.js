@@ -78,7 +78,7 @@ async function getIsolationState () {
  *
  * Add a type here whenever you add one that carries structured config.
  */
-const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use', 'computer_use'])
+const KNOWN_STRUCTURED_TYPES = new Set(['bridge_call', 'browser_use', 'agent_run', 'computer_use'])
 
 // Resolve a Node 18+ binary path for child processes (Playwright requirement)
 function resolveNode18Path () {
@@ -1377,6 +1377,20 @@ class TaskExecutor {
         clearInterval(progressInterval)
         outputStream.stop().catch(() => {})
         console.log(`[computer-use] ${payload.metadata?.desktop || '-'} → ${payload.status}${payload.error ? '  ' + payload.error : ''}`)
+        await this.cloud.submitResult(taskId, payload)
+        return
+      }
+
+      // ── Short-circuit: agent_run — one of the owner's agents, run by a local harness (#189970) ──
+      //
+      // Logic lives in agent-run.js so its tests run the SAME code this calls. It reads ONLY
+      // config.run_on_node (never config.runtime) and refuses what it cannot honour exactly.
+      if (task.type === 'agent_run') {
+        const payload = await this.runAgentRun(task, workspace)
+        clearInterval(progressInterval)
+        outputStream.stop().catch(() => {})
+        const m = payload.metadata || {}
+        console.log(`[agent-run] ${m.runtime || '-'} agent=${m.agent_id ?? '-'} → ${payload.status}${payload.error ? '  ' + payload.error : ''}`)
         await this.cloud.submitResult(taskId, payload)
         return
       }
@@ -4910,6 +4924,58 @@ exit 1
         }
         reject(err)
       })
+    })
+  }
+
+  /**
+   * Runtimes this machine can run an agent_run task under, as { runtime: binary }. Cached for a
+   * minute: the heartbeat asks every 30s and the answer only changes when software is installed.
+   * `getLocalModelsReport` is set by the daemon (LocalModelReporter); without it local_llm is
+   * never claimed.
+   */
+  agentRunRuntimes (opts = {}) {
+    const now = Date.now()
+    if (!opts.fresh && this._agentRunRuntimes && now - this._agentRunRuntimesAt < 60000) return this._agentRunRuntimes
+    let localModels = null
+    try { localModels = typeof this.getLocalModelsReport === 'function' ? this.getLocalModelsReport() : null } catch { localModels = null }
+    this._agentRunRuntimes = require('./agent-run').detectRuntimes({ localModels, ...(opts.deps || {}) })
+    this._agentRunRuntimesAt = now
+    return this._agentRunRuntimes
+  }
+
+  /** The heartbeat's `run_on_node` field: { version: 1, runtimes: [...detected here] }. */
+  runOnNodeCapability () {
+    return require('./agent-run').runOnNodeCapability(this.agentRunRuntimes())
+  }
+
+  /** Execute an agent_run task in its workspace. Never throws; returns the result payload. */
+  runAgentRun (task, workspace, deps = {}) {
+    const agentRun = require('./agent-run')
+    const found = deps.found || this.agentRunRuntimes()
+    let localModels = []
+    try {
+      const r = typeof this.getLocalModelsReport === 'function' ? this.getLocalModelsReport() : null
+      localModels = (r && Array.isArray(r.models)) ? r.models.map((m) => (typeof m === 'string' ? m : m && (m.id || m.name))).filter(Boolean) : []
+    } catch { localModels = [] }
+    return agentRun.runAgentRun(task, {
+      available: Object.keys(found),
+      claudeBin: found.claude_code,
+      opencodeBin: found.opencode,
+      localModels,
+      workDir: workspace && (workspace.projectDir || workspace.dir),
+      env: {
+        ...process.env,
+        PATH: [path.join(os.homedir(), '.iris', 'bin'), process.env.PATH || ''].filter(Boolean).join(pathDelimiterFor()),
+        TASK_ID: task.id,
+        TASK_TYPE: task.type
+      },
+      onSpawn: (child) => {
+        child._startedAt = Date.now()
+        child._taskTitle = task.title || task.type
+        child._taskType = task.type
+        if (this.runningTasks) this.runningTasks.set(task.id, child)
+      },
+      ...deps
     })
   }
 

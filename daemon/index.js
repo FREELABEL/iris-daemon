@@ -458,6 +458,8 @@ class Daemon {
       this.meshLlm = null
     }
     this.localModels = new LocalModelReporter().start()
+    // agent_run (#189970) claims local_llm only when this server actually answered with models.
+    if (this.executor) this.executor.getLocalModelsReport = () => (this.localModels ? this.localModels.report() : null)
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
       // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup
@@ -575,6 +577,16 @@ class Daemon {
       // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
       // its model can run. From a background cache; omitted until the first probe lands.
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
+      // run_on_node (#189970): which local harnesses can run one of the owner's agents here —
+      // only runtimes found on this machine. The hub dispatches agent_run only to a node that
+      // lists the runtime; an empty list clears the capability server-side. A probe failure
+      // omits the key, which the hub reads as "no update", never as "supported".
+      ...((() => {
+        try { return this.executor ? { run_on_node: this.executor.runOnNodeCapability() } : {} } catch (e) {
+          console.error(`[heartbeat] run_on_node probe failed: ${e.message}`)
+          return {}
+        }
+      })()),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
       ...(this._atlasSyncReport ? { atlas_sync: this._atlasSyncReport } : {}),
