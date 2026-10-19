@@ -243,3 +243,33 @@ test('limit applies AFTER dedupe so duplicates cannot starve the result', async 
   assert.strictEqual(new Set(rows.map((r) => r.id)).size, 6)
   assert.ok(rows.some((r) => r.message_id === '222'), 'a duplicate row took the last slot')
 })
+
+// ── The HTTP handler index.js mounts ──
+function call(query) {
+  const { mailSearchHandler } = require('../drivers/apple-mail-route')
+  return new Promise((resolve) => {
+    const res = { code: 200, status(c) { this.code = c; return this }, json(b) { resolve({ code: this.code, body: b }) } }
+    mailSearchHandler()({ query }, res)
+  })
+}
+
+test('route: participant= returns both directions, recipients and capabilities', async () => {
+  const { code, body } = await call({ participant: 'hpk@m42.com', days: '30', limit: '50' })
+  assert.strictEqual(code, 200)
+  assert.ok(body.capabilities.includes('participant'))
+  const dirs = new Set(body.emails.map((e) => e.direction))
+  assert.ok(dirs.has('inbound') && dirs.has('outbound'), [...dirs].join(','))
+  assert.ok(body.emails.every((e) => Array.isArray(e.to) && Array.isArray(e.mailboxes)))
+})
+
+test('route: include_body=1 returns bodies; without it, no body key', async () => {
+  const withBody = await call({ participant: 'hpk@m42.com', days: '30', limit: '50', include_body: '1' })
+  assert.ok(withBody.body.emails.some((e) => typeof e.body === 'string' && e.body.length > 0))
+  const without = await call({ participant: 'hpk@m42.com', days: '30', limit: '50' })
+  assert.ok(without.body.emails.every((e) => !('body' in e)))
+})
+
+test('route: an empty / whitespace query is a 400, not every message', async () => {
+  assert.strictEqual((await call({ from: '  ' })).code, 400)
+  assert.strictEqual((await call({})).code, 400)
+})
