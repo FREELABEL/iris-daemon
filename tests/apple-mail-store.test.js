@@ -84,6 +84,9 @@ function build() {
   msg(1014, 0, 1, 5, 2, INBOX); rcpt(1014, 2, 0)
   // Sent from a second Gmail account: no Sent mailbox row exists, only the label.
   msg(1015, 1515, 9, 4, 1, ALLMAIL); rcpt(1015, 3, 0); label(1015, SENT)
+  // Two DIFFERENT messages whose 64-bit hashes are equal once rounded to a JS number.
+  msg(1016, '5138336715160088001', 1, 5, 300, INBOX); rcpt(1016, 2, 0)
+  msg(1017, '5138336715160088002', 1, 6, 300, INBOX); rcpt(1017, 2, 0)
 
   execFileSync('/usr/bin/sqlite3', [db, sql.join('\n')])
 
@@ -161,6 +164,12 @@ test('plus-tags and case do not hide the lead', async () => {
   assert.ok(a.some((r) => r.message_id === '555' && r.direction === 'inbound'), 'HPK+news@M42.com not matched')
   const b = await store.searchEmails({ participant: 'hpk+crm@m42.com', days: 30, limit: 50 })
   assert.ok(b.some((r) => r.message_id === '222'), 'a plus-tagged lead address must still find the base mailbox')
+})
+
+test('64-bit message hashes keep full precision — two messages never collapse into one', async () => {
+  const rows = await store.searchEmails({ participant: 'hpk@m42.com', days: 30, limit: 50 })
+  const ids = rows.map((r) => r.message_id)
+  assert.ok(ids.includes('5138336715160088001') && ids.includes('5138336715160088002'), ids.join(','))
 })
 
 test('message_id 0 never collapses unrelated messages', async () => {
