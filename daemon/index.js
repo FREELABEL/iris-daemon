@@ -439,7 +439,7 @@ class Daemon {
       // meant a hub that was mid-deploy when this node registered simply dropped it, and
       // nothing re-offered it until the next daemon restart — the node would sit there
       // advertising nothing while believing it had reported (#182368). Measured exactly
-      // that way: the daemon logged "Tailnet address: 100.114.214.29" and the hub had no
+      // that way: the daemon logged "Tailnet address: 100.x.y.z" and the hub had no
       // record of it. It is a cached string; re-sending costs nothing.
       ...(this.tailscaleIp ? { tailscale_ip: this.tailscaleIp } : {}),
       paused: this.paused,

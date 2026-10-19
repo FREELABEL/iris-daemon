@@ -16,7 +16,7 @@
  * provokes and handles. A check that cannot tell those apart reports noise as
  * failure and, on a slower day, failure as success.
  */
-const { chromium } = require('/Users/mayoalexander/.iris/bridge/node_modules/playwright')
+const { chromium } = require('playwright')
 const fs = require('fs')
 const KEY = fs.readFileSync(process.env.HOME + '/.iris/bridge-token', 'utf8').trim()
 const OUT = process.argv[2]

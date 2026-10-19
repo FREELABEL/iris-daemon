@@ -16,7 +16,7 @@ const RAW = `import { test, expect } from '@playwright/test';
 
 test('test', async ({ page }) => {
   await page.goto('https://portal.example.com/login');
-  await page.getByLabel('Email').fill('navigator@clinic.org');
+  await page.getByLabel('Email').fill('navigator@example.com');
   await page.getByLabel('Password').fill('Hunter2!secret');
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.getByPlaceholder('Enter the 6-digit verification code').fill('492133');
@@ -30,7 +30,7 @@ test('test', async ({ page }) => {
   await page.getByRole('button', { name: 'Download PDF' }).click();
 });
 `
-const SECRETS = ['navigator@clinic.org', 'Hunter2!secret', '492133', 'Doe', '03/14/1962', '0012345', '88812345', '78701', 'Jane']
+const SECRETS = ['navigator@example.com', 'Hunter2!secret', '492133', 'Doe', '03/14/1962', '0012345', '88812345', '78701', 'Jane']
 
 test('no typed secret, OTP, patient value or record-looking text survives', () => {
   const { script } = sanitizeRecording(RAW, { name: 'pathways-labs', vault: 'pathways-portal' })
