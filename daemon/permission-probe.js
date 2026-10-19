@@ -255,6 +255,9 @@ async function probePermissions (io = defaultIo) {
   await run('browser', probeBrowser)
   await run('network', probeNetwork)
   await run('isolation', probeIsolation)
+  // #190056 — the SAME measurement, under the name scripts declare (`requires=docker`). Copied, not
+  // probed twice: two `docker info` calls could disagree, and then one fact would have two answers.
+  out.docker = { ...out.isolation }
   await run('python3', probeRuntime('python3'))
   await run('node', probeRuntime('node'))
   await run('bash', probeRuntime('bash'))

@@ -198,8 +198,33 @@ function nodePolicyFromEnv (env = process.env) {
  * A REFUSAL RETURNS NO COMMAND. Not a command that happens to be safe, not a flag the caller
  * might forget to check — nothing to run. The only way to execute is to be handed something.
  */
+/**
+ * #190056 — may this run leave the sandbox because a person approved it to drive hardware?
+ *
+ * A script that drives hardware cannot work in a container: it sees no USB, no Bluetooth, no
+ * camera and no host docker socket. So it runs on the host when ALL of these hold:
+ *   - the node is personal — a shared or server node isolates everything, always;
+ *   - its Gate receipt says it was held for HARDWARE (the server decided that from what the
+ *     script declares — not re-derived here, so there is one answer, not two);
+ *   - and names the person who approved it.
+ * The receipt is written by the server alone (fl-iris-api drops any caller-supplied config.gate),
+ * and the bytes are pinned by script_sha256, so an approval covers exactly what was approved.
+ * What it grants is the account's own power on this machine — which is what "approve" says.
+ */
+function hardwareApproved (policy, gate) {
+  if (isolationRequired(policy)) return null
+  if (!gate || typeof gate !== 'object') return null
+  const held = Array.isArray(gate.held_for) && gate.held_for.includes('hardware')
+  const by = gate.approved_by
+  if (!held || by === undefined || by === null || by === '') return null
+  return `hardware run approved by #${by}${gate.scan_id ? ` (Gate ${gate.scan_id})` : ''}`
+}
+
 function planScriptExecution (o) {
-  const decision = decideExecution(o.policy || {}, o.isolation)
+  const approvedHost = hardwareApproved(o.policy || {}, o.gate)
+  const decision = approvedHost
+    ? { mode: 'host', isolated: false, reason: approvedHost }
+    : decideExecution(o.policy || {}, o.isolation)
   const manifest = o.manifest || {}
 
   if (decision.mode === 'refused') {
@@ -239,7 +264,8 @@ function planScriptExecution (o) {
     mode: 'host',
     isolated: false,
     egressEnforced: false,
-    reason: (o.isolation && o.isolation.reason) || null,
+    reason: approvedHost || (o.isolation && o.isolation.reason) || null,
+    hardwareApproved: !!approvedHost,
     cmd: entry[0],
     args: entry.slice(1),
     timeoutMs: timeoutSeconds * 1000
@@ -279,6 +305,7 @@ function planWarmup (isolation) {
 }
 
 module.exports = {
+  hardwareApproved,
   imagesToWarm,
   planWarmup,
   planScriptExecution,
