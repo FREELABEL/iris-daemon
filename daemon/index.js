@@ -258,6 +258,31 @@ class Daemon {
       if (typeof this._worktreeSweepTimeout.unref === 'function') this._worktreeSweepTimeout.unref()
     }
 
+    // Step 0b3: Atlas background sync (#189972) — keep opted-in local copies of datasets
+    // (`iris atlas:datasets sync <slug> --background on`) in step every IRIS_ATLAS_SYNC_SECONDS
+    // (default 300). Runs the CLI's own sync; never overlaps itself. Off with IRIS_ATLAS_SYNC=0.
+    if (process.env.IRIS_ATLAS_SYNC !== '0' && !this._atlasSyncInterval) {
+      const every = Math.max(60, Number(process.env.IRIS_ATLAS_SYNC_SECONDS) || 300) * 1000
+      const runAtlasSync = () => {
+        if (this._atlasSyncRunning) return
+        this._atlasSyncRunning = true
+        require('../lib/atlas-sync').runOnce()
+          .then((r) => {
+            if (r.datasets.length || r.skipped) this._atlasSyncReport = r
+            for (const d of r.datasets) {
+              console.log(d.ok
+                ? `[atlas-sync] ${d.slug}: pulled ${d.pulled}, pushed ${d.pushed}${d.conflicts ? `, ${d.conflicts} conflict(s)` : ''}${d.refused ? `, ${d.refused} refused` : ''}`
+                : `[atlas-sync] ${d.slug}: FAILED — ${d.error}`)
+            }
+          })
+          .catch((e) => console.warn(`[atlas-sync] run failed: ${e.message}`))
+          .finally(() => { this._atlasSyncRunning = false })
+      }
+      this._atlasSyncTimeout = setTimeout(runAtlasSync, 60 * 1000)
+      this._atlasSyncInterval = setInterval(runAtlasSync, every)
+      if (typeof this._atlasSyncTimeout.unref === 'function') this._atlasSyncTimeout.unref()
+    }
+
     // Step 0c: Detect hardware profile (cached after first run)
     console.log('[daemon] Detecting hardware...')
     this.hardwareProfile = await detectProfile()
@@ -552,6 +577,7 @@ class Daemon {
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
+      ...(this._atlasSyncReport ? { atlas_sync: this._atlasSyncReport } : {}),
       // Live free space on ~/.iris, plus the last failed state write (#188700). Omitted when the
       // platform cannot measure it; the cloud keeps the startup number then.
       ...((() => { try { const d = require('../lib/disk-report').diskReport(); return d ? { disk: d } : {} } catch { return {} } })()),
