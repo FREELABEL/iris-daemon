@@ -273,3 +273,19 @@ test('route: an empty / whitespace query is a 400, not every message', async () 
   assert.strictEqual((await call({ from: '  ' })).code, 400)
   assert.strictEqual((await call({})).code, 400)
 })
+
+// #189942 — `iris mail audit` reconciles what went OUT against the comms ledger. It needs the
+// Sent side of every account, including Gmail, which keeps sent mail in All Mail with a label.
+test('from_me=1 returns what this Mac sent — Gmail labelled-Sent included, drafts excluded, deduped', async () => {
+  const rows = await store.searchEmails({ fromMe: true, days: 30, limit: 50 })
+  assert.deepStrictEqual(rows.map((r) => r.message_id), ['333'])
+  assert.deepStrictEqual(rows[0].to, ['hpk@m42.com'])
+  assert.strictEqual(rows[0].from_me, true)
+})
+
+test('route: from_me=1 is accepted alone (no from/subject needed)', async () => {
+  const { code, body } = await call({ from_me: '1', days: '30', limit: '10' })
+  assert.strictEqual(code, 200)
+  assert.ok(body.capabilities.includes('from_me'))
+  assert.strictEqual(body.emails.length, 1)
+})

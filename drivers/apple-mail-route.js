@@ -19,18 +19,19 @@ function mailSearchHandler({ onError = () => {} } = {}) {
   const from = (req.query.from || '').toString().trim()
   const participant = (req.query.participant || '').toString().trim()
   const subject = (req.query.subject || '').toString().trim()
+  const fromMe = ['1', 'true', 'yes'].includes(String(req.query.from_me || '').toLowerCase())
   const days = Math.max(1, Math.min(365, parseInt(req.query.days || '14', 10)))
   const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || '20', 10)))
   const includeBody = ['1', 'true', 'yes'].includes(String(req.query.include_body || '').toLowerCase())
   const maxBody = Math.max(1, Math.min(100000, parseInt(req.query.max_body || '4000', 10)))
 
-  if (!from && !subject && !participant) {
-    return res.status(400).json({ error: 'from, participant or subject query param is required' })
+  if (!from && !subject && !participant && !fromMe) {
+    return res.status(400).json({ error: 'from, participant, subject or from_me query param is required' })
   }
 
   try {
     const store = require('./apple-mail-store')
-    const emails = await store.searchEmails({ from, participant, subject, days, limit, includeBody, maxBody })
+    const emails = await store.searchEmails({ from, participant, subject, fromMe, days, limit, includeBody, maxBody })
     res.json({
       emails: emails.map((e) => ({
         id: e.id,
@@ -44,6 +45,7 @@ function mailSearchHandler({ onError = () => {} } = {}) {
         to: e.to,
         cc: e.cc,
         ...(participant ? { direction: e.direction, role: e.role, from_me: e.from_me } : {}),
+        ...(fromMe ? { from_me: true, direction: 'outbound' } : {}),
         ...(includeBody ? { body: e.body, body_error: e.body_error, body_truncated: e.body_truncated, message_id_header: e.message_id_header } : {}),
       })),
       count: emails.length,
@@ -51,7 +53,7 @@ function mailSearchHandler({ onError = () => {} } = {}) {
       source: 'envelope-index',
       // Lets a CLI tell "this bridge can see outbound + bodies" from an older one that
       // silently ignores the params and answers sender-only.
-      capabilities: ['participant', 'body', 'sender_name', 'dedupe'],
+      capabilities: ['participant', 'body', 'sender_name', 'dedupe', 'from_me'],
     })
   } catch (err) {
     onError(err)

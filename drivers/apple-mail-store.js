@@ -256,13 +256,13 @@ function readBody(rowid, mailboxUrls, maxBody) {
  *   subject     — subject contains this
  * At least one of them is required. Bodies only with includeBody.
  */
-async function searchEmails({ from = '', participant = '', subject = '', days = 14, limit = 20, includeBody = false, maxBody = 4000 } = {}) {
+async function searchEmails({ from = '', participant = '', subject = '', fromMe = false, days = 14, limit = 20, includeBody = false, maxBody = 4000 } = {}) {
   const lim = Math.max(1, Math.min(200, Math.floor(Number(limit) || 20)))
   const d = Math.max(1, Math.min(365, Math.floor(Number(days) || 14)))
   const f = String(from || '').trim()
   const p = String(participant || '').trim()
   const s = String(subject || '').trim()
-  if (!f && !p && !s) throw new Error('from, participant or subject is required (an empty query would match every message)')
+  if (!f && !p && !s && !fromMe) throw new Error('from, participant, subject or from_me is required (an empty query would match every message)')
 
   const where = [`m.date_sent > strftime('%s','now') - ${d} * 86400`, 'm.deleted = 0']
   let pIds = null
@@ -272,6 +272,14 @@ async function searchEmails({ from = '', participant = '', subject = '', days = 
   }
   if (f) where.push(`m.sender IN (SELECT ROWID FROM addresses WHERE address LIKE ${likeContains(f)} OR comment LIKE ${likeContains(f)})`)
   if (s) where.push(`m.subject IN (SELECT ROWID FROM subjects WHERE subject LIKE ${likeContains(s)})`)
+  let own = null
+  if (fromMe) {
+    // #189942: what went OUT, from every account — Gmail's sent mail is an All Mail row with a
+    // Sent label, never a Sent mailbox row, so "the Sent mailbox" alone misses all of it.
+    own = await ownAddresses()
+    if (own.size === 0) return []
+    where.push(`m.sender IN (SELECT ROWID FROM addresses WHERE address IN (${[...own].map(lit).join(', ')}))`)
+  }
 
   // Over-fetch: one Gmail message is up to ~4 rows (All Mail, INBOX, Sent, Important).
   const fetchN = Math.min(2000, lim * 6)
@@ -296,7 +304,7 @@ async function searchEmails({ from = '', participant = '', subject = '', days = 
      LIMIT ${fetchN};
   `)
 
-  const own = p ? await ownAddresses() : null
+  if (p && !own) own = await ownAddresses()
   const pForms = p ? participantForms(p) : null
 
   const byKey = new Map()
@@ -329,6 +337,7 @@ async function searchEmails({ from = '', participant = '', subject = '', days = 
       cc: list(1),
       _rows: [{ rowid: r.rowid, mailbox }],
     }
+    if (fromMe) row.from_me = true
     if (p) {
       const isSender = Number(r.p_is_sender) === 1
       const fromMe = own.has(sender.toLowerCase())
