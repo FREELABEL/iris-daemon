@@ -17,7 +17,7 @@
 // anything in a message body or a node name. If either reaches innerHTML
 // unescaped, any peer that can send this operator a message can run script in
 // the page — and the page holds the bridge key in localStorage.
-const { chromium } = require('/Users/mayoalexander/.iris/bridge/node_modules/playwright')
+const { chromium } = require('playwright')
 const fs = require('fs')
 const KEY = fs.readFileSync(process.env.HOME + '/.iris/bridge-token', 'utf8').trim()
 
