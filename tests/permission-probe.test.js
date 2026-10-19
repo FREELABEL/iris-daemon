@@ -248,3 +248,18 @@ describe('a timeout is not a measurement', () => {
     }
   })
 })
+
+describe('docker (#190056)', () => {
+  it('is reported under its own name too, from the SAME measurement as isolation', async () => {
+    // Scripts declare `requires=docker`; this daemon called the same fact `isolation`, so a node
+    // whose docker works was never routed a docker script (iris scripts doctor: "not advertised").
+    const out = await probePermissions(io({ exec: (cmd) => (cmd === 'docker' ? '29.1.3' : 'v1') }))
+    assert.equal(out.docker.available, true)
+    assert.equal(out.docker.available, out.isolation.available)
+  })
+
+  it('is not available when the runtime is down — never true on the alias alone', async () => {
+    const out = await probePermissions(io({ exec: (cmd) => { if (cmd === 'docker') { const e = new Error('down'); e.code = 1; throw e } return 'v1' } }))
+    assert.notEqual(out.docker.available, true)
+  })
+})

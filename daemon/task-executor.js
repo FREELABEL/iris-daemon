@@ -2263,7 +2263,9 @@ class TaskExecutor {
             outputDir: workspace.outputDir || path.join(workspace.dir, '.output'),
             manifest: script.manifest || task.config?.manifest || {},
             policy: nodePolicyFromEnv(),
-            isolation: await getIsolationState()
+            isolation: await getIsolationState(),
+            // #190056: an approved hardware run may leave the sandbox on a personal node.
+            gate: task.config?.gate
           })
 
           if (plan.mode === 'refused') {
