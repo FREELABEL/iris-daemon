@@ -20,6 +20,7 @@ const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL
 function sendDiscordAlert(message: string): Promise<void> {
   return new Promise((resolve) => {
     const body = JSON.stringify({ content: message });
+    if (!DISCORD_WEBHOOK) { console.log('  (no Discord webhook configured: alert skipped)'); return resolve(); }
     const url = new URL(DISCORD_WEBHOOK);
     const req = https.request({
       hostname: url.hostname,

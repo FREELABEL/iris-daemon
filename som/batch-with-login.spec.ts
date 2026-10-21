@@ -115,6 +115,7 @@ async function readRowAttrs(row: Locator): Promise<RowAttrs> {
 function sendDiscordAlert(message: string): Promise<void> {
   return new Promise((resolve) => {
     const body = JSON.stringify({ content: message });
+    if (!DISCORD_WEBHOOK) { console.log('  (no Discord webhook configured: alert skipped)'); return resolve(); }
     const url = new URL(DISCORD_WEBHOOK);
     const req = https.request({
       hostname: url.hostname,
@@ -200,6 +201,7 @@ function sendDiscordBatchSummary(opts: {
   const body = JSON.stringify(payload);
 
   return new Promise((resolve) => {
+    if (!DISCORD_WEBHOOK) { console.log('  (no Discord webhook configured: alert skipped)'); return resolve(); }
     const url = new URL(DISCORD_WEBHOOK);
     const req = https.request({
       hostname: url.hostname,
