@@ -776,6 +776,36 @@ async function main() {
     }
   } catch {}
 
+  // ── Which campaigns are on comes from the live switch, not the cache (#190302) ──
+  if (!useAll) {
+    let live;
+    try {
+      live = await somConfig.fetchLiveCampaigns({ apiUrl: API_BASE, token: API_TOKEN });
+    } catch (err) {
+      if (!onlyCampaigns) {
+        console.error(`\x1b[31m✖ Could not read which campaigns are on (${err.message}).\x1b[0m`);
+        console.error('  Not guessing from the local cache: it has run switched-off campaigns before.');
+        console.error('  Check the network and HEYIRIS_TOKEN, or name campaigns with only=<a,b>.');
+        process.exit(1);
+      }
+    }
+    if (live) {
+      const { registry, turnedOff } = somConfig.applyLiveActive(campaignRegistry, live);
+      for (const [id, c] of Object.entries(registry)) campaignRegistry[id].active = c.active;
+      if (turnedOff.length) console.log(`  [campaigns] switched off, skipping: ${turnedOff.join(', ')}`);
+      if (onlyCampaigns) {
+        const off = campaigns.filter(c => !campaignRegistry[c].active);
+        if (off.length) console.log(`  ⚠️  Named but switched off (running anyway because you asked): ${off.join(', ')}`);
+      } else {
+        campaigns = Object.entries(campaignRegistry).filter(([, v]) => v.active).map(([k]) => k);
+        if (campaigns.length === 0) {
+          console.log('\n  No campaigns are switched on (iris som status). Nothing to run.');
+          process.exit(0);
+        }
+      }
+    }
+  }
+
   const modeLabel = parallel ? 'PARALLEL' : 'SEQUENTIAL';
   const loopLabel = maxLoops > 0 ? ` x${maxLoops}` : repeatMs ? ' (∞)' : '';
   const repeatLabel = repeatMs ? ` every ${formatDuration(repeatMs)}` : '';

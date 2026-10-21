@@ -7,6 +7,7 @@ import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
+import { leadSource } from './lead-selection';
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
@@ -602,7 +603,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   // ── API-DIRECT MODE: only when MODE=api AND we have API-filtered IDs ──
   // MODE=ui (default): full UI flow with Apply Strategy + step tracking
   // MODE=api: fast direct navigation, skips UI table scan
-  const useApiDirect = SOM_MODE === 'api' && !!(apiFilteredIds && apiFilteredIds.size > 0);
+  let useApiDirect = leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: -1 }) === 'api';
   if (useApiDirect) {
     console.log(`⚡ API-DIRECT MODE: ${apiFilteredIds!.size} leads from API — skipping UI table scan\n`);
   }
@@ -686,6 +687,12 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     }
   }
   } // end if (!useApiDirect) — UI scanning block
+
+  // The API's fresh leads were not among the rows the scan reached: open them by id (#190296).
+  if (!useApiDirect && leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: eligibleRows.length }) === 'api-fallback') {
+    console.log(`⚡ ${apiFilteredIds!.size} fresh lead(s) from the API are not in the ${scannedUpTo} rows scanned — opening them directly\n`);
+    useApiDirect = true;
+  }
 
   // ── API-DIRECT: skip row scanning, process leads directly from API IDs ──
   if (useApiDirect && apiFilteredIds && apiFilteredIds.size > 0) {
