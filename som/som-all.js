@@ -721,9 +721,10 @@ async function main() {
     try {
       const lock = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf-8'));
       const age = Date.now() - lock.started;
-      const maxAge = 30 * 60 * 1000; // 30 min stale threshold
+      // A live batch under 30 min old holds it; a dead PID's lock is stale at any age (#190291).
+      const { lockVerdict } = require('./som-lock');
 
-      if (age < maxAge) {
+      if (lockVerdict(lock) === 'busy') {
         console.log('');
         console.log('  ╔══════════════════════════════════════════════════╗');
         console.log('  ║  ⏭  SOM BATCH ALREADY RUNNING — EXITING        ║');
@@ -733,7 +734,7 @@ async function main() {
         console.log('');
         process.exit(0);
       } else {
-        console.log(`  ⚠️  Stale lock (${formatDuration(age)} old, PID ${lock.pid}) — removing`);
+        console.log(`  ⚠️  Stale lock (${formatDuration(age)} old, PID ${lock.pid}, not running) — removing`);
         fs.unlinkSync(LOCK_FILE);
       }
     } catch {
