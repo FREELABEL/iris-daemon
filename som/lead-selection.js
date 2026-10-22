@@ -11,4 +11,15 @@ function leadSource ({ mode, allowListSize, uiEligible }) {
   return uiEligible === 0 ? 'api-fallback' : 'ui'
 }
 
-module.exports = { leadSource }
+// The API's "no outreach" list still holds leads DM'd before outreach steps were tracked; the
+// batch finds their [SOM DM] note and skips them. So fetch a wide pool, and count only sends and
+// failures against the batch size: on 2026-10-22, limit=1 tried one such lead and sent nothing.
+function candidateFetchSize (leadsToProcess) {
+  return Math.min(Math.max(leadsToProcess * 10, 50), 500)
+}
+
+function directQuotaReached ({ sent, failed }, limit) {
+  return sent + failed >= limit
+}
+
+module.exports = { leadSource, candidateFetchSize, directQuotaReached }

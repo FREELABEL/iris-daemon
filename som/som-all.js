@@ -587,7 +587,7 @@ async function countdown(totalMs) {
 
 function runCampaign(campaign, index, total) {
   const reg = campaignRegistry[campaign] || { color: '', label: campaign };
-  const prefix = `${reg.color}[${campaign.padEnd(10)}]${reset}`;
+  const prefix = `${reg.color || ''}[${campaign.padEnd(10)}]${reset}`;
 
   return new Promise((resolve) => {
     console.log(`${prefix} ── Campaign ${index + 1}/${total}: ${reg.label} ──\n`);
@@ -668,7 +668,7 @@ runAllParallel.__raw = function(campaignList) {
     for (let i = 0; i < campaignList.length; i++) {
       const campaign = campaignList[i];
       const reg = campaignRegistry[campaign] || { color: '', label: campaign };
-      const prefix = `${reg.color}[${campaign.padEnd(10)}]${reset}`;
+      const prefix = `${reg.color || ''}[${campaign.padEnd(10)}]${reset}`;
 
       // Stagger launches — each campaign starts 5s after the previous one
       setTimeout(() => {
