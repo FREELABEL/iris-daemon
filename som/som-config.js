@@ -167,6 +167,35 @@ function getDaemonConfigs () {
   return result
 }
 
+// ─── LIVE ON/OFF (#190302) ───────────────────────────────────────────────────
+// `iris som toggle` writes the switch to fl-api's /api/v1/som/campaigns. The disk cache comes
+// from campaign templates whose flag never changes, so it said all 9 campaigns were on while 2
+// were. The live list decides; a campaign it does not list is off.
+function applyLiveActive (registry, liveList) {
+  const on = new Map((liveList || []).map(c => [c.name, !!c.active]))
+  const out = {}
+  const turnedOff = []
+  for (const [id, c] of Object.entries(registry)) {
+    const active = on.get(id) === true
+    if (c.active && !active) turnedOff.push(id)
+    out[id] = { ...c, active }
+  }
+  return { registry: out, turnedOff }
+}
+
+async function fetchLiveCampaigns ({ apiUrl, token } = {}) {
+  apiUrl = apiUrl || process.env.IRIS_FL_API_URL || process.env.SOM_API_URL || 'https://raichu.heyiris.io'
+  if (!token) throw new Error('no API token')
+  const res = await fetch(`${apiUrl.replace(/\/$/, '')}/api/v1/som/campaigns`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const list = (await res.json())?.data?.campaigns
+  if (!Array.isArray(list)) throw new Error('response has no campaign list')
+  return list
+}
+
 // Inspect resolution — useful for debugging "why is this campaign behaving differently?"
 function getResolutionSource () {
   if (fs.existsSync(cacheFile)) {
@@ -346,5 +375,7 @@ module.exports = {
   getDaemonConfigs,
   getResolutionSource,
   syncFromApi,
+  applyLiveActive,
+  fetchLiveCampaigns,
   preflightCheck,
 }
