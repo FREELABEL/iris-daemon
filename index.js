@@ -3360,6 +3360,8 @@ async function findLiveSessionServer(sid, timeoutMs = 1500) {
 
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const { message, submit, from } = req.body
+  // Structured provenance (#190650), re-checked here: it arrives over HTTP and is not trusted as-is.
+  const provenance = require('./lib/message-provenance').cleanProvenance(req.body && req.body.provenance)
   const sid = req.params.id
 
   const base = await findLiveSessionServer(sid)
@@ -3389,9 +3391,11 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
     // actual requirement — a reader can tell — in every renderer today, and greps cleanly.
     const text = from ? `[via iris \u00b7 ${String(from).slice(0, 64)}] ${message}` : message
 
+    // The visible prefix stays (every renderer shows it); the structured record travels with the part.
+    const part = provenance ? { type: 'text', text, metadata: { iris_provenance: provenance } } : { type: 'text', text }
     const body = submit
-      ? { parts: [{ type: 'text', text }] }
-      : { noReply: true, parts: [{ type: 'text', text }] }
+      ? { parts: [part] }
+      : { noReply: true, parts: [part] }
 
     console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
     const msgUrl = `${base}/session/${encodeURIComponent(sid)}/message`

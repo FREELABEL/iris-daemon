@@ -4087,7 +4087,12 @@ exit 1
           }
           const msgBody = (isAnswer
             ? JSON.stringify({ answers: sessionConfig.answers })
-            : JSON.stringify({ message: task.prompt, from: senderLabel })).replace(/'/g, "'\\''")
+            : JSON.stringify({
+              message: task.prompt,
+              from: senderLabel,
+              // Who sent it, from where, on which model, on whose usage — beside the visible prefix (#190650)
+              provenance: require('../lib/message-provenance').provenanceOf(task, sessionConfig)
+            })).replace(/'/g, "'\\''")
           const route = isAnswer ? 'answer' : 'message'
           // --fail-with-body for answers: a refusal (409 "not on screen", "not in tmux") must still
           // fail the task AND carry its reason back. Plain -f drops the body, and the person would
