@@ -195,3 +195,26 @@ test('the whole check fits inside a heartbeat: every call gets a timeout', async
   await opencodeActivity({ sessions: [sess('a', '/code/a', 1000)], servers: ['http://s1', 'http://s2'], fetchJson, now: NOW })
   assert.ok(seen.length === 2 && seen.every((t) => Number.isFinite(t) && t > 0 && t <= 2000), JSON.stringify(seen))
 })
+
+// #190954 — idle is provable for a row that names the server it lives on.
+test('idle: the row\'s OWN server answered for its directory and did not list it', async () => {
+  const D = '/Users/me/code'
+  const mine = { ...sess('ses_quiet', D, 60_000), server: 'http://127.0.0.1:49244' }
+  const busy = { ...sess('ses_busy', D, 60_000), server: 'http://127.0.0.1:49244' }
+  const elsewhere = { ...sess('ses_other', D, 60_000), server: 'http://127.0.0.1:4096' } // its server did not answer
+  const anon = sess('ses_noserver', D, 60_000) // no server named: absence proves nothing
+  const { fetchJson } = fleet({ 'http://127.0.0.1:49244': { [D]: { ses_busy: { type: 'busy' } } } })
+  const r = await opencodeActivity({ sessions: [mine, busy, elsewhere, anon], servers: ['http://127.0.0.1:49244', 'http://127.0.0.1:4096'], fetchJson, now: NOW })
+  assert.strictEqual(r.activity.ses_quiet, 'idle')
+  assert.strictEqual(r.activity.ses_busy, 'working')
+  assert.strictEqual(r.activity.ses_other, undefined)
+  assert.strictEqual(r.activity.ses_noserver, undefined)
+})
+
+test('sessionActivity: a measured idle chat touched a minute ago reads idle, not active', () => {
+  const { sessionActivity } = require('../daemon/session-status')
+  const r = sessionActivity({ updated_at: ago(60_000), activity: 'idle' }, NOW)
+  assert.deepStrictEqual(r, { status: 'idle', activity: 'idle' })
+  assert.strictEqual(sessionActivity({ updated_at: ago(60_000), activity: 'working' }, NOW).status, 'active')
+  assert.deepStrictEqual(sessionActivity({ updated_at: ago(60_000) }, NOW), { status: 'active', activity: null })
+})
