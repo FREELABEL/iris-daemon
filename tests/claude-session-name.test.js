@@ -56,3 +56,21 @@ test('nothing usable falls back to the project folder, then a generic name', () 
   assert.strictEqual(extractSessionName([cmd('recap'), 'not json', JSON.stringify({ type: 'assistant' })], '/Users/me/sites/freelabel/'), 'freelabel')
   assert.strictEqual(extractSessionName([], null), 'Coding Session')
 })
+
+// #190881 — the session's own title outranks its first prompt.
+const { sessionTitle } = require('../lib/claude-session-name')
+const ai = (t) => JSON.stringify({ type: 'ai-title', aiTitle: t, sessionId: 's' })
+const custom = (t) => JSON.stringify({ type: 'custom-title', customTitle: t, sessionId: 's' })
+
+test('sessionTitle: a /rename title beats the generated one, newest of each wins, none is null', () => {
+  assert.strictEqual(sessionTitle([user('can you look into this ?'), ai('Logout failure and user complaints')]), 'Logout failure and user complaints')
+  assert.strictEqual(sessionTitle([ai('First guess'), user('x'), ai('Better title')]), 'Better title')
+  assert.strictEqual(sessionTitle([ai('Generated'), custom('Voice in Atlas Card'), ai('Generated again')]), 'Voice in Atlas Card')
+  assert.strictEqual(sessionTitle([user('just a prompt')]), null)
+  assert.strictEqual(sessionTitle(['{"type":"ai-title","aiTi', ai('  ')]), null)
+})
+
+test('wired: the claude-code listing asks for the title before the first prompt, over head AND tail', () => {
+  const BRIDGE = require('fs').readFileSync(require('path').join(__dirname, '..', 'index.js'), 'utf8')
+  assert.match(BRIDGE, /sessionTitle\(\[\.\.\.headLines, \.\.\.String\(tail \|\| ''\)\.split\('\\n'\)\]\) \|\|\s*extractSessionName\(headLines, projectPath\)/)
+})
