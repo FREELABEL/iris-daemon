@@ -3427,6 +3427,42 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   }
 })
 
+// Answer what an opencode / IRIS Desktop session is WAITING on — its permission prompt or question
+// (#190649). The engine holds the prompt; this replies to that exact request, never to a new turn.
+// Refuses with the reason when the session is not waiting or the choice does not fit — and never
+// turns an unrecognised choice into "allow".
+app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
+  const sid = req.params.id
+  try {
+    const base = await findLiveSessionServer(sid)
+    if (!base) return res.status(404).json({ error: `No live session server on this node is running ${sid}.`, session_id: sid })
+    const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sid)}`, 3000)
+    const dir = meta && meta.directory
+    if (!dir) return res.status(502).json({ error: 'the session server did not say which folder the session is in', session_id: sid })
+    const { pendingBySession, resolveAnswer } = require('./lib/opencode-pending')
+    const pending = (await pendingBySession({ servers: [base], directories: [dir], fetchJson: fetchJsonFromSessionServer })).get(sid)
+    if (!pending) return res.status(409).json({ error: 'This session is not waiting on a person right now — nothing to answer.', session_id: sid })
+    const r = resolveAnswer(pending.waiting, (req.body || {}).answers)
+    if (r.error) return res.status(400).json({ error: r.error, session_id: sid })
+    const url = `${base}/${r.path}?directory=${encodeURIComponent(dir)}`
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(url) },
+      body: JSON.stringify(r.body),
+      signal: AbortSignal.timeout(8000)
+    })
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '')
+      return res.status(502).json({ error: `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
+    }
+    const delivered = pending.waiting.opencode.type === 'permission' ? `permission: ${r.body.reply}` : `answered ${r.body.answers.length} question(s)`
+    console.log(`[opencode] answer ${sid.slice(-8)} -> ${delivered}`)
+    res.json({ session_id: sid, status: 'delivered', delivered })
+  } catch (err) {
+    res.status(500).json({ error: err.message, session_id: sid })
+  }
+})
+
 app.get('/api/sessions/opencode/:id/history', async (req, res) => {
   const sessionId = req.params.id
   const limit = parseInt(req.query.limit) || 200
@@ -4143,6 +4179,16 @@ app.get('/api/sessions/opencode', async (req, res) => {
       const { opencodeActivity } = require('./lib/opencode-activity')
       const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
       for (const s of page) s.activity = live.activity[s.session_id] || null
+      // A permission prompt or question the engine is HOLDING for a person (#190649) — reported in
+      // the same `waiting` shape as Claude Code, so needs_you and `iris hive answer` just work.
+      // Only recently active directories are asked: asking loads an instance on that server.
+      const { pendingBySession } = require('./lib/opencode-pending')
+      const { ACTIVITY_WINDOW_MS } = require('./lib/opencode-activity')
+      const recentDirs = page
+        .filter((s) => s.project_path && Date.now() - Date.parse(s.updated_at || 0) <= ACTIVITY_WINDOW_MS)
+        .map((s) => s.project_path)
+      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: fetchJsonFromSessionServer })
+      for (const s of page) { const p = pending.get(s.session_id); if (p) s.waiting = p.waiting }
       return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
     }
 

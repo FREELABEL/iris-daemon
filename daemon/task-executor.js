@@ -4079,8 +4079,10 @@ exit 1
           // prompt itself (hook or tmux keystroke) and refuses — failing this task — when it cannot.
           // A message goes to /message as before. (#188549 S4)
           const isAnswer = sessionConfig.answers && typeof sessionConfig.answers === 'object'
-          if (isAnswer && providerSlug !== 'claude-code') {
-            reject(new Error(`answering a waiting question is only supported for Claude Code sessions, not ${sessionProvider}`))
+          // Claude Code (hook / tmux keystroke) and opencode / IRIS Desktop (the engine's own
+          // permission and question replies, #190649) can be answered; anything else cannot.
+          if (isAnswer && !['claude-code', 'opencode'].includes(providerSlug)) {
+            reject(new Error(`answering a waiting question is only supported for Claude Code and opencode sessions, not ${sessionProvider}`))
             return
           }
           const msgBody = (isAnswer
