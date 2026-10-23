@@ -3295,6 +3295,8 @@ function sessionServerCandidatesFrom(ports) {
   }
   add(process.env.IRIS_SERVER)
   add(process.env.OPENCODE_SERVER)
+  // Desktop's published engine first: it is the one that holds Desktop's sessions (#190647).
+  for (const e of require('./lib/engine-auth').publishedEngines()) add(e.base)
   for (const port of ports) add(`http://127.0.0.1:${port}`)
   add('http://127.0.0.1:4096')
   return out
@@ -3334,7 +3336,8 @@ function sessionServerCandidatesAsync() {
 
 // Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
 async function fetchJsonFromSessionServer (url, timeoutMs) {
-  const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  // With Desktop's password when it published one (#190647); no header otherwise, as before.
+  const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
   if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
   return r.json()
 }
@@ -3345,7 +3348,8 @@ async function fetchJsonFromSessionServer (url, timeoutMs) {
 async function findLiveSessionServer(sid, timeoutMs = 1500) {
   for (const base of sessionServerCandidates()) {
     try {
-      const r = await fetch(`${base}/session/${encodeURIComponent(sid)}`, { signal: AbortSignal.timeout(timeoutMs) })
+      const url = `${base}/session/${encodeURIComponent(sid)}`
+      const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
       if (!r.ok) continue
       const b = await r.json()
       if (b && typeof b === 'object' && b.id === sid) return base
@@ -3390,9 +3394,10 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
       : { noReply: true, parts: [{ type: 'text', text }] }
 
     console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
-    const r = await fetch(`${base}/session/${encodeURIComponent(sid)}/message`, {
+    const msgUrl = `${base}/session/${encodeURIComponent(sid)}/message`
+    const r = await fetch(msgUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(msgUrl) },
       body: JSON.stringify(body),
       // A notification returns as soon as it is persisted. A submit runs the recipient's model
       // turn synchronously, so it needs a turn-length budget or it reports failure on success.
