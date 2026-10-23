@@ -113,3 +113,15 @@ test('a long transcript keeps the NEWEST messages — it is opened to see what i
   const items = Array.from({ length: 10 }, (_, i) => ({ info: { role: 'user', time: { created: T + i } }, parts: [{ type: 'text', text: `m${i}` }] }))
   assert.deepEqual(historyFromServerMessages(items, 3).messages.map(m => m.text), ['m7', 'm8', 'm9'])
 })
+
+// #190957 — a page must say how much it left out. 10 of 257 entries read as the whole chat.
+test('historyFromServerMessages: messages_total is the whole session, summary counts all of it', () => {
+  const { historyFromServerMessages } = require('../lib/server-sessions')
+  const items = Array.from({ length: 6 }, (_, i) => ({ info: { role: i % 2 ? 'assistant' : 'user', time: { created: 1792771558371 + i } }, parts: [{ type: 'text', text: `m${i}` }] }))
+  const h = historyFromServerMessages(items, 2)
+  assert.strictEqual(h.messages.length, 2)
+  assert.strictEqual(h.messages_total, 6)
+  assert.strictEqual(h.summary.total_messages, 6)
+  const { omittedFrom } = require('../lib/session-history-request')
+  assert.strictEqual(omittedFrom(h.messages_total, 0, h.messages.length), 4)
+})
