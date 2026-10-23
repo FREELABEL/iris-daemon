@@ -28,7 +28,8 @@ test('no measurement keeps the timestamp-derived status and says so with null', 
 })
 
 test('an activity value the daemon does not recognise is dropped, not trusted', () => {
-  for (const bogus of ['busy', 'idle', 'waiting', 'WORKING', 1, true, {}]) {
+  // 'idle' is recognised since #190954 (measured on the row's own server) — see opencode-activity.test.js.
+  for (const bogus of ['busy', 'waiting', 'WORKING', 'IDLE', 1, true, {}]) {
     assert.deepStrictEqual(sessionActivity({ updated_at: ago(3 * 24 * 60 * 60 * 1000), activity: bogus }, NOW), { status: 'stale', activity: null }, String(bogus))
   }
 })

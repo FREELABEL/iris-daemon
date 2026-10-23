@@ -52,8 +52,11 @@ function deriveSessionStatus (updatedAt, now = Date.now()) {
  * `activity` is null: "not measured", never "waiting" — absence from every status map proves nothing.
  */
 function sessionActivity (s, now = Date.now()) {
-  const activity = s && (s.activity === 'working' || s.activity === 'retrying') ? s.activity : null
-  const derived = activity ? 'active' : deriveSessionStatus(s && s.updated_at, now)
+  const activity = s && (s.activity === 'working' || s.activity === 'retrying' || s.activity === 'idle') ? s.activity : null
+  // MEASURED idle (#190954) — its own server answered and it is not generating — beats a recent
+  // timestamp: a chat touched two minutes ago that finished its turn is idle, not "active".
+  const touched = deriveSessionStatus(s && s.updated_at, now)
+  const derived = activity === 'idle' ? (touched === 'active' ? 'idle' : touched) : activity ? 'active' : touched
   return {
     status: isWaitingOnPerson(s, derived) ? 'needs_you' : derived,
     activity
