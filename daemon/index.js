@@ -1507,6 +1507,11 @@ LIMIT ${limit}
       }
     })
 
+    // ── Files (whole-disk search, #188665) ──────────────────────────
+    // GET /api/files/search?q=&limit= — operator key required, honours hive_search.files=false,
+    // patient-data guard applied. `iris hive search` reaches it over ssh on the owner's mesh.
+    require('./file-search-policy').mount(app, prefix)
+
     // ── Apps (search + launch) ──────────────────────────────────────
     /**
      * GET /api/apps/search?query=<name>&limit=20

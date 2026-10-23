@@ -304,6 +304,14 @@ function capabilities () {
     out.mcp = { available: false, reason: `mcp registry probe failed: ${e.message}`, detail: null, functions: [] }
   }
 
+  // Whole-disk file search (#188665): on unless this node's owner turned it off. Callers read
+  // this to skip the node up front; the node still refuses on its own if they do not.
+  try {
+    out.file_search = require('./file-search-policy').capability()
+  } catch (e) {
+    out.file_search = { available: false, reason: `file search probe failed: ${e.message}`, detail: null, functions: ['search_files'] }
+  }
+
   for (const [key, provider] of Object.entries(PROVIDERS)) {
     let probe
     try {
