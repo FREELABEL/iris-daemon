@@ -169,7 +169,12 @@ const PROVIDERS = {
       // Either provider's storage is enough; a machine with neither has nothing to read.
       const claude = path.join(os.homedir(), '.claude', 'projects')
       const opencode = path.join(os.homedir(), '.local', 'share', 'opencode', 'storage', 'session')
-      if (exists(claude) || exists(opencode)) return { ok: true, detail: exists(claude) ? 'Claude Code' : 'opencode' }
+      // IRIS Desktop keeps its sessions in SQLite under ~/.iris/accounts/<id> (#190648)
+      const { desktopDataHomes, desktopDb } = require('../lib/desktop-sessions')
+      const desktop = desktopDataHomes().some((h) => desktopDb(h))
+      if (exists(claude) || exists(opencode) || desktop) {
+        return { ok: true, detail: exists(claude) ? 'Claude Code' : desktop ? 'IRIS Desktop' : 'opencode' }
+      }
       return { ok: false, reason: 'No Claude Code or opencode session storage on this machine' }
     },
     functions: {
