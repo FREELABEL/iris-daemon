@@ -3295,6 +3295,8 @@ function sessionServerCandidatesFrom(ports) {
   }
   add(process.env.IRIS_SERVER)
   add(process.env.OPENCODE_SERVER)
+  // Desktop's published engine first: it is the one that holds Desktop's sessions (#190647).
+  for (const e of require('./lib/engine-auth').publishedEngines()) add(e.base)
   for (const port of ports) add(`http://127.0.0.1:${port}`)
   add('http://127.0.0.1:4096')
   return out
@@ -3334,7 +3336,8 @@ function sessionServerCandidatesAsync() {
 
 // Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
 async function fetchJsonFromSessionServer (url, timeoutMs) {
-  const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  // With Desktop's password when it published one (#190647); no header otherwise, as before.
+  const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
   if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
   return r.json()
 }
@@ -3345,7 +3348,8 @@ async function fetchJsonFromSessionServer (url, timeoutMs) {
 async function findLiveSessionServer(sid, timeoutMs = 1500) {
   for (const base of sessionServerCandidates()) {
     try {
-      const r = await fetch(`${base}/session/${encodeURIComponent(sid)}`, { signal: AbortSignal.timeout(timeoutMs) })
+      const url = `${base}/session/${encodeURIComponent(sid)}`
+      const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
       if (!r.ok) continue
       const b = await r.json()
       if (b && typeof b === 'object' && b.id === sid) return base
@@ -3356,6 +3360,8 @@ async function findLiveSessionServer(sid, timeoutMs = 1500) {
 
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const { message, submit, from } = req.body
+  // Structured provenance (#190650), re-checked here: it arrives over HTTP and is not trusted as-is.
+  const provenance = require('./lib/message-provenance').cleanProvenance(req.body && req.body.provenance)
   const sid = req.params.id
 
   const base = await findLiveSessionServer(sid)
@@ -3385,14 +3391,17 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
     // actual requirement — a reader can tell — in every renderer today, and greps cleanly.
     const text = from ? `[via iris \u00b7 ${String(from).slice(0, 64)}] ${message}` : message
 
+    // The visible prefix stays (every renderer shows it); the structured record travels with the part.
+    const part = provenance ? { type: 'text', text, metadata: { iris_provenance: provenance } } : { type: 'text', text }
     const body = submit
-      ? { parts: [{ type: 'text', text }] }
-      : { noReply: true, parts: [{ type: 'text', text }] }
+      ? { parts: [part] }
+      : { noReply: true, parts: [part] }
 
     console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
-    const r = await fetch(`${base}/session/${encodeURIComponent(sid)}/message`, {
+    const msgUrl = `${base}/session/${encodeURIComponent(sid)}/message`
+    const r = await fetch(msgUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(msgUrl) },
       body: JSON.stringify(body),
       // A notification returns as soon as it is persisted. A submit runs the recipient's model
       // turn synchronously, so it needs a turn-length budget or it reports failure on success.
@@ -3418,6 +3427,42 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
     })
   } catch (err) {
     console.error(`[opencode] Message failed: ${err.message}`)
+    res.status(500).json({ error: err.message, session_id: sid })
+  }
+})
+
+// Answer what an opencode / IRIS Desktop session is WAITING on — its permission prompt or question
+// (#190649). The engine holds the prompt; this replies to that exact request, never to a new turn.
+// Refuses with the reason when the session is not waiting or the choice does not fit — and never
+// turns an unrecognised choice into "allow".
+app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
+  const sid = req.params.id
+  try {
+    const base = await findLiveSessionServer(sid)
+    if (!base) return res.status(404).json({ error: `No live session server on this node is running ${sid}.`, session_id: sid })
+    const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sid)}`, 3000)
+    const dir = meta && meta.directory
+    if (!dir) return res.status(502).json({ error: 'the session server did not say which folder the session is in', session_id: sid })
+    const { pendingBySession, resolveAnswer } = require('./lib/opencode-pending')
+    const pending = (await pendingBySession({ servers: [base], directories: [dir], fetchJson: fetchJsonFromSessionServer })).get(sid)
+    if (!pending) return res.status(409).json({ error: 'This session is not waiting on a person right now — nothing to answer.', session_id: sid })
+    const r = resolveAnswer(pending.waiting, (req.body || {}).answers)
+    if (r.error) return res.status(400).json({ error: r.error, session_id: sid })
+    const url = `${base}/${r.path}?directory=${encodeURIComponent(dir)}`
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(url) },
+      body: JSON.stringify(r.body),
+      signal: AbortSignal.timeout(8000)
+    })
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '')
+      return res.status(502).json({ error: `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
+    }
+    const delivered = pending.waiting.opencode.type === 'permission' ? `permission: ${r.body.reply}` : `answered ${r.body.answers.length} question(s)`
+    console.log(`[opencode] answer ${sid.slice(-8)} -> ${delivered}`)
+    res.json({ session_id: sid, status: 'delivered', delivered })
+  } catch (err) {
     res.status(500).json({ error: err.message, session_id: sid })
   }
 })
@@ -4138,6 +4183,16 @@ app.get('/api/sessions/opencode', async (req, res) => {
       const { opencodeActivity } = require('./lib/opencode-activity')
       const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
       for (const s of page) s.activity = live.activity[s.session_id] || null
+      // A permission prompt or question the engine is HOLDING for a person (#190649) — reported in
+      // the same `waiting` shape as Claude Code, so needs_you and `iris hive answer` just work.
+      // Only recently active directories are asked: asking loads an instance on that server.
+      const { pendingBySession } = require('./lib/opencode-pending')
+      const { ACTIVITY_WINDOW_MS } = require('./lib/opencode-activity')
+      const recentDirs = page
+        .filter((s) => s.project_path && Date.now() - Date.parse(s.updated_at || 0) <= ACTIVITY_WINDOW_MS)
+        .map((s) => s.project_path)
+      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: fetchJsonFromSessionServer })
+      for (const s of page) { const p = pending.get(s.session_id); if (p) s.waiting = p.waiting }
       return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
     }
 

@@ -4079,13 +4079,20 @@ exit 1
           // prompt itself (hook or tmux keystroke) and refuses — failing this task — when it cannot.
           // A message goes to /message as before. (#188549 S4)
           const isAnswer = sessionConfig.answers && typeof sessionConfig.answers === 'object'
-          if (isAnswer && providerSlug !== 'claude-code') {
-            reject(new Error(`answering a waiting question is only supported for Claude Code sessions, not ${sessionProvider}`))
+          // Claude Code (hook / tmux keystroke) and opencode / IRIS Desktop (the engine's own
+          // permission and question replies, #190649) can be answered; anything else cannot.
+          if (isAnswer && !['claude-code', 'opencode'].includes(providerSlug)) {
+            reject(new Error(`answering a waiting question is only supported for Claude Code and opencode sessions, not ${sessionProvider}`))
             return
           }
           const msgBody = (isAnswer
             ? JSON.stringify({ answers: sessionConfig.answers })
-            : JSON.stringify({ message: task.prompt, from: senderLabel })).replace(/'/g, "'\\''")
+            : JSON.stringify({
+              message: task.prompt,
+              from: senderLabel,
+              // Who sent it, from where, on which model, on whose usage — beside the visible prefix (#190650)
+              provenance: require('../lib/message-provenance').provenanceOf(task, sessionConfig)
+            })).replace(/'/g, "'\\''")
           const route = isAnswer ? 'answer' : 'message'
           // --fail-with-body for answers: a refusal (409 "not on screen", "not in tmux") must still
           // fail the task AND carry its reason back. Plain -f drops the body, and the person would
