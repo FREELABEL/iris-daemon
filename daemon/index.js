@@ -3014,6 +3014,10 @@ LIMIT ${limit}
         }
       }
 
+      // A provider that timed out this cycle keeps its last known rows rather than vanishing from
+      // the fleet until the next good cycle (#190956). Still named in `unreachable` below.
+      sessions.push(...require('./session-status').carryUnreachable(this._cachedSessions, unreachable))
+
       // Freshest first, so anything that truncates downstream keeps live work rather than
       // whichever fossils happened to sort first.
       sessions.sort((a, b) => Date.parse(b.updated_at || 0) - Date.parse(a.updated_at || 0))
