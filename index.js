@@ -3421,6 +3421,10 @@ app.get('/api/sessions/opencode/:id/history', (req, res) => {
   const msgDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'message', sessionId)
 
   if (!fs.existsSync(msgDir)) {
+    // Not in the legacy files: an IRIS Desktop session lives in its SQLite (#190648).
+    const { desktopSessionHistory } = require('./lib/desktop-sessions')
+    const desktop = desktopSessionHistory(sessionId, { limit })
+    if (desktop) return res.json(desktop)
     return res.status(404).json({ error: `OpenCode session ${sessionId} not found` })
   }
 
@@ -4034,15 +4038,12 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 app.get('/api/sessions/opencode', async (req, res) => {
   try {
     const ocDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'session')
-    if (!fs.existsSync(ocDir)) {
-      return res.json({ sessions: [] })
-    }
-
     const limit = parseInt(req.query.limit) || 50
     const sessions = []
 
-    // Scan all project dirs for session JSON files
-    const projectDirs = fs.readdirSync(ocDir).filter(d => {
+    // Scan all project dirs for session JSON files (the legacy layout; IRIS Desktop's own
+    // sessions are read from its SQLite below — #190648)
+    const projectDirs = !fs.existsSync(ocDir) ? [] : fs.readdirSync(ocDir).filter(d => {
       try { return fs.statSync(path.join(ocDir, d)).isDirectory() } catch { return false }
     })
 
@@ -4085,9 +4086,14 @@ app.get('/api/sessions/opencode', async (req, res) => {
       }
     }
 
-    // Sort by most recent update, limit
-    sessions.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
-    const page = sessions.slice(0, limit)
+    // IRIS Desktop keeps its sessions in SQLite under ~/.iris/accounts/<id>, not in the files
+    // above: without this, Hive listed 25 opencode sessions on a Mac, none of them Desktop's,
+    // while 15 Desktop sessions active that week were invisible (#190648).
+    const { listDesktopSessions, mergeSessions } = require('./lib/desktop-sessions')
+    const desktop = listDesktopSessions({ limit, readGitBranch })
+
+    // Sort by most recent update, limit (one row per session id; Desktop's wins)
+    const page = mergeSessions(sessions, desktop, limit)
 
     // `?live=1`: ask the servers RUNNING these sessions which are working right now (epic
     // #185632, step 4b). `updated_at` can only say a file changed recently; opencode's
