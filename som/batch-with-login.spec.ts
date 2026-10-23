@@ -7,7 +7,7 @@ import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
-import { leadSource, candidateFetchSize, directQuotaReached } from './lead-selection';
+import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
@@ -310,6 +310,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   if (!IS_LINKEDIN && igFile) {
     console.log('Validating Instagram session...');
     const checkPage = await context.newPage();
+    let humanCheckBlocked = false;
     try {
       await checkPage.goto('https://www.instagram.com/', { timeout: 15000, waitUntil: 'domcontentloaded' });
       await checkPage.waitForTimeout(1500);
@@ -319,7 +320,25 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       // Detect the logged-out splash page ("Log in or Sign up" with no nav)
       const hasLoggedOutSplash = await checkPage.locator('a:has-text("Log in"), button:has-text("Log in")').first().isVisible({ timeout: 1000 }).catch(() => false)
         && !(await checkPage.locator('svg[aria-label="Home"]').isVisible({ timeout: 500 }).catch(() => false));
-      if (onLogin || hasForm || hasLoggedOutSplash) {
+      // Logged in but locked: Instagram sends every page to /accounts/suspended/ ("Confirm you're
+      // human to use your account") until a person confirms on their phone. That page has no login
+      // form, so it used to pass as a valid session and every lead then failed (#190636).
+      const humanCheck = checkUrl.includes('/accounts/suspended')
+        || await checkPage.getByText(/confirm you.re human/i).first().isVisible({ timeout: 1000 }).catch(() => false);
+      if (humanCheck) {
+        console.log(`\n${'='.repeat(70)}`);
+        console.log(`  ACCOUNT LOCKED: @${IG_ACCOUNT} — Instagram wants a human check`);
+        console.log(`  Fix: open Instagram on your phone as @${IG_ACCOUNT} and confirm it's you, then rerun.`);
+        console.log(`${'='.repeat(70)}\n`);
+        fs.mkdirSync('test-results/screenshots', { recursive: true });
+        await checkPage.screenshot({ path: `test-results/screenshots/human-check-preflight-${IG_ACCOUNT}.png` }).catch(() => {});
+        await sendDiscordAlert(
+          `**SOM — Instagram wants a human check (preflight)**\n` +
+          `Account: \`@${IG_ACCOUNT}\` | Board: \`${BOARD_ID}\`\n` +
+          `Every page redirects to "Confirm you're human". Open Instagram on your phone as @${IG_ACCOUNT} and confirm. No DMs sent.`
+        );
+        humanCheckBlocked = true;
+      } else if (onLogin || hasForm || hasLoggedOutSplash) {
         console.log(`\n${'='.repeat(70)}`);
         console.log(`  SESSION EXPIRED: @${IG_ACCOUNT}`);
         console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`);
@@ -334,11 +353,15 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         await checkPage.close();
         return; // Abort entire test
       }
-      console.log(`Instagram session valid for @${IG_ACCOUNT}`);
+      if (!humanCheckBlocked) console.log(`Instagram session valid for @${IG_ACCOUNT}`);
     } catch (err: any) {
       console.log(`IG preflight check failed: ${err.message?.substring(0, 60)} — continuing anyway`);
     }
     await checkPage.close().catch(() => {});
+    // Fail the run (not a quiet return) so the dispatcher reports it instead of "0 sent".
+    if (humanCheckBlocked) {
+      throw new Error(`Instagram account @${IG_ACCOUNT} is behind "Confirm you're human" — confirm it on your phone, then rerun`);
+    }
   }
 
   // ── PREFLIGHT: validate LinkedIn session before wasting time loading workspace ──
@@ -496,6 +519,19 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   // Per-lead eligibility (hasDmNote, hasReply, igHandle, id) is read from the rendered
   // workspace UI via data-* attributes — no leadMap, no 200-cap, no API fanout.
   const apiClient = new LeadgenApiClient(TOKEN, BOARD_ID);
+  if (DRY_RUN) {
+    // A dry run reads leads and never writes to them: on 2026-10-22 one left [SOM FAIL] notes that
+    // put two real leads on a 3-day cooldown (#190637). Every write goes through here, so stub them.
+    const wouldWrite = (what: string) => async (leadId: number, arg?: any): Promise<any> => {
+      const detail = typeof arg === 'string' ? arg : JSON.stringify(arg ?? '');
+      console.log(`    [DRY] Would ${what} on lead #${leadId}: ${detail.substring(0, 120)}`);
+      return { success: true, message: 'dry run — not written' };
+    };
+    apiClient.addNote = wouldWrite('add note');
+    apiClient.updateLead = wouldWrite('update lead');
+    apiClient.recordDmSent = wouldWrite('record DM');
+    apiClient.completeStep = wouldWrite('complete step');
+  }
   const enrichStats = { checked: 0, enriched: 0, emailsFound: 0, alreadyHad: 0 };
 
   // ── NAVIGATE ──
@@ -536,6 +572,9 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   // reaches ~500 leads. Instead, fetch eligible lead IDs from the API and use them as
   // an allow-list when scanning the UI. This way we skip already-outreached leads.
   let apiFilteredIds: Set<number> | null = null;
+  // Which list the candidates came from and how far through it we are, so API-direct can ask
+  // for the next page when old DMs eat the pool (#190638).
+  let candidatePaging: { url: string; page: number; lastPage: number } | null = null;
   const apiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io';
   const apiToken = TOKEN;
 
@@ -560,8 +599,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       // has_social=1 filters to leads with IG/social handles (skips non-DM-able leads like law firms)
       const socialFilter = IS_LINKEDIN ? '' : '&has_social=1';
       const perPage = candidateFetchSize(LEADS_TO_PROCESS);
-      const freshRes = await fetch(
-        `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=no_outreach${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`,
+      const freshUrl = `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=no_outreach${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`;
+      const freshRes = await fetch(freshUrl,
         { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
       );
       if (freshRes.ok) {
@@ -569,14 +608,15 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         const leads = freshData.data?.data || freshData.data || [];
         const ids = leads.map((l: any) => l.id).filter(Boolean);
         apiFilteredIds = new Set(ids);
+        candidatePaging = { url: freshUrl, page: 1, lastPage: freshData.last_page || freshData.data?.last_page || 1 };
         const totalFresh = freshData.data?.total || freshData.total || ids.length;
         console.log(`✓ API fresh leads: ${apiFilteredIds.size} without outreach (${totalFresh} total on board)`);
         if (apiFilteredIds.size === 0) {
           // No fresh leads — try not_contacted (have steps assigned but none completed yet)
           console.log('⚠️  No fresh leads. Checking for leads with incomplete outreach steps...');
           try {
-            const pendingRes = await fetch(
-              `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=not_contacted${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`,
+            const pendingUrl = `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=not_contacted${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`;
+            const pendingRes = await fetch(pendingUrl,
               { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
             );
             if (pendingRes.ok) {
@@ -585,6 +625,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
               const pendingIds = pendingLeads.map((l: any) => l.id).filter(Boolean);
               if (pendingIds.length > 0) {
                 apiFilteredIds = new Set(pendingIds);
+                candidatePaging = { url: pendingUrl, page: 1, lastPage: pendingData.last_page || pendingData.data?.last_page || 1 };
                 console.log(`✓ Found ${apiFilteredIds.size} leads with incomplete outreach — using those instead`);
               } else {
                 console.log('⚠️  All leads fully contacted. Run leadgen to discover more.');
@@ -705,8 +746,31 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     const leadTimings: { name: string; duration: number; status: string }[] = [];
     const batchStart = Date.now();
 
-    for (let idx = 0; idx < apiLeadIds.length; idx++) {
+    // Next page of the same list, minus leads already seen. False when there is nothing more to try.
+    const fetchMoreCandidates = async (): Promise<boolean> => {
+      while (candidatePaging && shouldFetchNextPage(candidatePaging)) {
+        candidatePaging.page++;
+        try {
+          const res = await fetch(`${candidatePaging.url}&page=${candidatePaging.page}`,
+            { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } });
+          if (!res.ok) { console.log(`  Next candidate page failed: ${res.status}`); return false; }
+          const body = await res.json();
+          const more = (body.data?.data || body.data || []).map((l: any) => l.id).filter((id: number) => id && !apiLeadIds.includes(id));
+          if (more.length === 0) continue;
+          apiLeadIds.push(...more);
+          console.log(`\n⚡ ${results.sent + results.failed}/${directLimit} done after ${apiLeadIds.length - more.length} candidates — fetched page ${candidatePaging.page}/${candidatePaging.lastPage} (+${more.length})`);
+          return true;
+        } catch (e: any) {
+          console.log(`  Next candidate page failed: ${e.message}`);
+          return false;
+        }
+      }
+      return false;
+    };
+
+    for (let idx = 0; ; idx++) {
       if (directQuotaReached(results, directLimit)) break;
+      if (idx >= apiLeadIds.length && !(await fetchMoreCandidates())) break;
       const leadId = apiLeadIds[idx];
       const leadStart = Date.now();
       console.log(`\n━━━ Lead ${idx + 1}/${apiLeadIds.length} (ID: ${leadId}) ━━━\n`);
