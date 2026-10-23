@@ -4091,7 +4091,10 @@ exit 1
               message: task.prompt,
               from: senderLabel,
               // Who sent it, from where, on which model, on whose usage — beside the visible prefix (#190650)
-              provenance: require('../lib/message-provenance').provenanceOf(task, sessionConfig)
+              provenance: require('../lib/message-provenance').provenanceOf(task, sessionConfig),
+              // `submit` makes the session take a turn on the message (#190671 — `iris hive ask`).
+              // Strictly true: anything else stays a notification, which spends nobody's tokens.
+              submit: sessionConfig.submit === true
             })).replace(/'/g, "'\\''")
           const route = isAnswer ? 'answer' : 'message'
           // --fail-with-body for answers: a refusal (409 "not on screen", "not in tmux") must still

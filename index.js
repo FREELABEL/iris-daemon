@@ -3398,15 +3398,21 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
       : { noReply: true, parts: [part] }
 
     console.log(`[opencode] Live delivery to ${sid} via ${base}${submit ? ' (submit)' : ''}`)
-    const msgUrl = `${base}/session/${encodeURIComponent(sid)}/message`
-    const r = await fetch(msgUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(msgUrl) },
-      body: JSON.stringify(body),
-      // A notification returns as soon as it is persisted. A submit runs the recipient's model
-      // turn synchronously, so it needs a turn-length budget or it reports failure on success.
-      signal: AbortSignal.timeout(submit ? 180000 : 8000)
-    })
+    const post = (route, timeoutMs) => {
+      const url = `${base}/session/${encodeURIComponent(sid)}/${route}`
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...require('./lib/engine-auth').engineHeaders(url) },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs)
+      })
+    }
+    // A submit QUEUES the turn (prompt_async answers 204 at once) and the caller follows the reply
+    // through the transcript (#190671). Waiting on /message held the node task — and the person's
+    // terminal — for the whole model turn, and a turn longer than the budget reported failure on
+    // success. An engine without prompt_async (404) still gets the old synchronous call.
+    let r = submit ? await post('prompt_async', 15000) : await post('message', 8000)
+    if (submit && r.status === 404) r = await post('message', 180000)
 
     if (!r.ok) {
       const t = await r.text().catch(() => '')
