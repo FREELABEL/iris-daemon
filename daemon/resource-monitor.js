@@ -16,7 +16,7 @@
  */
 
 const os = require('os')
-const { execSync } = require('child_process')
+const { exec } = require('child_process')
 const EventEmitter = require('events')
 
 // ── Capacity thresholds (CPU % and battery %) ────────────────────────
@@ -133,38 +133,47 @@ class ResourceMonitor extends EventEmitter {
   }
 
   /**
-   * Check macOS battery state via pmset.
-   * Returns { onBattery: boolean, percent: number|null }
+   * Battery state, { onBattery, percent } — the LAST reading, refreshed in the background (#191011).
+   *
+   * This ran `pmset -g batt` (or PowerShell on Windows) with execSync on every poll, so the whole
+   * daemon — heartbeat, bridge, session lookups — waited on it. pmset takes 20 ms on an idle Mac;
+   * at load 15-27 (measured 2026-10-23) every synchronous child waits seconds for CPU, and the
+   * daemon froze for up to 9.5 s at a time, often enough that the Mac stopped reporting its chats.
+   * A battery reading one poll old is fine; a frozen daemon is not.
    */
   _checkBattery () {
-    if (os.platform() === 'darwin') {
-      try {
-        const output = execSync('pmset -g batt 2>/dev/null', { encoding: 'utf-8', timeout: 5000 })
-        const onBattery = /Battery Power/i.test(output) && !/AC Power/i.test(output.split('\n')[0])
-        const pctMatch = output.match(/(\d+)%/)
-        const percent = pctMatch ? parseInt(pctMatch[1], 10) : null
-        return { onBattery, percent }
-      } catch {
-        return { onBattery: false, percent: null }
-      }
+    const cmd = batteryCommand(os.platform())
+    if (cmd && !this._batteryInFlight) {
+      this._batteryInFlight = true
+      exec(cmd, { encoding: 'utf-8', timeout: 5000 }, (err, out) => {
+        this._batteryInFlight = false
+        if (!err) this._battery = parseBattery(os.platform(), out)
+      })
     }
-
-    if (os.platform() === 'win32') {
-      try {
-        const output = execSync('powershell -Command "(Get-CimInstance Win32_Battery | Select-Object -First 1 | ConvertTo-Json)" 2>nul', { encoding: 'utf-8', timeout: 5000 })
-        const batt = JSON.parse(output)
-        // BatteryStatus: 1=discharging, 2=AC, 3-5=charging variants
-        const onBattery = batt.BatteryStatus === 1
-        const percent = batt.EstimatedChargeRemaining ?? null
-        return { onBattery, percent }
-      } catch {
-        return { onBattery: false, percent: null }
-      }
-    }
-
-    // Linux or unknown
-    return { onBattery: false, percent: null }
+    return this._battery || { onBattery: false, percent: null }
   }
 }
 
-module.exports = { ResourceMonitor }
+function batteryCommand (platform) {
+  if (platform === 'darwin') return 'pmset -g batt 2>/dev/null'
+  if (platform === 'win32') return 'powershell -Command "(Get-CimInstance Win32_Battery | Select-Object -First 1 | ConvertTo-Json)" 2>nul'
+  return null
+}
+
+function parseBattery (platform, output) {
+  try {
+    if (platform === 'darwin') {
+      const onBattery = /Battery Power/i.test(output) && !/AC Power/i.test(String(output).split('\n')[0])
+      const pctMatch = String(output).match(/(\d+)%/)
+      return { onBattery, percent: pctMatch ? parseInt(pctMatch[1], 10) : null }
+    }
+    if (platform === 'win32') {
+      const batt = JSON.parse(output)
+      // BatteryStatus: 1=discharging, 2=AC, 3-5=charging variants
+      return { onBattery: batt.BatteryStatus === 1, percent: batt.EstimatedChargeRemaining ?? null }
+    }
+  } catch { /* unparseable — no battery reading */ }
+  return { onBattery: false, percent: null }
+}
+
+module.exports = { ResourceMonitor, parseBattery, batteryCommand }

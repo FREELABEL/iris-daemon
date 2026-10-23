@@ -4131,20 +4131,32 @@ app.get('/api/sessions/opencode', async (req, res) => {
       try { return fs.statSync(path.join(ocDir, d)).isDirectory() } catch { return false }
     })
 
+    // The NEWEST `limit` files, chosen by mtime BEFORE anything is read (#191011). This read every
+    // file — 232 on a measured Mac, each with a readdir of its messages and a read of its newest
+    // one — then kept 25. Synchronously, on the heartbeat's path: at load 15 it took 4.7–10.8 s,
+    // over the refresh timeout, and froze the daemon (/health 14.8 s). claude-code already did this.
+    const withCounts = req.query.counts !== '0'
+    const candidates = []
     for (const projDir of projectDirs) {
       const projPath = path.join(ocDir, projDir)
-      const files = fs.readdirSync(projPath).filter(f => f.endsWith('.json'))
+      for (const f of fs.readdirSync(projPath)) {
+        if (!f.endsWith('.json')) continue
+        try { candidates.push({ projPath, file: f, mtime: fs.statSync(path.join(projPath, f)).mtimeMs }) } catch { /* vanished */ }
+      }
+    }
+    candidates.sort((a, b) => b.mtime - a.mtime)
 
-      for (const file of files) {
+    for (const { projPath, file } of candidates.slice(0, limit)) {
+      {
         try {
           const raw = fs.readFileSync(path.join(projPath, file), 'utf8')
           const data = JSON.parse(raw)
           if (!data.id) continue
 
           // Count messages for this session
-          let messageCount = 0
+          let messageCount = withCounts ? 0 : null // not counted ≠ zero
           const msgDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'message', data.id)
-          if (fs.existsSync(msgDir)) {
+          if (withCounts && fs.existsSync(msgDir)) {
             try { messageCount = fs.readdirSync(msgDir).filter(f => f.endsWith('.json')).length } catch { /* skip */ }
           }
 
