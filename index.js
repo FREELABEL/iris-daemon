@@ -3860,7 +3860,7 @@ app.delete('/api/sessions/ollama/:id', (req, res) => {
  * Falls back to the project directory name if no user message found.
  */
 // Tested in isolation — see lib/claude-session-name.js for what counts as a real first message.
-const { extractSessionName } = require('./lib/claude-session-name')
+const { extractSessionName, sessionTitle } = require('./lib/claude-session-name')
 // When a session last SPOKE. The file's mtime is NOT that — measured up to 721 minutes apart.
 const { lastMessageAtFromChunk, readTailChunk } = require('./lib/session-times')
 const { waitingFromChunk } = require('./lib/session-waiting')
@@ -4061,8 +4061,11 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           // Fix: use cwd from JSONL, or reconstruct path by checking filesystem
           const projectPath = cwd || reconstructPath(dir)
 
-          // Generate meaningful name from first user message
-          const sessionName = extractSessionName(headLines, projectPath)
+          // The session's own title (/rename, then Claude Code's ai-title) — from the head AND the
+          // tail, since both are re-written as the session goes on — else its first real message.
+          const tail = readTailChunk(fs, file.path, stat.size)
+          const sessionName = sessionTitle([...headLines, ...String(tail || '').split('\n')]) ||
+            extractSessionName(headLines, projectPath)
 
           // WHEN IT LAST SPOKE, not when the file was last touched. Measured 2026-09-17 across 12
           // real transcripts: the two differ by up to 721 MINUTES, because Claude Code appends
@@ -4071,7 +4074,6 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           // twelve hours ago showed as "now" with a live dot, then opened on a transcript that
           // ended hours earlier. Null when the tail holds no message: "cannot tell" is not "just
           // now" (lib/session-times.js).
-          const tail = readTailChunk(fs, file.path, stat.size)
           const lastMessageAt = lastMessageAtFromChunk(tail)
           // Blocked on a person? An unanswered AskUserQuestion in the same tail (#188536,
           // lib/session-waiting.js). null = not waiting, or cannot tell — never a guess.
