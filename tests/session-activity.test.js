@@ -42,7 +42,12 @@ test('the refresh uses it, and asks opencode — only opencode — for live stat
 test('the live status path discovers servers WITHOUT blocking the event loop', () => {
   // It runs on every session refresh (~30s); the watchdog kills a main thread blocked for 60s.
   const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
-  assert.match(SRC, /servers: await sessionServerCandidatesAsync\(\)/)
+  // The list route asks the servers twice per refresh (their sessions, then their status, #189446), and
+  // both must use the non-blocking discovery: no synchronous sessionServerCandidates() in that route.
+  const route = SRC.slice(SRC.indexOf("app.get('/api/sessions/opencode', async"), SRC.indexOf('// ─── Discover All Sessions Across Providers'))
+  assert.ok(route.length > 0, 'the opencode list route was not found')
+  assert.match(route, /await sessionServerCandidatesAsync\(\)/)
+  assert.ok(!/sessionServerCandidates\(\)/.test(route), 'the list route must not call the blocking discovery')
   const asyncFn = SRC.slice(SRC.indexOf('function sessionServerCandidatesAsync'), SRC.indexOf('// Asserts on the BODY, never the status'))
   assert.ok(asyncFn.length > 0 && !/execSync/.test(asyncFn), 'the async discovery must not call execSync')
   assert.match(asyncFn, /child_process'\)\.exec\(/)

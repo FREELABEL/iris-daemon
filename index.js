@@ -3332,6 +3332,13 @@ function sessionServerCandidatesAsync() {
   })
 }
 
+// Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
+async function fetchJsonFromSessionServer (url, timeoutMs) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
+  return r.json()
+}
+
 // Asserts on the BODY, never the status: unknown paths on these servers return HTTP 200 with the
 // web UI's HTML, so a status check calls any open port a session server. Requiring the returned
 // id to match also rules out a 200 describing somebody else's session.
@@ -3415,16 +3422,39 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   }
 })
 
-app.get('/api/sessions/opencode/:id/history', (req, res) => {
+app.get('/api/sessions/opencode/:id/history', async (req, res) => {
   const sessionId = req.params.id
   const limit = parseInt(req.query.limit) || 200
   const msgDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'message', sessionId)
 
   if (!fs.existsSync(msgDir)) {
-    // Not in the legacy files: an IRIS Desktop session lives in its SQLite (#190648).
+    // Not in the 1.3.x JSON store. First IRIS Desktop's own SQLite (#190648) — read-only, no
+    // side effects, works with Desktop closed — then the running server holding it (epic #189446),
+    // which also covers servers with their own data dir. 404 only when neither has it.
     const { desktopSessionHistory } = require('./lib/desktop-sessions')
     const desktop = desktopSessionHistory(sessionId, { limit })
     if (desktop) return res.json(desktop)
+    try {
+      const base = await findLiveSessionServer(sessionId)
+      if (base) {
+        const { historyFromServerMessages } = require('./lib/server-sessions')
+        const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sessionId)}`, 3000)
+        const items = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sessionId)}/message`, 10000)
+        if (Array.isArray(items)) {
+          const iso = (ms) => (typeof ms === 'number' ? new Date(ms).toISOString() : null)
+          return res.json({
+            session_id: sessionId,
+            project_path: (meta && meta.directory) || null,
+            created_at: iso(meta && meta.time && meta.time.created),
+            updated_at: iso(meta && meta.time && meta.time.updated),
+            source: 'server',
+            ...historyFromServerMessages(items, limit)
+          })
+        }
+      }
+    } catch (err) {
+      console.log(`[opencode] live history for ${sessionId} failed: ${err.message}`)
+    }
     return res.status(404).json({ error: `OpenCode session ${sessionId} not found` })
   }
 
@@ -4041,8 +4071,9 @@ app.get('/api/sessions/opencode', async (req, res) => {
     const limit = parseInt(req.query.limit) || 50
     const sessions = []
 
-    // Scan all project dirs for session JSON files (the legacy layout; IRIS Desktop's own
-    // sessions are read from its SQLite below — #190648)
+    // Scan all project dirs for session JSON files (the 1.3.x CLI store). A machine with only
+    // IRIS Desktop has no such directory, and that is not "no sessions" — Desktop's SQLite and the
+    // running servers are asked below.
     const projectDirs = !fs.existsSync(ocDir) ? [] : fs.readdirSync(ocDir).filter(d => {
       try { return fs.statSync(path.join(ocDir, d)).isDirectory() } catch { return false }
     })
@@ -4086,14 +4117,18 @@ app.get('/api/sessions/opencode', async (req, res) => {
       }
     }
 
-    // IRIS Desktop keeps its sessions in SQLite under ~/.iris/accounts/<id>, not in the files
-    // above: without this, Hive listed 25 opencode sessions on a Mac, none of them Desktop's,
-    // while 15 Desktop sessions active that week were invisible (#190648).
-    const { listDesktopSessions, mergeSessions } = require('./lib/desktop-sessions')
+    // Three sources, one row per session (epic #189446 K2, #190648). The scan above sees only the
+    // 1.3.x CLI's files; IRIS Desktop keeps its chats in SQLite, so without the next two the
+    // machine you sit at was the one the fleet knew least about (a Mac listed 25 opencode
+    // sessions, none of them Desktop's). Desktop's database is read even while Desktop is closed;
+    // the running servers report what is live and any store not under ~/.iris/accounts.
+    const { listDesktopSessions } = require('./lib/desktop-sessions')
     const desktop = listDesktopSessions({ limit, readGitBranch })
-
-    // Sort by most recent update, limit (one row per session id; Desktop's wins)
-    const page = mergeSessions(sessions, desktop, limit)
+    const { listServerSessions, mergeSessionRows } = require('./lib/server-sessions')
+    const servers = await sessionServerCandidatesAsync()
+    const fromServers = await listServerSessions({ servers, fetchJson: fetchJsonFromSessionServer, limit })
+    // Freshest row wins per id, gaps filled from the others.
+    const page = mergeSessionRows(mergeSessionRows(sessions, desktop), fromServers.rows, limit)
 
     // `?live=1`: ask the servers RUNNING these sessions which are working right now (epic
     // #185632, step 4b). `updated_at` can only say a file changed recently; opencode's
@@ -4101,18 +4136,12 @@ app.get('/api/sessions/opencode', async (req, res) => {
     // unmeasured, never "idle" — because only the server running a session reports it.
     if (req.query.live === '1') {
       const { opencodeActivity } = require('./lib/opencode-activity')
-      const fetchJson = async (url, timeoutMs) => {
-        const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-        // Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
-        if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
-        return r.json()
-      }
-      const live = await opencodeActivity({ sessions: page, servers: await sessionServerCandidatesAsync(), fetchJson })
+      const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
       for (const s of page) s.activity = live.activity[s.session_id] || null
-      return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors } })
+      return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
     }
 
-    res.json({ sessions: page })
+    res.json({ sessions: page, servers_answered: fromServers.answered })
   } catch (err) {
     console.log(`[opencode] List sessions failed: ${err.message}`)
     res.json({ sessions: [], error: err.message })

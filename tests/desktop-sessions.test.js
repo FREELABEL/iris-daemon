@@ -6,7 +6,7 @@ const os = require('os')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const {
-  desktopDataHomes, desktopDb, openReader, listDesktopSessions, desktopSessionHistory, mergeSessions, literal
+  desktopDataHomes, desktopDb, openReader, listDesktopSessions, desktopSessionHistory, literal
 } = require('../lib/desktop-sessions')
 
 // #190648 — Hive listed 25 opencode sessions on a Mac, none of them IRIS Desktop's.
@@ -103,14 +103,6 @@ test('history: text and tool use, synthetic left out by the query, newest `limit
   assert.deepStrictEqual(out.summary.files_edited, ['/Users/me/app/a.ts'])
   assert.deepStrictEqual(out.summary.commands_run, ['bun run build'])
   assert.strictEqual(desktopSessionHistory('ses_nope', { home: h, reader: fakeReader({ list: [], parts: {} }) }), null)
-})
-
-test('merge: one row per session (Desktop wins), newest first, limited', () => {
-  const legacy = [{ session_id: 'a', updated_at: '2026-01-01T00:00:00Z', source: undefined }, { session_id: 'b', updated_at: '2026-01-03T00:00:00Z' }]
-  const desktop = [{ session_id: 'a', updated_at: '2026-01-05T00:00:00Z', source: 'iris_desktop' }]
-  const m = mergeSessions(legacy, desktop, 10)
-  assert.deepStrictEqual(m.map((s) => [s.session_id, s.source]), [['a', 'iris_desktop'], ['b', undefined]])
-  assert.strictEqual(mergeSessions(legacy, desktop, 1).length, 1)
 })
 
 test('the sqlite3 fallback binds values as literals, quotes escaped', () => {
