@@ -106,4 +106,22 @@ function sessionReportFields ({ reportable, sessions, truncated, unreachable } =
   }
 }
 
-module.exports = { deriveSessionStatus, sessionActivity, ACTIVE_MS, IDLE_MS, SESSIONS_PER_PROVIDER_LIMIT, sessionReportFields }
+/**
+ * The rows of a provider this cycle could not reach, carried from the last cycle (#190956).
+ *
+ * A partial failure still reports — what we learned is true — but the server REPLACES the list, so
+ * a provider that timed out for one cycle lost every row: on a loaded Mac, every IRIS Desktop chat
+ * vanished from the fleet for that heartbeat (measured 2026-10-23, 1,625 timeouts in one log), and
+ * `iris hive ask` said "No session matching" for a live chat. The last known rows stand in; their
+ * MEASUREMENT does not (activity is re-derived as unmeasured, status from updated_at), and the
+ * provider is still named unreachable, so nothing claims to be fresh.
+ */
+function carryUnreachable (previous, unreachable, now = Date.now()) {
+  const gone = new Set(Array.isArray(unreachable) ? unreachable : [])
+  if (!gone.size || !Array.isArray(previous)) return []
+  return previous
+    .filter((r) => r && gone.has(r.provider))
+    .map((r) => ({ ...r, ...sessionActivity({ updated_at: r.updated_at, waiting: r.waiting }, now), carried: true }))
+}
+
+module.exports = { carryUnreachable, deriveSessionStatus, sessionActivity, ACTIVE_MS, IDLE_MS, SESSIONS_PER_PROVIDER_LIMIT, sessionReportFields }
