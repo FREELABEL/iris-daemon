@@ -977,6 +977,53 @@ class TaskExecutor {
     return true
   }
 
+  _drainGate (ts) {
+    for (const next of this.gate.drain()) {
+      console.log(`[executor] [${ts()}] 🔄 Resource free — running queued ${next.type} ${next.id.substring(0, 12)}`)
+      setTimeout(() => this.execute(next, { fromGate: true }), 2000)
+    }
+  }
+
+  // True when the browser job should run. Otherwise it has already been reported to the cloud.
+  async _browserJobGo (task, ts) {
+    const consent = require('./browser-job-consent')
+    const short = task.id.substring(0, 12)
+    if (consent.isStale(task)) {
+      const age = Math.round(consent.ageMinutes(task))
+      console.log(`[executor] [${ts()}] ⌛ ${task.type} ${short} waited ${age} min in the queue — expired, not run`)
+      try {
+        await this.cloud.submitResult(task.id, {
+          status: 'expired',
+          error: `Queued ${age} minutes before reaching this machine (limit ${consent.maxAgeMinutes()}, IRIS_BROWSER_TASK_MAX_AGE_MIN). A browser job that old is backlog, not something to run now.`,
+          output: '',
+          duration_ms: 0
+        })
+      } catch {}
+      return false
+    }
+    const mode = consent.consentMode()
+    if (mode === 'off') return true
+    const job = consent.describeJob(task)
+    if (mode === 'notify') {
+      try { this._notifyClickable(job.title, job.message, null) } catch {}
+      return true
+    }
+    const timeoutSec = parseInt(process.env.IRIS_BROWSER_JOBS_ASK_SECONDS || '120', 10) || 120
+    console.log(`[executor] [${ts()}] ✋ Asking before ${task.type} ${short}: ${job.message}`)
+    const answer = await consent.askToRun(job, timeoutSec)
+    if (answer === 'run') return true
+    console.log(`[executor] [${ts()}] ⏭ ${task.type} ${short} not run (${answer === 'timeout' ? `no answer in ${timeoutSec}s` : 'Skip'})`)
+    try {
+      await this.cloud.submitResult(task.id, {
+        status: 'skipped',
+        error: answer === 'timeout' ? `Nobody answered the Run / Skip prompt within ${timeoutSec}s, so it was not run.` : 'Skipped from the Run / Skip prompt on this machine.',
+        output: '',
+        duration_ms: 0
+      })
+    } catch {}
+    return false
+  }
+
   async execute (task, opts = {}) {
     const taskId = task.id
     const runtime = task.runtime || task.config?.runtime || process.env.RUNTIME || 'iris_agent'
@@ -1054,6 +1101,14 @@ class TaskExecutor {
       }
       // verdict === 'run' — reserved by the gate (keys held in the reservation)
       this._executedTaskIds.set(taskId, now)
+    }
+
+    // A browser job is expired if it sat in a backlog, announced on a Mac, and held for a yes when
+    // IRIS_BROWSER_JOBS=ask. It holds the browser slot while it waits, so nothing else opens one.
+    if (isBrowserTask && !(await this._browserJobGo(task, ts))) {
+      this.gate.release(taskId)
+      this._drainGate(ts)
+      return
     }
 
     // Auto-install Playwright browsers on first browser task (idempotent — instant if already installed)
@@ -2025,10 +2080,7 @@ class TaskExecutor {
       // The gate reserves each as it dequeues (so cross-resource tasks can start
       // together); re-entry uses { fromGate: true } to skip re-admission. A small
       // delay lets Chromium fully exit before the next browser task spawns.
-      for (const next of this.gate.drain()) {
-        console.log(`[executor] [${ts()}] 🔄 Resource free — running queued ${next.type} ${next.id.substring(0, 12)}`)
-        setTimeout(() => this.execute(next, { fromGate: true }), 2000)
-      }
+      this._drainGate(ts)
 
       // Clean up workspace after a delay (keep for debugging). NOT for a PHI task (#187918): its
       // workspace is where the full result, screenshots and recordings were kept INSTEAD of
