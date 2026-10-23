@@ -11,7 +11,7 @@
 const os = require('os')
 const fs = require('fs')
 const path = require('path')
-const { execSync } = require('child_process')
+const { execSync, exec } = require('child_process')
 const http = require('http')
 const { probeLocalLlm } = require('./local-llm')
 
@@ -218,6 +218,7 @@ function detectGPU () {
 const GPU_CAPABILITY_TTL_MS = 5 * 60 * 1000
 let _gpuCapability = null
 let _gpuCapabilityAt = 0
+let _gpuProbeInFlight = false
 
 /**
  * Is there a GPU this node can actually USE — proven by the driver answering?
@@ -242,28 +243,24 @@ let _gpuCapabilityAt = 0
  * "We could not tell" must never route work here.
  */
 function gpuCapability ({ force = false } = {}) {
+  // Answered from the cache; an expired cache is refreshed in the BACKGROUND (#191011). This ran
+  // system_profiler / nvidia-smi with execSync (8 s budget) on the heartbeat path every five
+  // minutes, freezing the whole daemon while it ran — seconds at a time on a loaded Mac. Until the
+  // first probe lands the answer is false: "we could not tell" must never route GPU work here.
   const now = Date.now()
-  if (!force && _gpuCapability !== null && (now - _gpuCapabilityAt) < GPU_CAPABILITY_TTL_MS) {
-    return _gpuCapability
+  const fresh = _gpuCapability !== null && (now - _gpuCapabilityAt) < GPU_CAPABILITY_TTL_MS
+  if ((force || !fresh) && !_gpuProbeInFlight) {
+    _gpuProbeInFlight = true
+    const darwin = os.platform() === 'darwin'
+    const nullDev = os.platform() === 'win32' ? '2>nul' : '2>/dev/null'
+    const cmd = darwin ? 'system_profiler SPDisplaysDataType 2>/dev/null' : `nvidia-smi --query-gpu=name --format=csv,noheader ${nullDev}`
+    exec(cmd, { encoding: 'utf-8', timeout: 8000 }, (err, output) => {
+      _gpuProbeInFlight = false
+      _gpuCapability = !err && (darwin ? /metal/i.test(output) : String(output).trim().length > 0)
+      _gpuCapabilityAt = Date.now()
+    })
   }
-
-  let proven = false
-  try {
-    if (os.platform() === 'darwin') {
-      const output = execSync('system_profiler SPDisplaysDataType 2>/dev/null', { encoding: 'utf-8', timeout: 8000 })
-      proven = /metal/i.test(output)
-    } else {
-      const nullDev = os.platform() === 'win32' ? '2>nul' : '2>/dev/null'
-      const output = execSync(`nvidia-smi --query-gpu=name --format=csv,noheader ${nullDev}`, { encoding: 'utf-8', timeout: 8000 })
-      proven = output.trim().length > 0
-    }
-  } catch {
-    proven = false
-  }
-
-  _gpuCapability = proven
-  _gpuCapabilityAt = now
-  return proven
+  return _gpuCapability === true
 }
 
 /**
