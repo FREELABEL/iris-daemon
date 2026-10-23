@@ -48,7 +48,7 @@ const CASES = [
   {
     layer: 'Obsidian  (control)',
     a: { label: 'mdfind / ripgrep / grep', knownMs: 35, note: 'best alternative measured — 35ms grep, 44-750ms rg, 130-196ms mdfind' },
-    b: { label: 'readFileSync (current)', run: async () => { const d = require('../drivers/obsidian'); const t = Date.now(); const r = d.searchNotes('/Users/mayoalexander/Documents/Obsidian Vault', 'IRIS', { limit: 25, includeBody: true }); return { ms: Date.now() - t, n: r.length, probe: { threw: true, message: 'throws Path escapes the vault / Not an Obsidian vault' } } } },
+    b: { label: 'readFileSync (current)', run: async () => { const d = require('../drivers/obsidian'); const t = Date.now(); const r = d.searchNotes(process.env.OBSIDIAN_VAULT || require('path').join(require('os').homedir(), 'Documents/Obsidian Vault'), 'IRIS', { limit: 25, includeBody: true }); return { ms: Date.now() - t, n: r.length, probe: { threw: true, message: 'throws Path escapes the vault / Not an Obsidian vault' } } } },
   },
 ]
 

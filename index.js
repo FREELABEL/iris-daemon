@@ -3428,8 +3428,12 @@ app.get('/api/sessions/opencode/:id/history', async (req, res) => {
   const msgDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'message', sessionId)
 
   if (!fs.existsSync(msgDir)) {
-    // Not in the 1.3.x JSON store — an IRIS Desktop session lives in a server's SQLite store, so
-    // ask the server holding it (epic #189446). 404 only when no running server has it either.
+    // Not in the 1.3.x JSON store. First IRIS Desktop's own SQLite (#190648) — read-only, no
+    // side effects, works with Desktop closed — then the running server holding it (epic #189446),
+    // which also covers servers with their own data dir. 404 only when neither has it.
+    const { desktopSessionHistory } = require('./lib/desktop-sessions')
+    const desktop = desktopSessionHistory(sessionId, { limit })
+    if (desktop) return res.json(desktop)
     try {
       const base = await findLiveSessionServer(sessionId)
       if (base) {
@@ -4068,7 +4072,8 @@ app.get('/api/sessions/opencode', async (req, res) => {
     const sessions = []
 
     // Scan all project dirs for session JSON files (the 1.3.x CLI store). A machine with only
-    // IRIS Desktop has no such directory, and that is not "no sessions" — see the server ask below.
+    // IRIS Desktop has no such directory, and that is not "no sessions" — Desktop's SQLite and the
+    // running servers are asked below.
     const projectDirs = !fs.existsSync(ocDir) ? [] : fs.readdirSync(ocDir).filter(d => {
       try { return fs.statSync(path.join(ocDir, d)).isDirectory() } catch { return false }
     })
@@ -4112,13 +4117,18 @@ app.get('/api/sessions/opencode', async (req, res) => {
       }
     }
 
-    // Ask the RUNNING servers too (epic #189446, K2). IRIS Desktop keeps its chats in SQLite, so
-    // the scan above never saw them: the machine you sit at was the one the fleet knew least
-    // about. Every running server lists its own store, whatever the format.
+    // Three sources, one row per session (epic #189446 K2, #190648). The scan above sees only the
+    // 1.3.x CLI's files; IRIS Desktop keeps its chats in SQLite, so without the next two the
+    // machine you sit at was the one the fleet knew least about (a Mac listed 25 opencode
+    // sessions, none of them Desktop's). Desktop's database is read even while Desktop is closed;
+    // the running servers report what is live and any store not under ~/.iris/accounts.
+    const { listDesktopSessions } = require('./lib/desktop-sessions')
+    const desktop = listDesktopSessions({ limit, readGitBranch })
     const { listServerSessions, mergeSessionRows } = require('./lib/server-sessions')
     const servers = await sessionServerCandidatesAsync()
     const fromServers = await listServerSessions({ servers, fetchJson: fetchJsonFromSessionServer, limit })
-    const page = mergeSessionRows(sessions, fromServers.rows, limit)
+    // Freshest row wins per id, gaps filled from the others.
+    const page = mergeSessionRows(mergeSessionRows(sessions, desktop), fromServers.rows, limit)
 
     // `?live=1`: ask the servers RUNNING these sessions which are working right now (epic
     // #185632, step 4b). `updated_at` can only say a file changed recently; opencode's

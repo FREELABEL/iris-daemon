@@ -9,8 +9,8 @@ const { parseTailscaleIp, detectTailscaleIp, CANDIDATES } = require('../daemon/t
 // was "pinned by tests rather than trusted" and had none.
 
 test('parses the real single-address output', () => {
-  assert.strictEqual(parseTailscaleIp('100.114.214.29\n'), '100.114.214.29')
-  assert.strictEqual(parseTailscaleIp('  100.100.67.48  '), '100.100.67.48')
+  assert.strictEqual(parseTailscaleIp('100.71.22.33\n'), '100.71.22.33')
+  assert.strictEqual(parseTailscaleIp('  100.88.10.20  '), '100.88.10.20')
 })
 
 test('blank and non-string read as NO address, never as one', () => {

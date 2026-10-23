@@ -35,7 +35,7 @@ test('heals: registers with the ACCOUNT token and persists key, node_id and api_
   const seen = []
   const r = await healNodeKey({
     apiUrl: 'https://freelabel.net/',
-    nodeName: 'patsy-mbp',
+    nodeName: 'example-mbp',
     previousKey: 'node_live_DEAD',
     configPath: cfg,
     account: { token: 'acct_tok', userId: 42 },

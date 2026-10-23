@@ -587,16 +587,16 @@ async function countdown(totalMs) {
 
 function runCampaign(campaign, index, total) {
   const reg = campaignRegistry[campaign] || { color: '', label: campaign };
-  const prefix = `${reg.color}[${campaign.padEnd(10)}]${reset}`;
+  const prefix = `${reg.color || ''}[${campaign.padEnd(10)}]${reset}`;
 
   return new Promise((resolve) => {
     console.log(`${prefix} ── Campaign ${index + 1}/${total}: ${reg.label} ──\n`);
 
     const startTime = Date.now();
     let dmsSent = 0, dmsFailed = 0, leadsProcessed = 0, errors = [];
-    const child = spawn('node', [somScript, campaign, ...args], {
+    const child = spawn(...(c => [c.cmd, c.args])(require('./som-lock').campaignCommand(process.platform, process.env, require('./som-lock').hasXvfbRun(), somScript, [campaign, ...args])), {
       cwd: __dirname,
-      env: { ...process.env, SOM_CAMPAIGN_NAME: campaign },
+      env: { ...process.env, HEYIRIS_TOKEN: API_TOKEN, SOM_CAMPAIGN_NAME: campaign },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -668,14 +668,14 @@ runAllParallel.__raw = function(campaignList) {
     for (let i = 0; i < campaignList.length; i++) {
       const campaign = campaignList[i];
       const reg = campaignRegistry[campaign] || { color: '', label: campaign };
-      const prefix = `${reg.color}[${campaign.padEnd(10)}]${reset}`;
+      const prefix = `${reg.color || ''}[${campaign.padEnd(10)}]${reset}`;
 
       // Stagger launches — each campaign starts 5s after the previous one
       setTimeout(() => {
         const startTime = Date.now();
-        const child = spawn('node', [somScript, campaign, ...args], {
+        const child = spawn(...(c => [c.cmd, c.args])(require('./som-lock').campaignCommand(process.platform, process.env, require('./som-lock').hasXvfbRun(), somScript, [campaign, ...args])), {
           cwd: __dirname,
-          env: { ...process.env, SOM_CAMPAIGN_NAME: campaign },
+          env: { ...process.env, HEYIRIS_TOKEN: API_TOKEN, SOM_CAMPAIGN_NAME: campaign },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
@@ -721,9 +721,10 @@ async function main() {
     try {
       const lock = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf-8'));
       const age = Date.now() - lock.started;
-      const maxAge = 30 * 60 * 1000; // 30 min stale threshold
+      // A live batch under 30 min old holds it; a dead PID's lock is stale at any age (#190291).
+      const { lockVerdict } = require('./som-lock');
 
-      if (age < maxAge) {
+      if (lockVerdict(lock) === 'busy') {
         console.log('');
         console.log('  ╔══════════════════════════════════════════════════╗');
         console.log('  ║  ⏭  SOM BATCH ALREADY RUNNING — EXITING        ║');
@@ -733,7 +734,7 @@ async function main() {
         console.log('');
         process.exit(0);
       } else {
-        console.log(`  ⚠️  Stale lock (${formatDuration(age)} old, PID ${lock.pid}) — removing`);
+        console.log(`  ⚠️  Stale lock (${formatDuration(age)} old, PID ${lock.pid}, not running) — removing`);
         fs.unlinkSync(LOCK_FILE);
       }
     } catch {
@@ -758,13 +759,11 @@ async function main() {
   // ── PRE-FLIGHT: kill orphaned SOM processes from previous runs ──
   try {
     const { execSync } = require('child_process');
-    const myPid = process.pid;
-    const myPpid = process.ppid;
-    const psOut = execSync("ps aux | grep '[s]om-all.js' || true", { encoding: 'utf-8' });
-    const otherPids = psOut.split('\n')
-      .filter(l => l.trim())
-      .map(l => parseInt(l.trim().split(/\s+/)[1]))
-      .filter(pid => pid !== myPid && pid !== myPpid && !isNaN(pid));
+    // Only OTHER node som-all.js processes, never our own ancestors: the tmux client and shell that launched
+    // this run also mention som-all.js, and killing them killed every daemon-started run (#190291).
+    const { orphanPids, ancestorPids } = require('./som-lock');
+    const psOut = execSync('ps -eo pid=,args=', { encoding: 'utf-8' });
+    const otherPids = orphanPids(psOut, process.pid, ancestorPids());
     if (otherPids.length > 0) {
       console.log(`  ⚠️  PRE-FLIGHT: Killing ${otherPids.length} orphaned som-all process(es): ${otherPids.join(', ')}`);
       for (const pid of otherPids) { try { process.kill(pid, 'SIGTERM'); } catch {} }
@@ -776,6 +775,36 @@ async function main() {
       execSync("pkill -f 'ms-playwright.*chromium' || true", { timeout: 5000 });
     }
   } catch {}
+
+  // ── Which campaigns are on comes from the live switch, not the cache (#190302) ──
+  if (!useAll) {
+    let live;
+    try {
+      live = await somConfig.fetchLiveCampaigns({ apiUrl: API_BASE, token: API_TOKEN });
+    } catch (err) {
+      if (!onlyCampaigns) {
+        console.error(`\x1b[31m✖ Could not read which campaigns are on (${err.message}).\x1b[0m`);
+        console.error('  Not guessing from the local cache: it has run switched-off campaigns before.');
+        console.error('  Check the network and HEYIRIS_TOKEN, or name campaigns with only=<a,b>.');
+        process.exit(1);
+      }
+    }
+    if (live) {
+      const { registry, turnedOff } = somConfig.applyLiveActive(campaignRegistry, live);
+      for (const [id, c] of Object.entries(registry)) campaignRegistry[id].active = c.active;
+      if (turnedOff.length) console.log(`  [campaigns] switched off, skipping: ${turnedOff.join(', ')}`);
+      if (onlyCampaigns) {
+        const off = campaigns.filter(c => !campaignRegistry[c].active);
+        if (off.length) console.log(`  ⚠️  Named but switched off (running anyway because you asked): ${off.join(', ')}`);
+      } else {
+        campaigns = Object.entries(campaignRegistry).filter(([, v]) => v.active).map(([k]) => k);
+        if (campaigns.length === 0) {
+          console.log('\n  No campaigns are switched on (iris som status). Nothing to run.');
+          process.exit(0);
+        }
+      }
+    }
+  }
 
   const modeLabel = parallel ? 'PARALLEL' : 'SEQUENTIAL';
   const loopLabel = maxLoops > 0 ? ` x${maxLoops}` : repeatMs ? ' (∞)' : '';
@@ -911,6 +940,8 @@ async function main() {
 
     // ── Write SOM status file ──
     writeSomStatus(results, batchElapsed);
+    // A failed campaign fails the batch, so Hive doesn't report it as completed (#190291).
+    process.exitCode = results.some(r => r.code !== 0) ? 1 : 0;
 
     // Repeat?
     if (!repeatMs) break;

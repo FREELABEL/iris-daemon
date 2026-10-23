@@ -56,7 +56,7 @@ test('a lookup is down: no change', async () => {
 })
 
 test('a private / CGNAT answer is never published, even when both sources agree', async () => {
-  for (const ip of ['192.168.4.22', '10.0.0.5', '100.100.67.48', '127.0.0.1', '172.20.1.1']) {
+  for (const ip of ['192.168.4.22', '10.0.0.5', '100.88.10.20', '127.0.0.1', '172.20.1.1']) {
     const w = world({ ipify: ip, trace: ip })
     assert.match((await w.run()).error, /not a public/, ip)
     assert.strictEqual(w.patches.length, 0, ip)

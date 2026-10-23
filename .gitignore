@@ -22,3 +22,7 @@ som/.som-campaigns-cache.json
 
 # Paired R1 device registry — runtime state, holds per-device token hashes.
 r1-devices.json
+
+# Python bytecode
+__pycache__/
+*.pyc

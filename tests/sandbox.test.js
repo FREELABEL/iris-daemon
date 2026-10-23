@@ -248,3 +248,45 @@ describe('S2.4 — a page-invoked action cannot wait for a cold pull', () => {
     assert.equal(planWarmup(undefined).shouldWarm, false)
   })
 })
+
+/**
+ * #190056 — a script that drives hardware cannot work in the sandbox: no USB, no Bluetooth, no
+ * camera, no host docker socket. So on a PERSONAL node it runs on the host — but only when its
+ * Gate receipt says it was held for hardware and a person approved it. The receipt is written by
+ * the server alone (fl-iris-api drops any caller-supplied config.gate), so it cannot be self-issued.
+ */
+describe('an approved hardware run (#190056)', () => {
+  const approved = { by: 'Constellation Gate', held_for: ['hardware'], approved_by: 193, scan_id: 'scan_1', sha256: 'abc' }
+  const up = { available: true, reason: null }
+
+  it('runs on the host on a personal node, and says who approved it', () => {
+    const p = plan({ isolation: up, gate: approved })
+    assert.equal(p.mode, 'host')
+    assert.equal(p.isolated, false)
+    assert.equal(p.cmd, '/bin/bash')
+    assert.match(p.reason, /approved by #193/)
+    assert.match(p.reason, /scan_1/)
+  })
+
+  it('stays sandboxed with no receipt, as every other script does', () => {
+    assert.equal(plan({ isolation: up }).mode, 'sandboxed')
+  })
+
+  it('stays sandboxed when the receipt names no approver', () => {
+    assert.equal(plan({ isolation: up, gate: { ...approved, approved_by: undefined } }).mode, 'sandboxed')
+  })
+
+  it('stays sandboxed when the approval was for something other than hardware', () => {
+    // A flagged script a person waved through has not been declared to need the host.
+    assert.equal(plan({ isolation: up, gate: { ...approved, held_for: ['flagged'] } }).mode, 'sandboxed')
+  })
+
+  it('NEVER leaves the sandbox on a shared node, approved or not', () => {
+    assert.equal(plan({ policy: { shared: true }, isolation: up, gate: approved }).mode, 'sandboxed')
+    assert.equal(plan({ policy: { require_isolation: true }, isolation: up, gate: approved }).mode, 'sandboxed')
+  })
+
+  it('on a shared node with no runtime, an approval does not turn a refusal into a host run', () => {
+    assert.equal(plan({ policy: { shared: true }, isolation: { available: false, reason: 'down' }, gate: approved }).mode, 'refused')
+  })
+})

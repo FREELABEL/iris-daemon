@@ -20,6 +20,10 @@
  *      opening a capture session — so no macOS camera/microphone permission prompt, ever.
  *
  * Device NAMES are deliberately not reported: they identify people and rooms ("Alex's AirPods").
+ * ONE narrow exception (#189589): the FACTORY product name of a physical camera ("OBSBOT Tiny
+ * Camera", "FaceTime HD Camera"), so a person can see which webcam a node has. Never a Continuity
+ * camera (named after its owner's phone), never a name with a possessive, never one containing
+ * this machine's user or host name — see productCameraName(). Audio names: still never.
  *
  * The macOS probe takes ~4s (measured 2026-10-04), so it runs async in the background on an
  * interval and the heartbeat reads the cached result. It must never run inside the heartbeat.
@@ -51,6 +55,22 @@ let inFlight = null
  * Pure parser for `system_profiler -json SPAirPortDataType SPBluetoothDataType SPAudioDataType
  * SPCameraDataType`. Exported for tests.
  */
+const PERSONAL_HINTS = (() => {
+  const words = [os.userInfo().username, ...os.hostname().split(/[-_.\s]+/)]
+  return words.filter(w => w && w.length >= 3).map(w => w.toLowerCase())
+})()
+
+/** A camera's name, only when it is a product name that cannot identify a person; else null. */
+function productCameraName (name, modelId = '') {
+  const n = String(name || '').trim()
+  if (!n || n.length > 64) return null
+  if (/^(iPhone|iPad)/i.test(String(modelId)) || /iphone|ipad|continuity|desk view/i.test(n)) return null
+  if (/['’]s\b/i.test(n)) return null
+  const low = n.toLowerCase()
+  if (PERSONAL_HINTS.some(w => low.includes(w))) return null
+  return n
+}
+
 function parseMacProfiler (data) {
   const wifiIfaces = (data.SPAirPortDataType || [])
     .flatMap(x => x.spairport_airport_interfaces || [])
@@ -75,11 +95,14 @@ function parseMacProfiler (data) {
     if (dev.coreaudio_device_output) audio.audio_out[kind]++
   }
 
-  const camera = { count: 0, virtual: 0 }
+  const camera = { count: 0, virtual: 0, names: [] }
   for (const cam of data.SPCameraDataType || []) {
     // Virtual cameras are camera EXTENSIONS ("OBS Camera Extension") — measured on this Mac.
     const isVirtual = VIRTUAL_NAME.test(cam._name || '') || VIRTUAL_NAME.test(cam['spcamera_model-id'] || '')
     camera[isVirtual ? 'virtual' : 'count']++
+    // #189589: the PHYSICAL ones by name, so the panel can say "OBSBOT Tiny Camera" is plugged in.
+    const name = isVirtual ? null : productCameraName(cam._name, cam['spcamera_model-id'])
+    if (name) camera.names.push(name)
   }
 
   return {
@@ -124,10 +147,14 @@ function probeLinux (root = '/') {
 
   // One camera exposes several /dev/video nodes (capture + metadata). index 0 is the capture
   // node, so counting those counts cameras rather than device files.
-  const camera = { count: 0, virtual: 0 }
+  const camera = { count: 0, virtual: 0, names: [] }
   for (const v of listDir(sys('video4linux'))) {
     if ((readText(sys('video4linux', v, 'index')) || '0') !== '0') continue
-    camera[VIRTUAL_NAME.test(readText(sys('video4linux', v, 'name')) || '') ? 'virtual' : 'count']++
+    const name = readText(sys('video4linux', v, 'name')) || ''
+    const isVirtual = VIRTUAL_NAME.test(name)
+    camera[isVirtual ? 'virtual' : 'count']++
+    const product = isVirtual ? null : productCameraName(name)
+    if (product) camera.names.push(product)
   }
 
   // /proc/asound/pcm: "00-00: ALC3234 Analog : ALC3234 Analog : playback 1 : capture 1"
@@ -202,6 +229,7 @@ function getDeviceReport () {
 }
 
 module.exports = {
+  productCameraName,
   parseMacProfiler,
   probeLinux,
   detectDevices,

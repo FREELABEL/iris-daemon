@@ -507,22 +507,40 @@ async function ensureSomSessions (somDir, configs) {
 let _somPreflightCheck = null
 function getSomPreflightCheck () {
   if (_somPreflightCheck) return _somPreflightCheck
-  try {
-    const freelabelRoot = findFreelabelPath()
-    if (freelabelRoot) {
-      const somConfig = require(path.join(freelabelRoot, 'tests', 'e2e', 'som-config.js'))
+  // The bundled som/ dir is what som_batch actually runs, and the only copy on a machine with
+  // no freelabel checkout. Looking only in the checkout warned 6 times a run on iris-hive-001 (#190301).
+  const found = somConfigCandidates(findFreelabelPath()).find(f => fs.existsSync(f))
+  if (found) {
+    try {
+      const somConfig = require(found)
       if (somConfig.preflightCheck) {
         _somPreflightCheck = somConfig.preflightCheck
         return _somPreflightCheck
       }
+    } catch (err) {
+      console.log(`[preflight] could not load ${found}: ${err.message}`)
     }
-  } catch { /* fall through */ }
+  }
   // Fallback: inline minimal check (shouldn't happen if freelabel path is found)
   _somPreflightCheck = async (boardId) => {
     console.log('[preflight] WARNING: using inline fallback — som-config.js not found')
     return { eligible: -1, total: -1, skip: false, reason: 'fallback' }
   }
   return _somPreflightCheck
+}
+// Task types whose non-zero exit is a real failure, never "completed with warnings".
+// som_batch: som-all.js exits 1 only when a campaign failed (#190291); reporting that as
+// "✓ completed" is how a broken SOM looked healthy for days (#190300).
+const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch'])
+function statusForExit (type, exitCode) {
+  if (exitCode === 0) return 'completed'
+  return NONZERO_IS_FAILURE.has(type) ? 'failed' : 'completed_with_warnings'
+}
+
+function somConfigCandidates (freelabelRoot) {
+  const out = [path.join(__dirname, '..', 'som', 'som-config.js')]
+  if (freelabelRoot) out.push(path.join(freelabelRoot, 'tests', 'e2e', 'som-config.js'))
+  return out
 }
 async function somPreflightCheck (boardId, strategy, opts = {}) {
   const check = getSomPreflightCheck()
@@ -1714,14 +1732,7 @@ class TaskExecutor {
       // because the n8n chat interaction failed or the wait was interrupted.
       // EXCEPTION: custom_playwright (requirement tests) — non-zero IS a real test
       // failure that needs to flow back as 'failed' so the webhook reports correctly.
-      let taskStatus
-      if (result.exitCode === 0) {
-        taskStatus = 'completed'
-      } else if (task.type === 'custom_playwright') {
-        taskStatus = 'failed'
-      } else {
-        taskStatus = 'completed_with_warnings'
-      }
+      let taskStatus = statusForExit(task.type, result.exitCode)
 
       // A non-zero browser task is usually benign (scrape succeeded, n8n hiccup
       // on the trailing chat step). But a CATASTROPHIC crash — the script never
@@ -2249,13 +2260,23 @@ class TaskExecutor {
             break
           }
 
+          // #189589 — the run's settings, as IRIS_ARG_<NAME>. Carried to both paths: the host
+          // spawn (below, in spawnEnv) and the sandbox, which inherits NOTHING and is handed them.
+          task._scriptArgEnv = { ...require('./script-args').runEnv(task), ...require('./script-args').scriptArgEnv(task.config?.args) }
+          if (Object.keys(task._scriptArgEnv).length) {
+            console.log(`[executor] user_script '${slug}' settings: ${Object.keys(task._scriptArgEnv).join(', ')}`)
+          }
+
           const plan = planScriptExecution({
             runtime,
             scriptPath,
+            env: task._scriptArgEnv,
             outputDir: workspace.outputDir || path.join(workspace.dir, '.output'),
             manifest: script.manifest || task.config?.manifest || {},
             policy: nodePolicyFromEnv(),
-            isolation: await getIsolationState()
+            isolation: await getIsolationState(),
+            // #190056: an approved hardware run may leave the sandbox on a personal node.
+            gate: task.config?.gate
           })
 
           if (plan.mode === 'refused') {
@@ -4661,6 +4682,8 @@ exit 1
         ...accountEnvForScripts(),
         ...(workspace.env || {}),
         ...(task.config?.env_vars || {}),
+        // A script's settings (#189589): IRIS_ARG_* only, so they cannot shadow PATH or anything above.
+        ...(task._scriptArgEnv || {}),
         // Last, so a task's own env_vars cannot shadow the vault's values (#187915).
         ...(task._vaultEnv || {})
       }
@@ -5794,4 +5817,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets }
+module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit }

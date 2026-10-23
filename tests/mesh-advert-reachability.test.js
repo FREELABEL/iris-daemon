@@ -33,8 +33,8 @@ describe('bridgeBindHost — one definition', () => {
   })
 
   it('honours the env var', () => {
-    process.env.BRIDGE_BIND_HOST = '100.100.67.48'
-    assert.equal(bridgeBindHost(), '100.100.67.48')
+    process.env.BRIDGE_BIND_HOST = '100.88.10.20'
+    assert.equal(bridgeBindHost(), '100.88.10.20')
   })
 })
 
@@ -46,7 +46,7 @@ describe('isLoopbackBind — would any peer be able to dial this?', () => {
   })
 
   it('does not treat a reachable address as loopback', () => {
-    for (const h of ['0.0.0.0', '100.100.67.48', '192.168.4.29', '10.0.0.5']) {
+    for (const h of ['0.0.0.0', '100.88.10.20', '192.168.4.29', '10.0.0.5']) {
       assert.equal(isLoopbackBind(h), false, `${h} should NOT be loopback`)
     }
   })
@@ -128,7 +128,7 @@ describe('MeshDiscovery — the advert decision', () => {
       console.log('  SKIPPED: bonjour-service not installed, advert path not exercised')
       return
     }
-    const d = new MeshDiscovery({ nodeName: 'reachable-node', port: 3200, bindHost: '100.100.67.48' })
+    const d = new MeshDiscovery({ nodeName: 'reachable-node', port: 3200, bindHost: '100.88.10.20' })
     let published = 0
     const fakeBonjour = {
       publish: () => { published++; return { on () {} } },

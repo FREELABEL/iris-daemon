@@ -7,6 +7,7 @@ import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
+import { leadSource, candidateFetchSize, directQuotaReached } from './lead-selection';
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
@@ -115,6 +116,7 @@ async function readRowAttrs(row: Locator): Promise<RowAttrs> {
 function sendDiscordAlert(message: string): Promise<void> {
   return new Promise((resolve) => {
     const body = JSON.stringify({ content: message });
+    if (!DISCORD_WEBHOOK) { console.log('  (no Discord webhook configured: alert skipped)'); return resolve(); }
     const url = new URL(DISCORD_WEBHOOK);
     const req = https.request({
       hostname: url.hostname,
@@ -200,6 +202,7 @@ function sendDiscordBatchSummary(opts: {
   const body = JSON.stringify(payload);
 
   return new Promise((resolve) => {
+    if (!DISCORD_WEBHOOK) { console.log('  (no Discord webhook configured: alert skipped)'); return resolve(); }
     const url = new URL(DISCORD_WEBHOOK);
     const req = https.request({
       hostname: url.hostname,
@@ -556,7 +559,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     try {
       // has_social=1 filters to leads with IG/social handles (skips non-DM-able leads like law firms)
       const socialFilter = IS_LINKEDIN ? '' : '&has_social=1';
-      const perPage = Math.min(LEADS_TO_PROCESS * 3, 500);
+      const perPage = candidateFetchSize(LEADS_TO_PROCESS);
       const freshRes = await fetch(
         `${apiBase}/api/v1/leads?bloq_id=${BOARD_ID}&outreach_status=no_outreach${socialFilter}&sort=updated_at&order=desc&per_page=${perPage}`,
         { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } }
@@ -600,7 +603,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   // ── API-DIRECT MODE: only when MODE=api AND we have API-filtered IDs ──
   // MODE=ui (default): full UI flow with Apply Strategy + step tracking
   // MODE=api: fast direct navigation, skips UI table scan
-  const useApiDirect = SOM_MODE === 'api' && !!(apiFilteredIds && apiFilteredIds.size > 0);
+  let useApiDirect = leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: -1 }) === 'api';
   if (useApiDirect) {
     console.log(`⚡ API-DIRECT MODE: ${apiFilteredIds!.size} leads from API — skipping UI table scan\n`);
   }
@@ -685,18 +688,25 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   }
   } // end if (!useApiDirect) — UI scanning block
 
+  // The API's fresh leads were not among the rows the scan reached: open them by id (#190296).
+  if (!useApiDirect && leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: eligibleRows.length }) === 'api-fallback') {
+    console.log(`⚡ ${apiFilteredIds!.size} fresh lead(s) from the API are not in the ${scannedUpTo} rows scanned — opening them directly\n`);
+    useApiDirect = true;
+  }
+
   // ── API-DIRECT: skip row scanning, process leads directly from API IDs ──
   if (useApiDirect && apiFilteredIds && apiFilteredIds.size > 0) {
     const dmsRemaining = IS_LINKEDIN ? Math.max(0, LINKEDIN_DAILY_CAP - getLinkedInDmsSentToday()) : Math.max(0, DAILY_DM_CAP - getDmsSentToday());
     const directLimit = DRY_RUN ? LEADS_TO_PROCESS : Math.min(LEADS_TO_PROCESS, dmsRemaining);
-    const apiLeadIds = [...apiFilteredIds].slice(0, directLimit);
-    console.log(`⚡ API-DIRECT: Processing ${apiLeadIds.length} leads by direct navigation\n`);
+    const apiLeadIds = [...apiFilteredIds];
+    console.log(`⚡ API-DIRECT: up to ${directLimit} lead(s) from ${apiLeadIds.length} candidates by direct navigation\n`);
 
     const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0 };
     const leadTimings: { name: string; duration: number; status: string }[] = [];
     const batchStart = Date.now();
 
     for (let idx = 0; idx < apiLeadIds.length; idx++) {
+      if (directQuotaReached(results, directLimit)) break;
       const leadId = apiLeadIds[idx];
       const leadStart = Date.now();
       console.log(`\n━━━ Lead ${idx + 1}/${apiLeadIds.length} (ID: ${leadId}) ━━━\n`);
