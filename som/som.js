@@ -105,6 +105,8 @@ if (!campaign || !campaigns[campaign]) {
   console.log('\n  Scrape options:');
   console.log('    target=<url>       Post/tweet URL to scrape commenters from');
   console.log('    scrape_limit=50    Max handles to collect');
+  console.log('    discovery=<comments|followers|profiles>  What to read at the target (default: comments)');
+  console.log('    min_followers=N    Keep only profiles with at least N followers');
   console.log('    source=<label>     Lead source label');
   console.log('\n  Ledger & debug options:');
   console.log('    retry=1            Re-run only retryable failures from today\'s ledger');
@@ -129,7 +131,9 @@ const campaignDefaultMode = {
 };
 
 // Shorthand aliases → real env var names
-const aliases = { IG: 'IG_ACCOUNT', DRY: 'DRY_RUN', TW: 'TW_ACCOUNT', ENRICH: 'AUTO_ENRICH', BOARD: 'BOARD_ID', BLOQ: 'BOARD_ID', BLOQID: 'BOARD_ID', BLOQ_ID: 'BOARD_ID', WB: 'WRITE_BACK', WRITEBACK: 'WRITE_BACK', ENGAGE: 'WARMUP' };
+const aliases = { IG: 'IG_ACCOUNT', DRY: 'DRY_RUN', TW: 'TW_ACCOUNT', ENRICH: 'AUTO_ENRICH', BOARD: 'BOARD_ID', BLOQ: 'BOARD_ID', BLOQID: 'BOARD_ID', BLOQ_ID: 'BOARD_ID', WB: 'WRITE_BACK', WRITEBACK: 'WRITE_BACK', ENGAGE: 'WARMUP',
+  // mode=scrape (leadgen-scraper.spec.ts): MODE is taken for routing, so the discovery mode is discovery=
+  DISCOVERY: 'DISCOVERY_MODE', SCRAPE_LIMIT: 'LIMIT', MIN_FOLLOWERS: 'FILTER_MIN_FOLLOWERS', MAX_FOLLOWERS: 'FILTER_MAX_FOLLOWERS' };
 
 // Parse key=value args → ENV vars
 // Pull out repeat/loop/mode/platform before passing to playwright
