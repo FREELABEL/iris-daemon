@@ -22,4 +22,14 @@ function directQuotaReached ({ sent, failed }, limit) {
   return sent + failed >= limit
 }
 
-module.exports = { leadSource, candidateFetchSize, directQuotaReached }
+// A wide pool is still not enough when most of a board was DM'd before step tracking: on
+// 2026-10-22, 33 of the first 35 "no outreach" leads on courses had a [SOM DM] note (#190638).
+// So when the batch runs out of candidates short of its limit it asks for the next page, up to
+// a cap that keeps one run from walking the whole board.
+const MAX_CANDIDATE_PAGES = 10
+
+function shouldFetchNextPage ({ page, lastPage }, maxPages = MAX_CANDIDATE_PAGES) {
+  return page < lastPage && page < maxPages
+}
+
+module.exports = { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage, MAX_CANDIDATE_PAGES }

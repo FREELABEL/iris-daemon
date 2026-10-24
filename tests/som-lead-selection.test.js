@@ -36,3 +36,17 @@ test('a skipped lead does not use up the batch quota; a send or a failure does',
   assert.strictEqual(directQuotaReached({ sent: 1, failed: 1, skipped: 0 }, 2), true)
   assert.strictEqual(directQuotaReached({ sent: 0, failed: 0, skipped: 0 }, 0), true)
 })
+
+// 2026-10-22: 33 of the first 35 candidates on courses were old DMs (#190638).
+const { shouldFetchNextPage, MAX_CANDIDATE_PAGES } = require('../som/lead-selection')
+
+test('a batch short of its limit asks for the next page while the API has one', () => {
+  assert.strictEqual(shouldFetchNextPage({ page: 1, lastPage: 173 }), true)
+  assert.strictEqual(shouldFetchNextPage({ page: 3, lastPage: 3 }), false)
+  assert.strictEqual(shouldFetchNextPage({ page: 1, lastPage: 1 }), false)
+})
+
+test('one run never pages past the cap, however big the board', () => {
+  assert.strictEqual(shouldFetchNextPage({ page: MAX_CANDIDATE_PAGES, lastPage: 173 }), false)
+  assert.strictEqual(shouldFetchNextPage({ page: 2, lastPage: 173 }, 2), false)
+})
