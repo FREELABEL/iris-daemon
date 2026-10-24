@@ -55,4 +55,43 @@ function hasXvfbRun () {
   try { require('child_process').execSync('command -v xvfb-run', { stdio: 'ignore', shell: '/bin/sh' }); return true } catch { return false }
 }
 
-module.exports = { lockVerdict, pidAlive, ancestorPids, orphanPids, campaignCommand, hasXvfbRun, MAX_AGE_MS }
+// From `ps -eo pid=,ppid=` lines: every PID below root (children, grandchildren…). A campaign is
+// node → (xvfb-run) → node som.js → npx playwright → Chromium and its helpers; killing only the top
+// one leaves the browsers running, which is how stopped batches piled up Chrome until the Mac fell over.
+function descendantPids (psOut, root) {
+  const kids = new Map()
+  for (const l of psOut.split('\n')) {
+    const m = l.trim().match(/^(\d+)\s+(\d+)/); if (!m) continue
+    const pid = parseInt(m[1], 10), ppid = parseInt(m[2], 10)
+    if (!kids.has(ppid)) kids.set(ppid, [])
+    kids.get(ppid).push(pid)
+  }
+  const out = []
+  const stack = [...(kids.get(root) || [])]
+  while (stack.length) {
+    const pid = stack.pop()
+    if (out.includes(pid)) continue
+    out.push(pid)
+    stack.push(...(kids.get(pid) || []))
+  }
+  return out
+}
+
+// From `ps -eo pid=,ppid=,args=` lines: Playwright Chromium browsers whose owner is gone. A browser
+// Playwright launched carries --remote-debugging-pipe; when the test process dies it is re-parented to
+// PID 1 (init or launchd). Only those are orphans. The old `pkill -f ms-playwright.*chromium` killed
+// every Playwright browser on the machine, including ones a live run, an MCP or the Desktop app owned.
+function orphanBrowserPids (psOut) {
+  return psOut.split('\n').map(l => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter(Boolean)
+    .filter(([, , ppid, args]) => ppid === '1' && /ms-playwright/.test(args) && /--remote-debugging-pipe/.test(args))
+    .map(([, pid]) => parseInt(pid, 10))
+}
+
+// How many campaigns (one headed Chromium each) to run at once. Busier machine → fewer browsers;
+// the old check went from "all" to 3 under moderate load, which could ADD a browser (default was 2).
+function parallelLimit ({ freeGb, loadPct, battery = null, charging = true, requested = 2 }) {
+  const busy = freeGb < 4 || loadPct > 50 || (battery !== null && battery < 30 && !charging)
+  return Math.max(1, Math.min(requested, busy ? 1 : 2))
+}
+
+module.exports = { lockVerdict, pidAlive, ancestorPids, orphanPids, campaignCommand, hasXvfbRun, MAX_AGE_MS, descendantPids, orphanBrowserPids, parallelLimit }

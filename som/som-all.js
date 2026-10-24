@@ -585,6 +585,28 @@ async function countdown(totalMs) {
 
 // ── Run one campaign ─────────────────────────────────────────────
 
+// Every campaign process we started, so a stop takes their browsers down with them.
+const liveChildren = new Set();
+function trackChild(child) {
+  liveChildren.add(child);
+  child.on('exit', () => liveChildren.delete(child));
+}
+
+// Stop each campaign's whole tree (node → som.js → playwright → Chromium), deepest first, instead
+// of exiting and relying on each child noticing its stdout pipe broke. On iris-hive-001 they did
+// notice (browsers gone within 30s of SIGHUP or SIGKILL), but nothing guaranteed it.
+function stopCampaigns(signal = 'SIGTERM') {
+  if (liveChildren.size === 0) return;
+  let psOut = '';
+  try { psOut = require('child_process').execSync('ps -eo pid=,ppid=', { encoding: 'utf-8' }); } catch {}
+  const { descendantPids } = require('./som-lock');
+  for (const child of liveChildren) {
+    for (const pid of [...descendantPids(psOut, child.pid).reverse(), child.pid]) {
+      try { process.kill(pid, signal); } catch {}
+    }
+  }
+}
+
 function runCampaign(campaign, index, total) {
   const reg = campaignRegistry[campaign] || { color: '', label: campaign };
   const prefix = `${reg.color || ''}[${campaign.padEnd(10)}]${reset}`;
@@ -599,6 +621,7 @@ function runCampaign(campaign, index, total) {
       env: { ...process.env, HEYIRIS_TOKEN: API_TOKEN, SOM_CAMPAIGN_NAME: campaign },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    trackChild(child);
 
     child.stdout.on('data', (data) => {
       for (const line of data.toString().split('\n')) {
@@ -678,6 +701,7 @@ runAllParallel.__raw = function(campaignList) {
           env: { ...process.env, HEYIRIS_TOKEN: API_TOKEN, SOM_CAMPAIGN_NAME: campaign },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
+        trackChild(child);
 
         child.stdout.on('data', (data) => {
           for (const line of data.toString().split('\n')) {
@@ -701,12 +725,6 @@ runAllParallel.__raw = function(campaignList) {
         });
       }, i * STAGGER_MS); // stagger each launch
     }
-
-    // Forward Ctrl+C to all children
-    process.on('SIGINT', () => {
-      console.log('\n  Stopping all campaigns...\n');
-      process.exit(0);
-    });
   });
 }
 
@@ -749,9 +767,12 @@ async function main() {
   // Remove lock on ANY exit (clean, error, SIGINT, SIGTERM)
   const removeLock = () => { try { fs.unlinkSync(LOCK_FILE); } catch {} };
   process.on('exit', removeLock);
-  process.on('SIGINT', () => { removeLock(); process.exit(130); });
-  process.on('SIGTERM', () => { removeLock(); process.exit(143); });
-  process.on('uncaughtException', (err) => { console.error(err); removeLock(); process.exit(1); });
+  // tmux kill-session (the daemon's timeout and cancel) sends SIGHUP.
+  const stopAll = (code) => () => { console.log('\n  Stopping all campaigns...\n'); stopCampaigns(); removeLock(); process.exit(code); };
+  process.on('SIGINT', stopAll(130));
+  process.on('SIGTERM', stopAll(143));
+  process.on('SIGHUP', stopAll(129));
+  process.on('uncaughtException', (err) => { console.error(err); stopCampaigns(); removeLock(); process.exit(1); });
 
   const totalStart = Date.now();
   let runNum = 0;
@@ -769,10 +790,11 @@ async function main() {
       for (const pid of otherPids) { try { process.kill(pid, 'SIGTERM'); } catch {} }
     }
 
-    const pwOrphans = parseInt(execSync("ps aux | grep '[m]s-playwright.*chromium' | grep -v grep | wc -l || echo 0", { encoding: 'utf-8' }).trim(), 10) || 0;
-    if (pwOrphans > 6) {
-      console.log(`  ⚠️  PRE-FLIGHT: ${pwOrphans} orphaned Playwright browsers — killing`);
-      execSync("pkill -f 'ms-playwright.*chromium' || true", { timeout: 5000 });
+    const { orphanBrowserPids } = require('./som-lock');
+    const strayBrowsers = orphanBrowserPids(execSync('ps -eo pid=,ppid=,args=', { encoding: 'utf-8' }));
+    if (strayBrowsers.length > 0) {
+      console.log(`  ⚠️  PRE-FLIGHT: ${strayBrowsers.length} Playwright browser(s) left by a dead run — closing`);
+      for (const pid of strayBrowsers) { try { process.kill(pid, 'SIGTERM'); } catch {} }
     }
   } catch {}
 
@@ -823,7 +845,7 @@ async function main() {
   console.log('');
 
   // ── Resource check — auto-throttle if system is stressed ──
-  if (parallel && campaigns.length > 2) {
+  if (parallel && campaigns.length > 1) {
     try {
       const os = require('os');
       const cpus = os.cpus().length;
@@ -850,19 +872,18 @@ async function main() {
         console.log(`  Battery: ${battery}% ${isCharging ? '(charging)' : '(battery)'}`);
       }
 
-      const maxParallel = (freeMem < 2 || loadPct > 80 || (battery !== null && battery < 30 && !isCharging))
-        ? 2
-        : (freeMem < 4 || loadPct > 50)
-          ? 3
-          : campaigns.length;
+      const maxParallel = require('./som-lock').parallelLimit({
+        freeGb: freeMem, loadPct, battery, charging: isCharging,
+        requested: parseInt(process.env.SOM_MAX_PARALLEL || '2', 10),
+      });
 
       if (maxParallel < campaigns.length) {
         console.log(`  ⚠️  Throttling: ${maxParallel} campaigns at a time (was ${campaigns.length})`);
-        console.log(`     Reason: ${freeMem < 2 ? 'low memory' : loadPct > 80 ? 'high CPU' : 'low battery'}`);
-        process.env.SOM_MAX_PARALLEL = String(maxParallel);
+        console.log(`     Reason: ${freeMem < 4 ? 'low memory' : loadPct > 50 ? 'high CPU' : maxParallel === 2 ? 'two browsers at most' : 'low battery'}`);
       } else {
         console.log(`  ✅ Resources OK — running ${campaigns.length} campaigns in parallel`);
       }
+      process.env.SOM_MAX_PARALLEL = String(maxParallel);
       console.log('');
     } catch (e) {
       // Resource check is best-effort, don't block on errors

@@ -104,3 +104,32 @@ test('every Discord alert skips quietly when no webhook is configured', () => {
     assert.strictEqual(guarded, sites, `${f}: ${sites - guarded} unguarded Discord alert(s)`)
   }
 })
+
+// Chrome left running after a stop, and a "throttle" that added browsers (2026-10-23).
+const { descendantPids, orphanBrowserPids, parallelLimit } = require('../som/som-lock')
+
+test('a stop reaches the whole campaign tree, browsers included', () => {
+  const ps = ['100 1', '200 100', '300 200', '400 300', '401 400', '402 400', '999 1'].join('\n')
+  assert.deepStrictEqual(descendantPids(ps, 100).sort(), [200, 300, 400, 401, 402])
+  assert.deepStrictEqual(descendantPids(ps, 999), [])
+})
+
+test('only Playwright browsers whose owner died are closed', () => {
+  const chrome = '/home/u/.cache/ms-playwright/chromium-1223/chrome-linux64/chrome --no-sandbox --remote-debugging-pipe'
+  const ps = [
+    `500 1 ${chrome}`,                                   // owner gone → orphan
+    `501 4321 ${chrome}`,                                // a live run owns it
+    '502 500 /home/u/.cache/ms-playwright/chromium-1223/chrome-linux64/chrome --type=renderer', // helper, dies with 500
+    '503 1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome',                     // your own Chrome
+  ].join('\n')
+  assert.deepStrictEqual(orphanBrowserPids(ps), [500])
+})
+
+test('a busier machine never gets more browsers', () => {
+  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10 }), 2)
+  assert.strictEqual(parallelLimit({ freeGb: 3, loadPct: 10 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 60 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, battery: 20, charging: false }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, requested: 1 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, requested: 5 }), 2)
+})
