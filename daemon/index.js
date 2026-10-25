@@ -2954,7 +2954,8 @@ LIMIT ${limit}
         { slug: 'claude-code', name: 'claude_code' },
         { slug: 'opencode', name: 'opencode' },
         { slug: 'ollama', name: 'ollama' },
-        { slug: 'codex', name: 'codex' } // #188539 — list-only
+        { slug: 'codex', name: 'codex' }, // #188539 — list-only
+        { slug: 'acp', name: 'acp' } // #191170 — `iris acp run --keep`; message + answer reach the live session
       ]
 
       const sessions = []
