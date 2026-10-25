@@ -4128,8 +4128,8 @@ exit 1
           const isAnswer = sessionConfig.answers && typeof sessionConfig.answers === 'object'
           // Claude Code (hook / tmux keystroke) and opencode / IRIS Desktop (the engine's own
           // permission and question replies, #190649) can be answered; anything else cannot.
-          if (isAnswer && !['claude-code', 'opencode'].includes(providerSlug)) {
-            reject(new Error(`answering a waiting question is only supported for Claude Code and opencode sessions, not ${sessionProvider}`))
+          if (isAnswer && !['claude-code', 'opencode', 'acp'].includes(providerSlug)) {
+            reject(new Error(`answering a waiting question is only supported for Claude Code, opencode and kept ACP sessions, not ${sessionProvider}`))
             return
           }
           const msgBody = (isAnswer

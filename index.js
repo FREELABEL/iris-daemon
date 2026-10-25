@@ -3809,6 +3809,49 @@ app.get('/api/sessions/ollama/:id/history', (req, res) => {
 // List Ollama sessions
 // Codex CLI sessions (#188539) — read from $CODEX_HOME/sessions, head + tail only. List-only:
 // sending into a Codex session is not supported, and saying so is better than pretending.
+// ─── ACP sessions held by `iris acp run --keep` (#191170) ─────────────────────────────────────
+// Claude Code / Codex / Gemini / opencode / IRIS driven over the Agent Client Protocol by an iris
+// process that stays up. Unlike claude-code's /message (a second `claude -p --resume` process),
+// these reach the RUNNING session: the holder runs the turn and holds its permission prompts.
+app.get('/api/sessions/acp', (req, res) => {
+  try {
+    const { listAcpSessions } = require('./lib/acp-sessions')
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100)
+    res.json({ sessions: listAcpSessions(fs, process.env.HOME, limit) })
+  } catch (err) {
+    console.log(`[acp] List sessions failed: ${err.message}`)
+    res.json({ sessions: [], error: err.message })
+  }
+})
+
+async function forwardToAcpHolder (req, res, method, route, body) {
+  const { findHolder, callHolder } = require('./lib/acp-sessions')
+  const sid = req.params.id
+  const rec = findHolder(fs, process.env.HOME, sid)
+  if (!rec) {
+    return res.status(404).json({ error: `No kept ACP session ${sid} on this node (iris acp sessions lists them).`, session_id: sid })
+  }
+  const out = await callHolder(fetch, rec, method, route, body, route === '/history' ? 20000 : 8000)
+  res.status(out.status).json(out.body)
+}
+
+app.post('/api/sessions/acp/:id/message', async (req, res) => {
+  const { message, from } = req.body || {}
+  console.log(`[acp] Message to ${req.params.id.slice(-8)}`)
+  await forwardToAcpHolder(req, res, 'POST', '/message', { message, from })
+})
+
+app.post('/api/sessions/acp/:id/answer', async (req, res) => {
+  const out = await forwardToAcpHolder(req, res, 'POST', '/answer', { answers: (req.body || {}).answers })
+  console.log(`[acp] answer ${req.params.id.slice(-8)} -> ${res.statusCode}`)
+  return out
+})
+
+app.get('/api/sessions/acp/:id/history', async (req, res) => {
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 60, 200))
+  await forwardToAcpHolder(req, res, 'GET', `/history?limit=${limit}`)
+})
+
 app.get('/api/sessions/codex', (req, res) => {
   try {
     const { listCodexSessions } = require('./lib/codex-sessions')
