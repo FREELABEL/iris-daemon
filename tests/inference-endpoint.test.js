@@ -143,12 +143,12 @@ test('only /v1/chat/completions and /healthz exist; healthz says nothing about m
   assert.strictEqual((await fetch(`${r.base}/api/sessions/claude-code`)).status, 404)
 })
 
-test('the switch: missing file is off; the report is null when off and lists served models when on', () => {
+test('the switch: missing file is off; the report says so explicitly, and lists served models when on', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'inf-'))
   assert.strictEqual(readSettings(home).enabled, false)
   const localModels = { report: () => ({ available: true, models: ['qwen3:14b', 'phi4', 'nomic-embed-text'] }) }
   const ep = new InferenceEndpoint({ getKey: () => KEY, getNodeId: () => NODE, localModels, home, upstream: () => 'http://x', log: () => {} })
-  assert.strictEqual(ep.report(), null)
+  assert.deepStrictEqual(ep.report(), { enabled: false }, 'off is said out loud, so the hub stops routing')
   fs.mkdirSync(path.join(home, '.iris'))
   fs.writeFileSync(path.join(home, '.iris', 'inference.json'), JSON.stringify({ enabled: true, url: 'https://hive-001-ai.t.heyiris.io/', models: ['qwen3:14b', 'phi4'], port: 80 }))
   const rep = ep.report()

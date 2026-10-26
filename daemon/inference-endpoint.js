@@ -241,10 +241,14 @@ class InferenceEndpoint {
     this.log('stopped')
   }
 
-  /** The heartbeat field. Omitted (null) when off, so the hub never routes to a machine that said no. */
+  /**
+   * The heartbeat field. EXPLICIT when off: the hub keeps the last report when a key is absent
+   * (that is how it treats an older daemon), so omitting it would leave a machine that said no
+   * still routable until its report went stale.
+   */
   report () {
     const s = readSettings(this.home)
-    if (!s.enabled) return null
+    if (!s.enabled) return { enabled: false }
     return { enabled: true, listening: !!this.server, url: s.url, port: s.port, models: this.served(), max_concurrent: s.max_concurrent }
   }
 }

@@ -593,7 +593,8 @@ class Daemon {
       // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
       // its model can run. From a background cache; omitted until the first probe lands.
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
-      // Whether this machine serves its models to the owner's gateway, and where (#191176). Omitted when off.
+      // Whether this machine serves its models to the owner's gateway, and where (#191176). Sent
+      // when off too ({enabled:false}): the hub keeps a stale report for an absent key.
       ...(this.inference && this.inference.report() ? { inference: this.inference.report() } : {}),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
