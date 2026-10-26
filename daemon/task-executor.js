@@ -531,10 +531,31 @@ function getSomPreflightCheck () {
 // Task types whose non-zero exit is a real failure, never "completed with warnings".
 // som_batch: som-all.js exits 1 only when a campaign failed (#190291); reporting that as
 // "✓ completed" is how a broken SOM looked healthy for days (#190300).
-const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch'])
+// playbook_run/skill_run: `iris playbook run` exits 1 when a step failed — a scheduled
+// publisher that 401s must read as failed, not "with warnings" (#191214).
+const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch', 'playbook_run', 'skill_run'])
 function statusForExit (type, exitCode) {
   if (exitCode === 0) return 'completed'
   return NONZERO_IS_FAILURE.has(type) ? 'failed' : 'completed_with_warnings'
+}
+
+// The folder a playbook_run task runs in, so `iris playbook run` finds a project's own
+// .iris/playbooks/ and the files it reads relative to the repo. Was assigned to an undeclared
+// `cwd` and threw "cwd is not defined" on every task that set it (#191214). Returns null when
+// unset; throws on a path that is not an existing absolute directory, rather than silently
+// running somewhere else.
+function resolvePlaybookCwd (config) {
+  const dir = config && config.cwd
+  if (dir === undefined || dir === null || dir === '') return null
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) {
+    throw new Error(`playbook_run config.cwd must be an absolute path, got ${JSON.stringify(dir)}`)
+  }
+  let stat
+  try { stat = fs.statSync(dir) } catch { stat = null }
+  if (!stat || !stat.isDirectory()) {
+    throw new Error(`playbook_run config.cwd is not a directory on this machine: ${dir}`)
+  }
+  return dir
 }
 
 function somConfigCandidates (freelabelRoot) {
@@ -2167,10 +2188,9 @@ class TaskExecutor {
           }
           cmd = irisPath
           args = ['playbook', 'run', skillName, ...skillArgs, '--yes', '--json']
-          // Set cwd to project root if available (so playbooks can find .iris/playbooks/)
-          if (task.config?.cwd) {
-            cwd = task.config.cwd
-          }
+          // Run in the project root if given (so playbooks can find .iris/playbooks/)
+          const playbookCwd = resolvePlaybookCwd(task.config)
+          if (playbookCwd) workspace.projectDir = playbookCwd
           break
         }
 
@@ -5874,4 +5894,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit }
+module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }
