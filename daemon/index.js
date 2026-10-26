@@ -653,9 +653,14 @@ class Daemon {
         ...this.pendingTaskIds
       ])]
     })
+    this.sessionIndexBackfill = new (require('./session-index-backfill').SessionIndexBackfill)({
+      post: (path, body) => this.cloud.post(path, body)
+    })
     this.heartbeat.onPingCallback = () => {
       this._writeStatusFile()
       this._refreshSessionCache() // refresh session data after each heartbeat
+      // Full session list to the recall index — at most daily; the heartbeat carries only 25/provider (#191232).
+      this.sessionIndexBackfill.maybeRun().catch(() => {})
       if (this.scheduleRegistry) this.scheduleRegistry.flushPending().catch(() => {})
     }
     // #187457 — a push subscription can die silently, and the heartbeat reply's dispatched_count does
