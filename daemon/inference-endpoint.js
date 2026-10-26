@@ -29,7 +29,7 @@ const os = require('os')
 
 const MAX_TTL_S = 300
 const MAX_BODY = 2 * 1024 * 1024
-const DEFAULTS = { enabled: false, port: 3290, max_concurrent: 2, max_tokens: 8192, url: null, models: null }
+const DEFAULTS = { enabled: false, port: 3290, max_concurrent: 2, max_tokens: 8192, url: null, models: null, default_model: null }
 
 const settingsFile = (home = os.homedir()) => path.join(home, '.iris', 'inference.json')
 
@@ -44,6 +44,7 @@ function readSettings (home) {
     s.max_tokens = Math.max(1, Math.min(131072, Number(s.max_tokens) || DEFAULTS.max_tokens))
     s.url = typeof s.url === 'string' && /^https:\/\//.test(s.url) ? s.url.replace(/\/+$/, '') : null
     s.models = Array.isArray(s.models) ? s.models.filter((m) => typeof m === 'string') : null
+    s.default_model = typeof s.default_model === 'string' && s.default_model ? s.default_model : null
     return s
   } catch {
     return { ...DEFAULTS }
@@ -249,7 +250,11 @@ class InferenceEndpoint {
   report () {
     const s = readSettings(this.home)
     if (!s.enabled) return { enabled: false }
-    return { enabled: true, listening: !!this.server, url: s.url, port: s.port, models: this.served(), max_concurrent: s.max_concurrent }
+    const models = this.served()
+    // The model to use when a request must stay on the owner's machines (PHI, `phi_local_only`)
+    // and did not name one of them. Chosen by the owner; reported only if this machine serves it.
+    const def = s.default_model && models.includes(s.default_model) ? s.default_model : null
+    return { enabled: true, listening: !!this.server, url: s.url, port: s.port, models, default_model: def, max_concurrent: s.max_concurrent }
   }
 }
 
