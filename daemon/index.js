@@ -38,7 +38,8 @@ const { isPhiTask } = require('../lib/phi-task')
 const { writeFileAtomic } = require('../lib/atomic-write')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
-const { LocalModelReporter } = require('./local-llm')
+const { LocalModelReporter, resolveLocalLlmConfig } = require('./local-llm')
+const { InferenceEndpoint } = require('./inference-endpoint')
 const { MeshLlmSupervisor } = require('./mesh-llm-supervisor')
 const { startDeviceProbe, getDeviceReport } = require('./device-capabilities')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
@@ -458,6 +459,23 @@ class Daemon {
       this.meshLlm = null
     }
     this.localModels = new LocalModelReporter().start()
+    // This machine's models, served to the owner's IRIS gateway through a relay tunnel (#191176).
+    // Off unless ~/.iris/inference.json says so; re-read every 15 s so `iris hive models serve on`
+    // needs no restart. The key is read live: a healed node rotates it.
+    try {
+      this.inference = new InferenceEndpoint({
+        getKey: () => this.config.apiKey,
+        getNodeId: () => this.nodeId,
+        localModels: this.localModels,
+        upstream: () => resolveLocalLlmConfig(process.env).baseUrl
+      })
+      this.inference.tick()
+      this._inferenceTimer = setInterval(() => this.inference.tick(), 15000)
+      if (this._inferenceTimer.unref) this._inferenceTimer.unref()
+    } catch (e) {
+      console.error(`[inference] not started: ${e.message}`)
+      this.inference = null
+    }
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
       // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup
@@ -575,6 +593,8 @@ class Daemon {
       // on the mesh when it points at MeshLLM — so the hub sends a `local_llm` task only where
       // its model can run. From a background cache; omitted until the first probe lands.
       ...(this.localModels && this.localModels.report() ? { local_llm: this.localModels.report() } : {}),
+      // Whether this machine serves its models to the owner's gateway, and where (#191176). Omitted when off.
+      ...(this.inference && this.inference.report() ? { inference: this.inference.report() } : {}),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
       ...(this._atlasSyncReport ? { atlas_sync: this._atlasSyncReport } : {}),
@@ -3082,6 +3102,8 @@ LIMIT ${limit}
     console.log(`\n[daemon] Shutting down (${signal})...`)
 
     if (this.localModels) this.localModels.stop()
+    if (this._inferenceTimer) clearInterval(this._inferenceTimer)
+    if (this.inference) this.inference.stop()
     if (this.meshLlm) this.meshLlm.stop()
 
     // Stop mesh networking
