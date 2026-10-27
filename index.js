@@ -1461,6 +1461,13 @@ app.get('/api/instagram/inbox', async (req, res) => {
   }
 })
 
+// ─── Instagram: comment a keyword, get a DM (FL-CO-47, #190735) ─────
+//
+// Runs som/instagram-keyword-dm.spec.ts once, when a person asks. No schedule, no polling.
+// POST /api/instagram/keyword-dm (dry run unless send === true) and
+// GET /api/instagram/keyword-dm/ledger — see lib/keyword-dm-route.js. Behind the global bridgeAuth.
+require('./lib/keyword-dm-route').mountKeywordDm(app, { rootDir: __dirname })
+
 // ─── Discord Data Endpoints ──────────────────────────────────────
 
 function getDiscordClient () {
