@@ -36,7 +36,7 @@ test('data homes: the default account plus every account folder, never a key', (
     accounts: [{ user_id: 5498, key: 'iris_live_SECRET', data_dir: '/x/accounts/5498' }]
   }))
   const homes = desktopDataHomes(h)
-  assert.deepStrictEqual(homes, [path.join(h, '.iris', 'accounts', 'default'), '/x/accounts/5498'])
+  assert.deepStrictEqual(homes, [path.join(h, '.iris', 'accounts', 'default'), '/x/accounts/5498', path.join(h, '.local', 'share')])
   assert.ok(!JSON.stringify(homes).includes('SECRET'))
 })
 
@@ -142,4 +142,28 @@ test('end to end on a real database (node:sqlite or the sqlite3 CLI)', (t) => {
   const r = openReader(db)
   assert.throws(() => r.all("INSERT INTO session (id) VALUES ('x')"))
   r.close()
+})
+
+// #191305 — Desktop moved to ~/.iris/accounts/default and left 107 sessions in the old shared
+// folder; the bridge answered "not found on this machine" for every one of them.
+test('a session left in the old shared folder is still found, after the per-account folder', () => {
+  const h = home()
+  fs.writeFileSync(path.join(h, '.iris', 'accounts', 'default', 'opencode', 'opencode.db'), '')
+  fs.mkdirSync(path.join(h, '.local', 'share', 'opencode'), { recursive: true })
+  fs.writeFileSync(path.join(h, '.local', 'share', 'opencode', 'opencode.db'), '')
+  const part = (o) => JSON.stringify(o)
+  const byDb = {
+    [path.join(h, '.iris', 'accounts', 'default', 'opencode', 'opencode.db')]: { list: [{ id: 'ses_new', directory: '/a', time_created: 3, time_updated: 4 }], parts: {} },
+    [path.join(h, '.local', 'share', 'opencode', 'opencode.db')]: {
+      list: [{ id: 'ses_old', directory: '/b', time_created: 1, time_updated: 2 }],
+      parts: { ses_old: [{ mid: 'm1', role: 'user', time: 1, part: part({ type: 'text', text: 'hive chat fixes' }) }] }
+    }
+  }
+  const reader = (dbPath) => fakeReader(byDb[dbPath] || { list: [], parts: {} })()
+
+  const out = desktopSessionHistory('ses_old', { home: h, reader })
+  assert.ok(out, 'a session in the old folder must be readable')
+  assert.deepStrictEqual(out.messages.map((m) => m.text), ['hive chat fixes'])
+  const listed = listDesktopSessions({ home: h, reader }).map((r) => r.session_id)
+  assert.ok(listed.includes('ses_new') && listed.includes('ses_old'), `listed: ${listed}`)
 })
