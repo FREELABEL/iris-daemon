@@ -8,6 +8,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
@@ -275,6 +277,13 @@ function recordLinkedInDmSent(leadId?: number | null): void {
 }
 
 test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, context }) => {
+  // ── STRATEGY MUST EXIST (#191275) — before any login, browsing or message ──
+  {
+    const sc = await checkStrategy(BOARD_ID, STRATEGY_NAME, { token: TOKEN });
+    if (!sc.ok) throw new Error(`${describeFailure(BOARD_ID, sc)} Nothing was sent.`);
+    console.log(`✓ Strategy "${STRATEGY_NAME}" found on board ${BOARD_ID}`);
+  }
+
   // ── AUTH (HeyIRIS) ──
   await AuthHelper.loginWithToken(page, FRONTEND_TOKEN);
 
@@ -976,13 +985,17 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           }
 
           if (!msg) {
-            console.log(`  ⚠ Strategy script not found — using fallback`);
+            console.log(`  ⚠ No script or message for this lead`);
           }
         } catch (msgErr: any) {
-          console.log(`  ⚠ Message generation failed: ${msgErr.message} — using fallback`);
+          console.log(`  ⚠ Message generation failed: ${msgErr.message}`);
         }
         if (!msg) {
-          msg = `Hey ${name}! Noticed you're doing some interesting work. Would love to connect.`;
+          // Never send a generic stand-in to a real person (#191275): skip this lead instead.
+          console.log(`  ✗ No message could be built from "${STRATEGY_NAME}" — skipping this lead, nothing sent`);
+          results.failed++;
+          await page.keyboard.press('Escape').catch(() => {});
+          continue;
         }
         console.log(`-> Msg: "${msg.substring(0, 60)}..."`);
 

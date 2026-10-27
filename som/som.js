@@ -397,6 +397,17 @@ async function main() {
     const boardId = env.BOARD_ID;
     const strategy = env.STRATEGY;
     const pfMode = mode === 'followup' ? 'followup' : 'new';
+    // The strategy must exist on this board before anything opens or sends (#191275).
+    if (mode === 'outreach' || mode === 'followup') {
+      const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
+      const sc = await checkStrategy(boardId, strategy);
+      if (!sc.ok) {
+        console.error(`\n  ✗ ${describeFailure(boardId, sc)}`);
+        console.error(`  Nothing was sent. Pass the exact name: strategy="<name>"\n`);
+        process.exit(1);
+      }
+      console.log(`  Strategy: "${strategy}" found on board ${boardId}.`);
+    }
     console.log(`\n  Pre-flight: checking board ${boardId} for eligible leads...`);
     const pf = await preflightCheck(boardId, strategy, { mode: pfMode });
     console.log(`  Pre-flight: ${pf.reason}`);
