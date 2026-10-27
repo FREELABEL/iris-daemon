@@ -4169,6 +4169,14 @@ app.get('/api/sessions/claude-code', async (req, res) => {
 })
 
 app.get('/api/sessions/opencode', async (req, res) => {
+  // Stage timing (#191306): this route took 33 s on a Mac with no stage explaining it. Logged when
+  // slow; returned with ?timings=1 so a remote caller can see it without shell access.
+  const { stageTimer, SLOW_MS } = require('./lib/stage-timer')
+  const timer = stageTimer()
+  const finish = (body) => {
+    if (timer.total() > SLOW_MS) console.warn(`[sessions/opencode] slow: ${timer.summary()}`)
+    return res.json(req.query.timings === '1' ? { ...body, timings: { total_ms: timer.total(), stages: timer.stages } } : body)
+  }
   try {
     const ocDir = path.join(process.env.HOME, '.local', 'share', 'opencode', 'storage', 'session')
     const limit = parseInt(req.query.limit) || 50
@@ -4195,6 +4203,7 @@ app.get('/api/sessions/opencode', async (req, res) => {
       }
     }
     candidates.sort((a, b) => b.mtime - a.mtime)
+    timer.mark('scan_files')
 
     for (const { projPath, file } of candidates.slice(0, limit)) {
       {
@@ -4237,11 +4246,15 @@ app.get('/api/sessions/opencode', async (req, res) => {
     // machine you sit at was the one the fleet knew least about (a Mac listed 25 opencode
     // sessions, none of them Desktop's). Desktop's database is read even while Desktop is closed;
     // the running servers report what is live and any store not under ~/.iris/accounts.
+    timer.mark('read_files')
     const { listDesktopSessions } = require('./lib/desktop-sessions')
     const desktop = listDesktopSessions({ limit, readGitBranch })
+    timer.mark('desktop_sqlite')
     const { listServerSessions, mergeSessionRows } = require('./lib/server-sessions')
     const servers = await sessionServerCandidatesAsync()
+    timer.mark('find_servers')
     const fromServers = await listServerSessions({ servers, fetchJson: fetchJsonFromSessionServer, limit })
+    timer.mark('ask_servers')
     // Freshest row wins per id, gaps filled from the others.
     const page = mergeSessionRows(mergeSessionRows(sessions, desktop), fromServers.rows, limit)
 
@@ -4252,6 +4265,7 @@ app.get('/api/sessions/opencode', async (req, res) => {
     if (req.query.live === '1') {
       const { opencodeActivity } = require('./lib/opencode-activity')
       const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
+      timer.mark('live_activity')
       for (const s of page) s.activity = live.activity[s.session_id] || null
       // A permission prompt or question the engine is HOLDING for a person (#190649) — reported in
       // the same `waiting` shape as Claude Code, so needs_you and `iris hive answer` just work.
@@ -4262,14 +4276,15 @@ app.get('/api/sessions/opencode', async (req, res) => {
         .filter((s) => s.project_path && Date.now() - Date.parse(s.updated_at || 0) <= ACTIVITY_WINDOW_MS)
         .map((s) => s.project_path)
       const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: fetchJsonFromSessionServer })
+      timer.mark('pending_questions')
       for (const s of page) { const p = pending.get(s.session_id); if (p) s.waiting = p.waiting }
-      return res.json({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
+      return finish({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
     }
 
-    res.json({ sessions: page, servers_answered: fromServers.answered })
+    finish({ sessions: page, servers_answered: fromServers.answered })
   } catch (err) {
     console.log(`[opencode] List sessions failed: ${err.message}`)
-    res.json({ sessions: [], error: err.message })
+    finish({ sessions: [], error: err.message })
   }
 })
 
