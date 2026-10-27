@@ -533,7 +533,8 @@ function getSomPreflightCheck () {
 // "✓ completed" is how a broken SOM looked healthy for days (#190300).
 // playbook_run/skill_run: `iris playbook run` exits 1 when a step failed — a scheduled
 // publisher that 401s must read as failed, not "with warnings" (#191214).
-const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch', 'playbook_run', 'skill_run'])
+// clip_cutter: a clip that never reaches IG must read as failed (#191214).
+const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch', 'playbook_run', 'skill_run', 'clip_cutter'])
 function statusForExit (type, exitCode) {
   if (exitCode === 0) return 'completed'
   return NONZERO_IS_FAILURE.has(type) ? 'failed' : 'completed_with_warnings'
@@ -3641,8 +3642,16 @@ const BODY = ${JSON.stringify(clipBody)};
   console.log(JSON.stringify(json, null, 2));
 })().catch(err => { console.error('[clip_cutter] ERROR: ' + err.message); process.exit(1); });
 `
+          // download=hive: this node downloads the video section (YouTube blocks the server's
+          // IPs, #191214) and hands it to fl-api via a pre-signed R2 upload. See clip-hive-download.js.
+          const hiveScript = `
+require(${JSON.stringify(path.join(__dirname, 'clip-hive-download.js'))})
+  .run({ api: ${JSON.stringify(clipApiBase)}, token: ${JSON.stringify(clipToken)}, body: ${JSON.stringify(clipBody)} })
+  .then(r => console.log(JSON.stringify(r, null, 2)))
+  .catch(err => { console.error('[clip_cutter] ERROR: ' + err.message); process.exit(1); });
+`
           const clipScriptPath = path.join(workspace.dir, 'clip-cutter-task.js')
-          fs.writeFileSync(clipScriptPath, clipScript, 'utf-8')
+          fs.writeFileSync(clipScriptPath, clipGet('download') === 'hive' ? hiveScript : clipScript, 'utf-8')
           cmd = 'node'
           args = [clipScriptPath]
           break
