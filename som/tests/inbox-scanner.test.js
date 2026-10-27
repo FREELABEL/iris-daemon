@@ -89,19 +89,38 @@ function detectReply(profile, ourName) {
   return false
 }
 
-function matchLeadLocal(leads, contactName, contactPhone, phoneMap) {
-  if (contactPhone && phoneMap) {
-    const normalized = normalizePhone(contactPhone)
-    const hit = phoneMap.get(normalized)
+function normalizeHandle(handle) {
+  return (handle || '').toLowerCase().trim().replace(/^@+/, '').trim()
+}
+
+function exactHandleMatch(a, b) {
+  const na = normalizeHandle(a)
+  const nb = normalizeHandle(b)
+  return !!na && !!nb && na === nb
+}
+
+function matchLeadLocal(leads, contactHandle, contactPhone, phoneMap) {
+  // Exact handle identity only (#191271) — a display name is not a handle.
+  const wanted = normalizeHandle(contactHandle)
+  if (wanted) {
+    const hit = leads.find(lead => exactHandleMatch(lead.igHandle != null ? lead.igHandle : lead.handle, wanted))
     if (hit) return hit
   }
 
-  return leads.find(lead => {
-    if (lead.igHandle && contactName && nameMatch(lead.igHandle, contactName)) return true
-    if (lead.name && contactName && nameMatch(lead.name, contactName)) return true
-    if (contactPhone && lead.phone && phoneMatch(contactPhone, lead.phone)) return true
-    return false
-  })
+  if (contactPhone && phoneMap) {
+    const normalized = normalizePhone(contactPhone)
+    if (normalized.length >= 7) {
+      const hit = phoneMap.get(normalized)
+      if (hit) return hit
+    }
+  }
+
+  if (contactPhone) {
+    const hit = leads.find(lead => lead.phone && phoneMatch(contactPhone, lead.phone))
+    if (hit) return hit
+  }
+
+  return undefined
 }
 
 function autoDetectOurName(profiles) {
@@ -294,9 +313,21 @@ test('match by igHandle', () => {
   assert(result && result.id === 2, 'Should match Yukta by igHandle')
 })
 
-test('match by name', () => {
+test('display name does NOT match (#191271 regression)', () => {
   const result = matchLeadLocal(testLeads, 'Richard Delgado', '', undefined)
-  assert(result && result.id === 1, 'Should match Richard by name')
+  assert(!result, 'A display name is not identity — must not match by name')
+})
+
+test('near-miss handle does NOT match (#191271)', () => {
+  // @wicus_j's reply ended up on lead #8213 because the matcher accepted a close name
+  const leads = [{ id: 8213, name: 'Wicus', igHandle: 'wicus.j' }]
+  const result = matchLeadLocal(leads, 'wicus_j', '', undefined)
+  assert(!result, 'wicus_j and wicus.j are different accounts')
+})
+
+test('handle match ignores case and a leading @', () => {
+  const result = matchLeadLocal(testLeads, '@Yukta.Kandhari', '', undefined)
+  assert(result && result.id === 2, 'Case and @ are formatting, not identity')
 })
 
 test('short name does NOT false-positive match', () => {
