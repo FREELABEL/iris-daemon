@@ -10,7 +10,7 @@
 #
 # Configuration (env or ~/.iris/bridge/.env):
 #   HEYIRIS_TOKEN        required
-#   CAPTURE_ACCOUNTS     "heyiris.io:38,freelabelnet:24,thediscoverpage_:28"
+#   CAPTURE_ACCOUNTS     "heyiris.io:38,thediscoverpage_:80"
 #                        (or IG_ACCOUNT + BOARD_ID for one account)
 #   CAPTURE_LIMIT        max conversations per account (default 500)
 #   CAPTURE_SCROLLS      scroll attempts per account (default 60)

@@ -10,7 +10,7 @@ import * as https from 'https';
 import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
-import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
+import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
 
 const TOKEN = process.env.HEYIRIS_TOKEN;
 if (!TOKEN) throw new Error('HEYIRIS_TOKEN env var required. Set in ~/.iris/bridge/.env or export it.');
@@ -471,7 +471,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       }
 
       // Scan inbox using the appropriate provider
-      const provider = IS_LINKEDIN ? new LinkedInInboxProvider() : new InstagramInboxProvider();
+      const provider = IS_LINKEDIN ? new LinkedInInboxProvider() : new InstagramInboxJsonProvider(IG_ACCOUNT);
       const inboxResult = await provider.discover(page, context, {
         targetUrl: messagingUrl,
         limit: INBOX_LIMIT,
@@ -510,6 +510,9 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         console.log(`\n   ${scanResult.tagged.length} leads replied — they will be skipped in outreach\n`);
       }
     } catch (inboxErr: any) {
+      // Logged in as the wrong account: every DM after this would go out under someone
+      // else's name. Stop the batch, never "continue to outreach" (#191277).
+      if (inboxErr instanceof InstagramIdentityError) throw inboxErr;
       console.log(`   Inbox scan failed: ${inboxErr.message} — continuing to outreach\n`);
     }
   } else {

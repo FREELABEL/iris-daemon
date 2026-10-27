@@ -1,5 +1,5 @@
 import { test } from '@playwright/test';
-import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
+import { InstagramInboxJsonProvider } from './helpers/providers/instagram-inbox-json-provider';
 import { dismissInstagramPopups } from './helpers/providers/base-provider';
 import {
   fetchBoardLeads, runInboxScan, printSummary, sendResultAlert,
@@ -68,7 +68,8 @@ test(`Instagram Inbox Reply Check — @${IG_ACCOUNT} / Board ${BOARD_ID}`, async
 
   // ── Scan inbox ──
   console.log(`\nScanning Instagram inbox (limit: ${LIMIT} conversations)...`);
-  const provider = new InstagramInboxProvider();
+  // Exact handles + identity guard: refuses a session logged in as another account (#191277, #191279)
+  const provider = new InstagramInboxJsonProvider(IG_ACCOUNT);
   const inboxResult = await provider.discover(page, context, {
     targetUrl: 'https://www.instagram.com/direct/inbox/',
     limit: LIMIT,

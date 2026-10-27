@@ -9,7 +9,7 @@
  * account, and reads as far back as the provider can scroll.
  *
  * Config — either:
- *   CAPTURE_ACCOUNTS="heyiris.io:38,freelabelnet:24,thediscoverpage_:28"
+ *   CAPTURE_ACCOUNTS="heyiris.io:38,thediscoverpage_:80"   (account:boardId — a BOARD id, not an integration id)
  * or the single-account fallback:
  *   IG_ACCOUNT=heyiris.io BOARD_ID=38
  *
@@ -23,11 +23,8 @@
  *   npx playwright test capture-replies.spec.ts
  */
 import { test, Browser, BrowserContext } from '@playwright/test';
-import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
-import {
-  fetchBoardLeads, runInboxScan, printSummary, sendResultAlert,
-  persistUnmatchedReplies, sendDiscordAlert, Lead, ScanConfig,
-} from './helpers/inbox-scanner';
+import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
+import { syncInbox, sendDiscordAlert } from './helpers/inbox-scanner';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -79,6 +76,8 @@ function sessionFile(account: string): string | null {
 async function captureAccount(
   browser: Browser,
   { account, boardId }: CaptureAccount,
+  failures: string[],
+  summary: Record<string, any>[],
 ): Promise<void> {
   const label = `@${account} / Board ${boardId}`;
   console.log(`\n${'='.repeat(60)}\n  CAPTURE ${label}\n${'='.repeat(60)}`);
@@ -87,12 +86,14 @@ async function captureAccount(
   if (!file) {
     console.log(`  SKIP: no Instagram session file for @${account}`);
     await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — no session** @${account} (board ${boardId})`);
+    failures.push(`@${account}: no session file`);
     return;
   }
 
   const state = JSON.parse(fs.readFileSync(file, 'utf-8'));
   if (!state.cookies || state.cookies.length === 0) {
     console.log(`  SKIP: session file has no cookies (${file})`);
+    failures.push(`@${account}: session file has no cookies`);
     return;
   }
 
@@ -102,62 +103,49 @@ async function captureAccount(
     await context.addCookies(state.cookies);
     const page = await context.newPage();
 
-    // ── Session preflight: never scan a logged-out shell and report "0 replies" ──
-    await page.goto('https://www.instagram.com/', { timeout: 20000, waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(2000);
-    const onLogin = page.url().includes('/accounts/login') || page.url().includes('/challenge/');
-    const hasLoginForm = await page.locator('input[name="username"]').first()
-      .isVisible({ timeout: 2000 }).catch(() => false);
-    if (onLogin || hasLoginForm) {
-      console.log(`  SESSION EXPIRED: @${account} — re-save the session`);
-      await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — session expired** @${account} (board ${boardId})`);
-      return;
-    }
-
-    const boardLeads = await fetchBoardLeads<Lead>(API_BASE, TOKEN, boardId, (l) => ({
-      id: l.id,
-      name: (l.name || l.full_name || l.nickname || '').trim(),
-      // Identity is the stored handle, never the display name (#191271)
-      igHandle: (l.contact_info?.instagram || l.nickname || l.ig_handle || '')
-        .replace(/^@/, '').trim(),
-      phone: l.contact_info?.phone || l.phone || '',
-    }));
-    console.log(`  Loaded ${boardLeads.length} leads from board ${boardId}`);
-    if (boardLeads.length === 0) {
-      console.log(`  SKIP: board ${boardId} has no leads to match against`);
-      return;
-    }
-
-    const provider = new InstagramInboxProvider();
+    // Reads the inbox from the data Instagram's own page loads: exact usernames, exact sender,
+    // and it refuses a session that is logged in as a different account (#191277, #191279).
+    const provider = new InstagramInboxJsonProvider(account);
     const inbox = await provider.discover(page, context, {
       targetUrl: 'https://www.instagram.com/direct/inbox/',
       limit: CAPTURE_LIMIT,
       scrollAttempts: CAPTURE_SCROLLS,
-      scrollDelay: 2500,
+      scrollDelay: 1500,
     });
     console.log(`  Read ${inbox.profiles.length} conversations`);
     if (inbox.errors.length > 0) console.log(`  Provider errors: ${inbox.errors.join(', ')}`);
+    if (inbox.profiles.length === 0) {
+      // A logged-in inbox with zero threads is almost never true; reading nothing must not
+      // look like a quiet day (#190636).
+      throw new Error(`read 0 conversations for @${account} — treating as a failed capture, not "no replies"`);
+    }
 
-    const config: ScanConfig = {
-      platform: 'instagram',
-      account,
-      boardId,
-      apiBase: API_BASE,
-      token: TOKEN,
-      dryRun: DRY_RUN,
-      ourName: '',
-      discordWebhook: DISCORD_WEBHOOK,
-    };
-
-    const result = await runInboxScan(config, inbox.profiles, boardLeads, { autoDetectOurName: true });
-    printSummary(config, result);
-
-    // Non-lead replies become leads on this board instead of being dropped (#191270)
-    await persistUnmatchedReplies(config, result);
-    await sendResultAlert(config, result);
+    // One write path: every conversation goes to inbox-sync, which matches the WHOLE board by
+    // exact handle on the server, stores both sides of the thread (deduped per message), sets
+    // has_replied, and — with create_missing — makes a lead for someone we did not have yet
+    // (#191269 #191270 #191271 #191278). No client-side lead list, no second "replied" note.
+    const withReplies = inbox.profiles.filter(p => p.rawMetadata?.hasTheirMessage === true);
+    console.log(`  ${withReplies.length} of ${inbox.profiles.length} threads contain a message from them; ` +
+      `${inbox.profiles.filter(p => p.rawMetadata?.lastFromThem).length} are waiting on us`);
+    if (DRY_RUN) {
+      for (const p of withReplies.slice(0, 25)) {
+        console.log(`    @${p.username}${p.rawMetadata?.lastFromThem ? '  [waiting on us]' : ''}  "${String(p.rawMetadata?.lastMessage || '').slice(0, 70)}"`);
+      }
+      console.log(`  [DRY RUN] would send ${withReplies.length} conversations to inbox-sync (create_missing)`);
+      const out = path.join(__dirname, '../test-results', `capture-${account}.json`);
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, JSON.stringify(inbox.profiles, null, 1));
+      console.log(`  [DRY RUN] parsed threads written to ${out}`);
+      return;
+    }
+    const stats = await syncInbox(API_BASE, TOKEN, boardId, 'instagram', account, withReplies, '', { createMissing: true });
+    if (stats === null) throw new Error(`inbox-sync rejected the capture for @${account}`);
+    summary.push({ account, boardId, read: inbox.profiles.length, withReplies: withReplies.length, ...stats });
   } catch (err: any) {
-    console.log(`  CAPTURE FAILED for ${label}: ${err.message}`);
-    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — failed** ${label}\n${err.message}`);
+    const kind = err instanceof InstagramIdentityError ? 'wrong or expired session' : 'failed';
+    console.log(`  CAPTURE FAILED (${kind}) for ${label}: ${err.message}`);
+    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — ${kind}** ${label}\n${err.message}`);
+    failures.push(`${label}: ${err.message}`);
   } finally {
     await context?.close().catch(() => {});
   }
@@ -170,7 +158,14 @@ test('Capture Instagram replies — every account, read-only', async ({ browser 
   test.setTimeout(Math.max(600_000, list.length * 1_800_000));
   console.log(`Capturing replies for ${list.length} account(s), limit ${CAPTURE_LIMIT} threads each`);
 
+  const failures: string[] = [];
+  const summary: Record<string, any>[] = [];
   for (const entry of list) {
-    await captureAccount(browser, entry);
+    await captureAccount(browser, entry, failures, summary);
+  }
+  console.log(`\nCAPTURE SUMMARY ${JSON.stringify(summary)}`);
+  // One account failing must not hide behind the others passing.
+  if (failures.length > 0) {
+    throw new Error(`reply capture failed for ${failures.length} of ${list.length} account(s):\n  ` + failures.join('\n  '));
   }
 });

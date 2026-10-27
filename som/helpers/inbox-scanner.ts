@@ -216,7 +216,7 @@ export async function syncInbox(
   profiles: InboxProfile[],
   ourName: string,
   options?: { createMissing?: boolean },
-): Promise<void> {
+): Promise<Record<string, number> | null> {
   const conversations = profiles.map(profile => {
     const contactHandle = profile.rawMetadata?.phoneNumber || profile.username || profile.displayName || '';
     const fullMessages = profile.rawMetadata?.fullMessages || '';
@@ -240,7 +240,7 @@ export async function syncInbox(
     return { handle: contactHandle, replied, messages };
   }).filter(c => c.messages.length > 0);
 
-  if (conversations.length === 0) return;
+  if (conversations.length === 0) return {};
 
   try {
     const res = await fetch(`${apiBase}/api/v1/leads/inbox-sync`, {
@@ -262,12 +262,13 @@ export async function syncInbox(
       const data = await res.json();
       console.log(`\n  Inbox sync: ${data.stats?.new_messages || 0} new messages stored, ${data.stats?.replied || 0} leads marked replied` +
         (data.stats?.created ? `, ${data.stats.created} new leads created from replies` : ''));
-    } else {
-      console.log(`\n  Inbox sync failed: ${res.status}`);
+      return data.stats || {};
     }
+    console.log(`\n  Inbox sync failed: ${res.status} ${(await res.text().catch(() => '')).slice(0, 200)}`);
   } catch (err: any) {
     console.log(`\n  Inbox sync error: ${err.message}`);
   }
+  return null;
 }
 
 /** Store replies from people who are not leads yet, creating the lead instead of dropping it.
@@ -317,6 +318,11 @@ export function detectReply(
   profile: InboxProfile,
   ourName: string,
 ): boolean {
+  // A provider that knows the real sender of the newest message says so; no name guessing (#191279).
+  if (typeof profile.rawMetadata?.lastFromThem === 'boolean') {
+    return profile.rawMetadata.lastFromThem;
+  }
+
   const fullMessages = profile.rawMetadata?.fullMessages || '';
   const lastMessage = profile.rawMetadata?.lastMessage || '';
 
