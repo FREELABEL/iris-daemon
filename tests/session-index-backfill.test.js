@@ -2,7 +2,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert')
-const { SessionIndexBackfill, backfill, complete, toRow, PATH, EVERY_MS, RETRY_MS } = require('../daemon/session-index-backfill')
+const { SessionIndexBackfill, backfill, complete, toRow, PATH, EVERY_MS, RETRY_MS, BRIDGE_TIMEOUT_MS } = require('../daemon/session-index-backfill')
 
 // #191232 — the full session list for `iris recall`; the heartbeat carries only 25 per provider.
 
@@ -103,4 +103,25 @@ test('never runs twice at once', async () => {
   release()
   await first
   assert.strictEqual(calls, 3)
+})
+
+test('a slow machine is given time, and is not re-scanned twice an hour (#191302)', () => {
+  // Measured on the MacBook: the opencode list took 33s for 358 rows on the daemon's main thread.
+  assert.ok(BRIDGE_TIMEOUT_MS >= 120000, 'the list must be allowed to finish')
+  assert.ok(RETRY_MS >= 6 * 60 * 60 * 1000, 'an incomplete pass must not retry every 30 minutes')
+})
+
+test('the log says how long the pass took', async () => {
+  let t = 0
+  const lines = []
+  const b = new SessionIndexBackfill({
+    getJson: async () => { t += 33000; return { sessions: [] } },
+    post: async () => ({}),
+    now: () => t,
+    log: { log: (l) => lines.push(l), warn: (l) => lines.push(l) },
+    firstDelayMs: 0
+  })
+  const report = await b.maybeRun()
+  assert.strictEqual(report.durationMs, 99000)
+  assert.match(lines[0], / in 99s/)
 })
