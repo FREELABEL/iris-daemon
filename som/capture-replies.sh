@@ -6,7 +6,8 @@
 #
 # Run it from cron / systemd / a Hive schedule, not from a send run:
 #
-#   17 * * * *  cd /path/to/coding-agent-bridge/som && ./capture-replies.sh >> ../test-results/capture-replies.log 2>&1
+#   7 * * * *  flock -n /tmp/iris-reply-capture.lock ~/.iris/bridge/som/capture-replies.sh >> ~/.iris/data/reply-capture.log 2>&1
+#   Daily email: 45 13 * * *  ~/.iris/bridge/som/reply-digest.sh >> ~/.iris/data/reply-digest.log 2>&1
 #
 # Configuration (env or ~/.iris/bridge/.env):
 #   HEYIRIS_TOKEN        required
@@ -29,6 +30,9 @@ for env_file in "$HOME/.iris/bridge/.env" "$HOME/.iris/sdk/.env" .env; do
   fi
 done
 
+# The SDK login writes IRIS_API_KEY; the specs read HEYIRIS_TOKEN.
+export HEYIRIS_TOKEN="${HEYIRIS_TOKEN:-${IRIS_API_KEY:-}}"
+
 if [ -z "${HEYIRIS_TOKEN:-}" ]; then
   echo "capture-replies: HEYIRIS_TOKEN is not set" >&2
   exit 1
@@ -36,4 +40,8 @@ fi
 
 mkdir -p ../test-results
 
-exec npx playwright test capture-replies.spec.ts "${@}"
+# playwright.config.ts runs headed; a server with no display needs a virtual one.
+if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+  exec xvfb-run -a npx playwright test capture-replies.spec.ts --config playwright.config.ts "${@}"
+fi
+exec npx playwright test capture-replies.spec.ts --config playwright.config.ts "${@}"
