@@ -24,6 +24,7 @@ const path = require('path');
 const somConfig = require('./som-config');
 const campaignRegistry = somConfig.getCampaignRegistry();
 const { preflightCheck } = somConfig;
+const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
 
 // ── Loud failure on missing config (bug #133634) ─────────────────────────────
 // An EMPTY registry means campaigns were never synced to this machine — that is
@@ -896,6 +897,7 @@ async function main() {
   // ── Pre-flight lead check — skip campaigns with 0 eligible leads ──
   const eligibleCampaigns = [];
   const skippedCampaigns = [];
+  const strategyFailures = [];   // campaigns whose strategy is missing on their board (#191275)
   const filterLabel = leadFilter === 'followup' ? 'FOLLOW-UP' : 'NEW LEADS';
   console.log('  ┌──────────────────────────────────────────────────┐');
   console.log(`  │  LEAD ELIGIBILITY CHECK (${filterLabel.padEnd(24)})│`);
@@ -904,6 +906,12 @@ async function main() {
     const reg = campaignRegistry[c];
     if (!reg || !reg.boardId) {
       eligibleCampaigns.push(c);
+      continue;
+    }
+    const sc = await checkStrategy(reg.boardId, reg.strategy);
+    if (!sc.ok) {
+      console.log(`  ✗  ${c}: ${describeFailure(reg.boardId, sc)} — SKIPPING, nothing sent`);
+      strategyFailures.push(c);
       continue;
     }
     const pf = await preflightCheck(reg.boardId, reg.strategy, { mode: leadFilter, waitDays });
@@ -919,9 +927,12 @@ async function main() {
   if (skippedCampaigns.length > 0) {
     console.log(`\n  Skipped ${skippedCampaigns.length} exhausted campaign(s): ${skippedCampaigns.join(', ')}`);
   }
+  if (strategyFailures.length > 0) {
+    console.log(`\n  ✗ ${strategyFailures.length} campaign(s) name a strategy their board does not have: ${strategyFailures.join(', ')}`);
+  }
   if (eligibleCampaigns.length === 0) {
     console.log('\n  All campaigns exhausted — nothing to run. Exiting.');
-    process.exit(0);
+    process.exit(strategyFailures.length > 0 ? 1 : 0);
   }
   console.log(`\n  Running ${eligibleCampaigns.length} campaign(s): ${eligibleCampaigns.join(', ')}\n`);
 
