@@ -36,6 +36,18 @@ const CAPTURE_LIMIT = parseInt(process.env.CAPTURE_LIMIT || '500', 10);
 const CAPTURE_SCROLLS = parseInt(process.env.CAPTURE_SCROLLS || '60', 10);
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 const DISCORD_WEBHOOK = process.env.PLATFORM_UPDATES_DISCORD_CHANNEL_WEBHOOK_URL || '';
+// One JSON line per account per live run: what reply-digest.js summarises for the daily email.
+// Kept outside any checkout: it holds real people's messages and must never be committed.
+const CAPTURE_LOG = process.env.CAPTURE_LOG || path.join(require('os').homedir(), '.iris', 'data', 'reply-capture.jsonl');
+
+function appendCaptureLog(entry: Record<string, any>): void {
+  try {
+    fs.mkdirSync(path.dirname(CAPTURE_LOG), { recursive: true });
+    fs.appendFileSync(CAPTURE_LOG, JSON.stringify(entry) + '\n');
+  } catch (err: any) {
+    console.log(`  capture log not written (${CAPTURE_LOG}): ${err.message}`);
+  }
+}
 
 interface CaptureAccount { account: string; boardId: number }
 
@@ -141,6 +153,20 @@ async function captureAccount(
     const stats = await syncInbox(API_BASE, TOKEN, boardId, 'instagram', account, withReplies, '', { createMissing: true });
     if (stats === null) throw new Error(`inbox-sync rejected the capture for @${account}`);
     summary.push({ account, boardId, read: inbox.profiles.length, withReplies: withReplies.length, ...stats });
+    appendCaptureLog({
+      at: new Date().toISOString(), account, boardId,
+      read: inbox.profiles.length, withReplies: withReplies.length,
+      stats: { matched: stats.matched ?? 0, created: stats.created ?? 0, new_messages: stats.new_messages ?? 0, unmatched: stats.unmatched ?? 0, failed: stats.failed ?? 0 },
+      createdLeads: (stats as any).created_leads ?? [],
+      threads: withReplies.map(p => ({
+        handle: p.username,
+        name: p.displayName && p.displayName !== p.username ? p.displayName : '',
+        waitingOnUs: p.rawMetadata?.lastFromThem === true,
+        lastActivityAt: p.rawMetadata?.lastActivityAt ?? null,
+        // last few lines of the thread, oldest first, "me:" = us — what the digest drafts from
+        recent: String(p.rawMetadata?.fullMessages || '').split('\n').slice(-6),
+      })),
+    });
   } catch (err: any) {
     const kind = err instanceof InstagramIdentityError ? 'wrong or expired session' : 'failed';
     console.log(`  CAPTURE FAILED (${kind}) for ${label}: ${err.message}`);
