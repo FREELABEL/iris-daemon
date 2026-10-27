@@ -126,9 +126,12 @@ function writeLedger (file, ledger) {
 /**
  * Decide who gets a message. `commenters` is [{ username, commentText }] in page order.
  * Returns { targets, skipped } where skipped carries a reason per handle and targets is capped at max.
+ * `only`, when non-empty, is the list a person confirmed after a dry run: nobody outside it is sent,
+ * so a comment that arrived between the preview and the send is not messaged unseen.
  */
-function selectTargets ({ commenters, keywords, account, handled, max }) {
+function selectTargets ({ commenters, keywords, account, handled, max, only }) {
   const self = normalizeHandle(account)
+  const allow = only && only.size ? only : null
   const done = handled || new Set()
   const cap = clampMax(max)
   const seen = new Set()
@@ -143,10 +146,16 @@ function selectTargets ({ commenters, keywords, account, handled, max }) {
     seen.add(handle)
     if (handle === self) { skipped.push({ handle, comment, reason: 'own account' }); continue }
     if (done.has(handle)) { skipped.push({ handle, comment, reason: 'already in ledger' }); continue }
+    if (allow && !allow.has(handle)) { skipped.push({ handle, comment, reason: 'not in the confirmed list' }); continue }
     if (targets.length >= cap) { skipped.push({ handle, comment, reason: `over cap (${cap})` }); continue }
     targets.push({ handle, comment, keyword })
   }
   return { targets, skipped }
+}
+
+/** ONLY_HANDLES env → Set of normalized handles (empty Set when unset). */
+function parseHandles (raw) {
+  return new Set(String(raw || '').split(',').map(normalizeHandle).filter(Boolean))
 }
 
 /** Is this send result the account being logged out or challenged? Then the run must stop. */
@@ -190,6 +199,12 @@ function buildRunEnv (body, { ledgerFile = DEFAULT_LEDGER_FILE } = {}) {
   const account = String(b.account || '').trim().replace(/^@/, '')
   if (account && !/^[A-Za-z0-9._]{1,30}$/.test(account)) return { error: 'account is not a valid instagram handle' }
   const dry = b.send !== true
+  let only = []
+  if (b.handles != null) {
+    if (!Array.isArray(b.handles)) return { error: 'handles must be an array of instagram handles' }
+    only = [...new Set(b.handles.map(normalizeHandle).filter(Boolean))]
+    if (only.some(h => !/^[a-z0-9._]{1,30}$/.test(h))) return { error: 'handles must be instagram handles' }
+  }
   const max = clampMax(b.max)
   const env = {
     POST_URL: postUrl,
@@ -200,6 +215,7 @@ function buildRunEnv (body, { ledgerFile = DEFAULT_LEDGER_FILE } = {}) {
     LEDGER_FILE: ledgerFile,
   }
   if (account) env.IG_ACCOUNT = account
+  if (only.length) env.ONLY_HANDLES = only.join(',')
   return { env, dry, max }
 }
 
@@ -213,6 +229,7 @@ module.exports = {
   clampMax,
   isDryRun,
   normalizeHandle,
+  parseHandles,
   fillTemplate,
   postKey,
   readLedger,

@@ -24,6 +24,7 @@ const kdm = require('./helpers/keyword-dm');
  *                   no DM thread (typing in a composer shows the person a typing indicator).
  *   MAX_SENDS     — default 10, hard ceiling 25
  *   LEDGER_FILE   — JSON ledger keyed by post (default ~/.iris/keyword-dm-ledger.json)
+ *   ONLY_HANDLES  — optional comma list: send only to these (the list a person confirmed in a dry run)
  *   BROWSER_SESSION_FILE — session JSON (default som/instagram-auth-<IG_ACCOUNT>.json)
  *   SEND_DELAY_MS — base gap between sends, jittered ±40% (default 45000, floor 10000)
  *   SCROLL_ATTEMPTS — comment-list scrolls (default 40)
@@ -38,6 +39,7 @@ const MESSAGE = process.env.MESSAGE || '';
 const IG_ACCOUNT = (process.env.IG_ACCOUNT || 'heyiris.io').replace(/^@/, '');
 const DRY_RUN: boolean = kdm.isDryRun(process.env.DRY_RUN);
 const MAX_SENDS: number = kdm.clampMax(process.env.MAX_SENDS);
+const ONLY_HANDLES: Set<string> = kdm.parseHandles(process.env.ONLY_HANDLES);
 const LEDGER_FILE = process.env.LEDGER_FILE || kdm.DEFAULT_LEDGER_FILE;
 const SEND_DELAY_MS = Math.max(10000, parseInt(process.env.SEND_DELAY_MS || '45000', 10) || 45000);
 const SCROLL_ATTEMPTS = Math.max(1, parseInt(process.env.SCROLL_ATTEMPTS || '40', 10) || 40);
@@ -109,7 +111,7 @@ test(`Instagram keyword DM — ${KEYWORDS.join(',')} on ${POST_URL}`, async ({ p
   // ── Who qualifies ──
   const ledger = kdm.readLedger(LEDGER_FILE);
   const handled = kdm.handledHandles(ledger, POST_URL);
-  const { targets, skipped } = kdm.selectTargets({ commenters, keywords: KEYWORDS, account: IG_ACCOUNT, handled, max: MAX_SENDS });
+  const { targets, skipped } = kdm.selectTargets({ commenters, keywords: KEYWORDS, account: IG_ACCOUNT, handled, max: MAX_SENDS, only: ONLY_HANDLES });
   summary.targets = targets.map((t: any) => ({ handle: t.handle, comment: t.comment }));
   summary.skipped = skipped;
   summary.matched = targets.length + skipped.length;

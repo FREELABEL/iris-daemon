@@ -81,6 +81,13 @@ test('targets: the ledger and the cap both skip, and say why', () => {
   assert.deepStrictEqual(skipped.map(s => `${s.handle}:${s.reason}`), ['heyiris.io:own account', 'carol:already in ledger', 'frank:over cap (2)'])
 })
 
+test('targets: a confirmed list limits the send to exactly the people a person saw', () => {
+  const { targets, skipped } = k.selectTargets({ commenters, keywords: ['pipeline'], account: 'heyiris.io', handled: new Set(), max: 10, only: k.parseHandles('@Alice, erin') })
+  assert.deepStrictEqual(targets.map(t => t.handle), ['alice', 'erin'])
+  assert.deepStrictEqual(skipped.filter(s => s.reason === 'not in the confirmed list').map(s => s.handle), ['carol', 'frank'])
+  assert.strictEqual(k.selectTargets({ commenters, keywords: ['pipeline'], account: 'x', max: 10, only: new Set() }).targets.length, 5, 'empty list = no filter')
+})
+
 test('targets: the cap can never exceed 25 however many people ask', () => {
   const many = Array.from({ length: 60 }, (_, i) => ({ username: `u${i}`, commentText: 'PIPELINE' }))
   const { targets, skipped } = k.selectTargets({ commenters: many, keywords: ['pipeline'], account: 'x', handled: new Set(), max: 500 })
@@ -159,17 +166,20 @@ test('route body: bad input is refused before any browser starts', () => {
   assert.match(k.buildRunEnv({ ...base, message: 'x'.repeat(1001) }).error, /1000/)
   assert.match(k.buildRunEnv({ ...base, account: 'a b; rm -rf' }).error, /account/)
   assert.match(k.buildRunEnv(null).error, /postUrl/)
+  assert.match(k.buildRunEnv({ ...base, handles: 'alice' }).error, /array/)
+  assert.match(k.buildRunEnv({ ...base, handles: ['ok', 'bad handle!'] }).error, /handles/)
+  assert.strictEqual(k.buildRunEnv({ ...base, handles: ['@Alice', 'alice', 'erin'] }).env.ONLY_HANDLES, 'alice,erin')
+  assert.strictEqual(k.buildRunEnv({ ...base, handles: [] }).env.ONLY_HANDLES, undefined)
 })
 
-test('the route exists, runs the spec without blocking the event loop, and never schedules itself', () => {
+test('index.js mounts the route; the route spawns without blocking the loop; nothing schedules it', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
-  assert.match(src, /app\.post\('\/api\/instagram\/keyword-dm'/)
-  assert.match(src, /app\.get\('\/api\/instagram\/keyword-dm\/ledger'/)
-  const start = src.indexOf("app.post('/api/instagram/keyword-dm'")
-  const block = src.slice(start, src.indexOf("app.get('/api/instagram/keyword-dm/ledger'"))
-  assert.match(block, /keywordDm\.buildRunEnv\(req\.body\)/)
-  assert.match(block, /spawn\('npx'/)
-  assert.doesNotMatch(block, /execSync|setInterval|cron/)
+  assert.match(src, /require\('\.\/lib\/keyword-dm-route'\)\.mountKeywordDm\(app/)
+  // after the global bridgeAuth, like every other protected route
+  assert.ok(src.indexOf('mountKeywordDm(app') > src.indexOf('app.use(bridgeAuth('))
+  const route = fs.readFileSync(path.join(__dirname, '..', 'lib', 'keyword-dm-route.js'), 'utf8')
+  assert.match(route, /spawn\('npx'/)
+  assert.doesNotMatch(route, /execSync|setInterval|cron/)
   const spec = fs.readFileSync(path.join(__dirname, '..', 'som', 'instagram-keyword-dm.spec.ts'), 'utf8')
   assert.doesNotMatch(spec, /setInterval|cron|repeat/i)
 })
