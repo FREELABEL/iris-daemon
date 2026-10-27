@@ -14,6 +14,7 @@ export interface Lead {
   name: string;
   phone?: string;
   igHandle?: string;
+  handle?: string;        // platform handle, when the caller can supply one
   [key: string]: any;
 }
 
@@ -37,8 +38,12 @@ export interface InboxProfile {
 export interface ScanResult {
   tagged: { name: string; leadId: number; contact: string; lastMsg: string }[];
   unmatched: { contact: string; phone?: string; lastMsg: string }[];
+  /** Full profiles for unmatched replies, so a caller can persist them instead of dropping them. */
+  unmatchedProfiles: InboxProfile[];
   alreadyTaggedCount: number;
   scannedCount: number;
+  /** The sender name resolved for this scan (auto-detected when config.ourName was empty). */
+  ourName: string;
 }
 
 export interface RunOptions {
@@ -59,6 +64,18 @@ export function nameMatch(a: string, b: string): boolean {
   const longer = na.length > nb.length ? na : nb;
   if (shorter.length / longer.length < 0.4) return false;
   return longer.includes(shorter);
+}
+
+/** Normalize a platform handle for identity comparison — case and a leading @ are not identity. */
+export function normalizeHandle(handle: string | undefined | null): string {
+  return (handle || '').toLowerCase().trim().replace(/^@+/, '').trim();
+}
+
+/** Exact handle identity. NEVER fuzzy: a near-miss handle is a different person (#191271). */
+export function exactHandleMatch(a: string | undefined | null, b: string | undefined | null): boolean {
+  const na = normalizeHandle(a);
+  const nb = normalizeHandle(b);
+  return !!na && !!nb && na === nb;
 }
 
 /** Normalize phone to last 10 digits for comparison */
@@ -186,7 +203,10 @@ export async function tagLeadAsReplied(
   }
 }
 
-/** Sync conversations to inbox-sync API */
+/** Sync conversations to inbox-sync API.
+ *  createMissing=true makes the server create a board lead for a reply from someone we
+ *  did not already have, instead of dropping them (#191270).
+ */
 export async function syncInbox(
   apiBase: string,
   token: string,
@@ -195,6 +215,7 @@ export async function syncInbox(
   account: string,
   profiles: InboxProfile[],
   ourName: string,
+  options?: { createMissing?: boolean },
 ): Promise<void> {
   const conversations = profiles.map(profile => {
     const contactHandle = profile.rawMetadata?.phoneNumber || profile.username || profile.displayName || '';
@@ -229,17 +250,43 @@ export async function syncInbox(
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({ conversations, board_id: boardId, account, platform }),
+      body: JSON.stringify({
+        conversations,
+        board_id: boardId,
+        account,
+        platform,
+        create_missing: options?.createMissing === true,
+      }),
     });
     if (res.ok) {
       const data = await res.json();
-      console.log(`\n  Inbox sync: ${data.stats?.new_messages || 0} new messages stored, ${data.stats?.replied || 0} leads marked replied`);
+      console.log(`\n  Inbox sync: ${data.stats?.new_messages || 0} new messages stored, ${data.stats?.replied || 0} leads marked replied` +
+        (data.stats?.created ? `, ${data.stats.created} new leads created from replies` : ''));
     } else {
       console.log(`\n  Inbox sync failed: ${res.status}`);
     }
   } catch (err: any) {
     console.log(`\n  Inbox sync error: ${err.message}`);
   }
+}
+
+/** Store replies from people who are not leads yet, creating the lead instead of dropping it.
+ *  Run this after runInboxScan; it only sends the conversations the scan could not match.
+ */
+export async function persistUnmatchedReplies(
+  config: ScanConfig,
+  result: ScanResult,
+  createMissing = true,
+): Promise<void> {
+  if (result.unmatchedProfiles.length === 0) return;
+  if (config.dryRun) {
+    console.log(`\n  [DRY RUN] Would persist ${result.unmatchedProfiles.length} replies from non-leads`);
+    return;
+  }
+  await syncInbox(
+    config.apiBase, config.token, config.boardId, config.platform, config.account,
+    result.unmatchedProfiles, result.ourName || config.ourName, { createMissing },
+  );
 }
 
 // ── Auto-detect our name from sender frequency ────────────────────
@@ -295,39 +342,60 @@ export function detectReply(
 
 export function matchLeadLocal(
   leads: Lead[],
-  contactName: string,
+  contactHandle: string,
   contactPhone: string,
   phoneMap?: Map<string, Lead>,
 ): Lead | undefined {
-  // Phone match first (fast map lookup)
-  if (contactPhone && phoneMap) {
-    const normalized = normalizePhone(contactPhone);
-    const hit = phoneMap.get(normalized);
+  // Handle identity is exact (#191271). A display name is not a handle, and a fuzzy
+  // name match put @wicus_j's reply on lead #8213 — so it is not used for identity here.
+  const wanted = normalizeHandle(contactHandle);
+  if (wanted) {
+    const hit = leads.find(lead =>
+      exactHandleMatch(lead.igHandle ?? lead.handle, wanted)
+    );
     if (hit) return hit;
   }
 
-  return leads.find(lead => {
-    if (lead.igHandle && contactName && nameMatch(lead.igHandle, contactName)) return true;
-    if (lead.name && contactName && nameMatch(lead.name, contactName)) return true;
-    if (contactPhone && lead.phone && phoneMatch(contactPhone, lead.phone)) return true;
-    return false;
-  });
+  // Phone match — an exact E.164-ish identity, not a name guess.
+  if (contactPhone && phoneMap) {
+    const normalized = normalizePhone(contactPhone);
+    if (normalized.length >= 7) {
+      const hit = phoneMap.get(normalized);
+      if (hit) return hit;
+    }
+  }
+
+  if (contactPhone) {
+    const hit = leads.find(lead => lead.phone && phoneMatch(contactPhone, lead.phone));
+    if (hit) return hit;
+  }
+
+  return undefined;
 }
 
 export async function matchLeadApi(
   apiBase: string, token: string, boardId: number, searchTerm: string
 ): Promise<Lead | undefined> {
+  const wanted = normalizeHandle(searchTerm);
+  if (!wanted) return undefined;
+
   for (const scope of [`bloq_id=${boardId}&`, '']) {
     try {
+      // per_page raised from 1: we must inspect candidates, not accept the first row the
+      // search happens to return. Exact handle only — no "first result wins" (#191271).
       const res = await fetch(
-        `${apiBase}/api/v1/leads?${scope}search=${encodeURIComponent(searchTerm)}&per_page=1`,
+        `${apiBase}/api/v1/leads?${scope}search=${encodeURIComponent(searchTerm)}&per_page=25`,
         { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
       );
       if (res.ok) {
         const data = await res.json();
         const results = data.data?.data || data.data || [];
-        if (results.length > 0) {
-          return { id: results[0].id, name: results[0].name || '' };
+        const hit = results.find((l: any) => {
+          const ig = l.contact_info?.instagram || l.nickname || l.ig_handle;
+          return exactHandleMatch(ig, wanted);
+        });
+        if (hit) {
+          return { id: hit.id, name: hit.name || hit.nickname || '' };
         }
       }
     } catch {}
@@ -366,21 +434,23 @@ export async function runInboxScan(
 
   const tagged: ScanResult['tagged'] = [];
   const unmatched: ScanResult['unmatched'] = [];
+  const unmatchedProfiles: InboxProfile[] = [];
   let alreadyTaggedCount = 0;
 
   for (const profile of profiles) {
     const contactName = profile.displayName || profile.username || '';
+    const contactHandle = profile.username || '';
     const contactPhone = profile.rawMetadata?.phoneNumber || '';
     const fullMessages = profile.rawMetadata?.fullMessages || '';
     const lastMessage = profile.rawMetadata?.lastMessage || '';
 
     if (!detectReply(profile, ourName)) continue;
 
-    // Match lead
-    let matchedLead = matchLeadLocal(leads, contactName, contactPhone, phoneMap);
+    // Match lead by exact handle (or phone), never by display name (#191271)
+    let matchedLead = matchLeadLocal(leads, contactHandle, contactPhone, phoneMap);
 
-    if (!matchedLead && (contactName || contactPhone)) {
-      const searchTerm = contactPhone || contactName;
+    if (!matchedLead && (contactHandle || contactPhone)) {
+      const searchTerm = contactPhone || contactHandle;
       matchedLead = await matchLeadApi(config.apiBase, config.token, config.boardId, searchTerm);
     }
 
@@ -390,6 +460,7 @@ export async function runInboxScan(
         phone: contactPhone || undefined,
         lastMsg: (lastMessage || fullMessages || '').substring(0, 80),
       });
+      unmatchedProfiles.push(profile);
       continue;
     }
 
@@ -400,7 +471,6 @@ export async function runInboxScan(
     }
 
     const preview = (lastMessage || fullMessages || '').substring(0, 100);
-    const contactHandle = profile.username || contactName;
     console.log(`\n  REPLY: ${contactName} -> Lead #${matchedLead.id} (${matchedLead.name})`);
     console.log(`    "${preview}"`);
 
@@ -424,7 +494,7 @@ export async function runInboxScan(
     }
   }
 
-  return { tagged, unmatched, alreadyTaggedCount, scannedCount: profiles.length };
+  return { tagged, unmatched, unmatchedProfiles, alreadyTaggedCount, scannedCount: profiles.length, ourName };
 }
 
 // ── Output ────────────────────────────────────────────────────────

@@ -2,8 +2,8 @@ import { test } from '@playwright/test';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
 import { dismissInstagramPopups } from './helpers/providers/base-provider';
 import {
-  fetchBoardLeads, runInboxScan, syncInbox, printSummary, sendResultAlert,
-  sendDiscordAlert, Lead, ScanConfig,
+  fetchBoardLeads, runInboxScan, printSummary, sendResultAlert,
+  persistUnmatchedReplies, sendDiscordAlert, Lead, ScanConfig,
 } from './helpers/inbox-scanner';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -54,8 +54,10 @@ test(`Instagram Inbox Reply Check — @${IG_ACCOUNT} / Board ${BOARD_ID}`, async
   // ── Fetch board leads ──
   console.log(`\nFetching leads from board ${BOARD_ID}...`);
   const boardLeads = await fetchBoardLeads<Lead>(API_BASE, TOKEN, BOARD_ID, (l) => {
-    const name = (l.name || l.full_name || '').trim();
-    const igHandle = name.startsWith('@') ? name.slice(1) : name;
+    const name = (l.name || l.full_name || l.nickname || '').trim();
+    // Identity is the stored handle, never the display name (#191271)
+    const igHandle = (l.contact_info?.instagram || l.nickname || l.ig_handle || '')
+      .replace(/^@/, '').trim();
     return { id: l.id, name, igHandle };
   });
   console.log(`Loaded ${boardLeads.length} leads from board ${BOARD_ID}`);
@@ -88,10 +90,10 @@ test(`Instagram Inbox Reply Check — @${IG_ACCOUNT} / Board ${BOARD_ID}`, async
   const result = await runInboxScan(config, inboxResult.profiles, boardLeads);
   printSummary(config, result);
 
-  // ── Sync to inbox-sync API ──
-  if (!DRY_RUN && inboxResult.profiles.length > 0) {
-    await syncInbox(API_BASE, TOKEN, BOARD_ID, 'instagram', IG_ACCOUNT, inboxResult.profiles, config.ourName);
-  }
+  // ── Replies from people who are not leads yet become leads (#191270) ──
+  // Only the unmatched conversations go through inbox-sync, so an already-matched reply
+  // is not stored twice.
+  await persistUnmatchedReplies(config, result);
 
   await sendResultAlert(config, result);
 });

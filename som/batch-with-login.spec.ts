@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
-import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
+import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxProvider } from './helpers/providers/instagram-inbox-provider';
 
@@ -501,6 +501,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
       const scanResult = await runInboxScan(scanConfig, inboxResult.profiles, inboxLeads, { autoDetectOurName: true });
       printSummary(scanConfig, scanResult);
+      // Replies from people who are not leads yet must not be dropped on the floor (#191270)
+      await persistUnmatchedReplies(scanConfig, scanResult);
       await sendResultAlert(scanConfig, scanResult);
       inboxReplies = scanResult.tagged;
 
