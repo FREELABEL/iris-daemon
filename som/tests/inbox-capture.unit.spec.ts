@@ -123,6 +123,13 @@ test.describe('lead matching is exact (#191271)', () => {
     expect(matchLeadLocal(leads, 'wicus.j', '')).toBeUndefined();
   });
 
+  test('one handle containing another is a different person', () => {
+    expect(exactHandleMatch('wicus', 'wicus_j')).toBe(false);
+    expect(exactHandleMatch('nobodybutzino', 'zino')).toBe(false);
+    expect(matchLeadLocal(leads, 'wicus', '')).toBeUndefined();
+    expect(matchLeadLocal(leads, 'zino', '')).toBeUndefined();
+  });
+
   test('case and a leading @ are not identity', () => {
     expect(matchLeadLocal(leads, '@Wicus_J', '')?.id).toBe(7981);
   });
