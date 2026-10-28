@@ -153,3 +153,14 @@ describe('#191560 — a task killed by a daemon restart ends', () => {
     assert.deepEqual(seen[0], ['add', 't-l'], 'a started task is not on the on-disk ledger')
   })
 })
+
+describe('#191560 — a killed task says why it ended', () => {
+  it('a task killed by shutdown reports "Interrupted: …", not "Process exited with code null"', async () => {
+    const sent = []
+    const ex = new TaskExecutor({ reportProgress: async () => {}, submitResult: async (id, r) => { sent.push(r) }, post: async () => ({}) }, { create: () => ({ dir: os.tmpdir(), projectDir: os.tmpdir() }), get: () => null, cleanup: () => {} })
+    ex.killAll('the IRIS daemon on n was stopped (SIGTERM) while this task ran; it did not finish')
+    assert.equal(ex._stopReason, 'the IRIS daemon on n was stopped (SIGTERM) while this task ran; it did not finish')
+    const src = fs.readFileSync(path.join(__dirname, '..', 'daemon', 'task-executor.js'), 'utf8')
+    assert.match(src, /error: stopReason \? `Interrupted: \$\{stopReason\}` : err\.message/)
+  })
+})

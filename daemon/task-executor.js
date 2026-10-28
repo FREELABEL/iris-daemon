@@ -2082,10 +2082,13 @@ class TaskExecutor {
       // back here, before `finally` deletes the entry.
       const runningEntry = this.runningTasks.get(taskId)
       const exitCode = runningEntry?._exitCode ?? null
+      // #191560 — killed on purpose (a cancel, or this daemon shutting down): say that, not the
+      // bare "Process exited with code null" a signal leaves behind.
+      const stopReason = runningEntry?._stopReason || this._stopReason || null
 
       await this.cloud.submitResult(taskId, {
         status: 'failed',
-        error: err.message,
+        error: stopReason ? `Interrupted: ${stopReason}` : err.message,
         output: outputLines.join('\n'),
         duration_ms: Date.now() - startTime,
         exit_code: exitCode,
@@ -2097,6 +2100,7 @@ class TaskExecutor {
         stdout: typeof err.stdout === 'string' ? err.stdout : undefined,
         stderr: typeof err.stderr === 'string' ? err.stderr : undefined,
         metadata: {
+          ...(stopReason ? { interrupted: true, interrupted_reason: stopReason } : {}),
           exit_code: exitCode,
           executed_by_node_id: this.nodeId ?? null,
           executed_by_node_name: this.nodeName ?? null,
@@ -5770,7 +5774,9 @@ exit 1
   /**
    * Kill all running tasks (used during shutdown).
    */
-  killAll () {
+  killAll (reason = null) {
+    // Read by each killed task's own failure report (#191560), after this map is cleared.
+    if (reason) this._stopReason = reason
     for (const [taskId, entry] of this.runningTasks) {
       console.log(`[executor] Killing task ${taskId}`)
       this._stopEntry(entry)

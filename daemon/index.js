@@ -3224,9 +3224,10 @@ LIMIT ${limit}
       ...this.executor.runningTasks.keys(),
       ...(this.inflight ? this.inflight.list() : []),
     ])]
-    this.executor.killAll()
+    const why = `the IRIS daemon on ${this.nodeName} was stopped (${signal}) while this task ran; it did not finish`
+    this.executor.killAll(why)
     if (interrupted.length) {
-      const done = await reportInterrupted(this.cloud, interrupted, `the IRIS daemon on ${this.nodeName} was stopped (${signal}) while this task ran; it did not finish`, 3000)
+      const done = await reportInterrupted(this.cloud, interrupted, why, 3000)
       if (this.inflight) for (const id of done) this.inflight.remove(id)
       console.log(`[daemon] Reported ${done.length}/${interrupted.length} interrupted task(s) to the platform`)
     }
