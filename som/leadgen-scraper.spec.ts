@@ -84,8 +84,8 @@ test(`Leadgen — ${CAMPAIGN_LABEL} (${DISCOVERY_MODE})`, async ({ page, context
       console.log(`  Instagram session loaded for @${IG_ACCOUNT} (${state.cookies.length} cookies)`);
     }
   } else {
-    console.log(`  No instagram-auth-${IG_ACCOUNT}.json — run save-instagram-session first`);
-    console.log(`  IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\n`);
+    console.log(`  No instagram-auth-${IG_ACCOUNT}.json — log it in first: iris som login ${IG_ACCOUNT} --node <this machine>`);
+    console.log(`  iris som login ${IG_ACCOUNT}  (or on this Mac: node som/login.js ${IG_ACCOUNT})\n`);
     return;
   }
 
