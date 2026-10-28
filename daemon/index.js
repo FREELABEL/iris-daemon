@@ -36,6 +36,7 @@ const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { isPhiTask } = require('../lib/phi-task')
 const { writeFileAtomic } = require('../lib/atomic-write')
+const { ENDED_STATUSES, endedAtAccept, reportInterrupted } = require('./task-stop')
 const mailCompose = require('../lib/mail-compose')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
@@ -86,7 +87,11 @@ class Daemon {
     // The delivery contract, node side (#187568): ran-once per key, never started late.
     this.keyLedger = new KeyLedger()
     this._keyByTask = new Map() // taskId → idempotency_key, for tasks running here
+    // Tasks started here and not yet reported on, kept on disk (#191560): a daemon that dies
+    // mid-task cannot report on the way out, so the next one does it at startup.
+    this.inflight = new (require('./task-stop').InflightLedger)()
     this.cloud.onResultSubmitted = (taskId, result) => {
+      if (this.inflight) this.inflight.remove(taskId)
       const key = this._keyByTask.get(taskId)
       if (!key) return
       this._keyByTask.delete(taskId)
@@ -360,7 +365,7 @@ class Daemon {
     console.log(`[daemon] User: ${heartbeatResult.user_id ?? 'unknown'}`)
     console.log(`[daemon] API: ${this.config.apiUrl}`)
     console.log(`[daemon] Status: online | Active tasks: ${heartbeatResult.active_tasks}`)
-    console.log(`[daemon] Max concurrent: ${process.env.MAX_CONCURRENT || 4}`)
+    console.log(`[daemon] Max concurrent: ${this._maxConcurrent()}`)
     console.log(`[daemon] PID: ${process.pid}`)
 
     // Write status IMMEDIATELY after first heartbeat — don't wait for callback setup
@@ -383,6 +388,8 @@ class Daemon {
       this.pusher = new PusherClient(pusherKey, pusherCluster, channel, this.cloud)
       await this.pusher.connect()
       this.pusher.onTaskDispatched((event) => this.handleTaskDispatched(event))
+      // #184886 — a cancel reaches this machine now, not at the next heartbeat.
+      this.pusher.onTaskCancelled((event) => this.handleTaskCancelled(event).catch(() => {}))
       console.log('[daemon] Pusher connected — listening for tasks')
     } else {
       console.log('[daemon] No Pusher key — falling back to polling mode')
@@ -711,6 +718,15 @@ class Daemon {
 
     // Step 6: Listen for SIGUSR1 (pause/resume toggle from CLI)
     process.on('SIGUSR1', () => this._handleConfigReload())
+
+    // Step 6b (#191560): tasks the PREVIOUS daemon process started and never reported on died with
+    // it. Say so now, so their callers stop waiting, before taking new work.
+    if (this.inflight && this.inflight.list().length) {
+      const left = this.inflight.list()
+      const done = await reportInterrupted(this.cloud, left, `the IRIS daemon on ${this.nodeName} stopped while this task ran (it has since restarted); it did not finish`, 5000)
+      for (const id of done) this.inflight.remove(id)
+      console.log(`[daemon] Reported ${done.length}/${left.length} task(s) interrupted by the last restart: ${left.map((i) => i.slice(0, 8)).join(', ')}`)
+    }
 
     // Step 7: Check for any pending tasks already assigned
     if (!this.paused) {
@@ -2284,14 +2300,21 @@ LIMIT ${limit}
     // server's orphan path routes it elsewhere. It used to be reported failed with "Will retry on next
     // schedule", which nothing did, and its id was refused for 5 minutes. Forget we saw it, so the
     // re-delivery is not dropped as a duplicate.
+    //
+    // #191558 — the check and the reservation are ONE synchronous step. It used to count only
+    // executor.runningTasks, which a task enters after two network round trips (fetch, accept), so
+    // eight deliveries arriving together all counted 0 running and all started: a 3-slot node ran
+    // 5 at once. A task holds its slot from here until it has finished (the finally below).
     const MAX_CONCURRENT = this._maxConcurrent()
-    const activeTasks = this.executor ? this.executor.runningTasks.size : 0
+    const activeTasks = this._slotsInUse()
     if (activeTasks >= MAX_CONCURRENT) {
       console.log(`[daemon] Deferring task ${event.task_id} — ${activeTasks}/${MAX_CONCURRENT} slots busy; it will be picked up when one frees`)
       this.pendingTaskIds.delete(event.task_id)
       this.recentlySeenTasks.delete(event.task_id)
       return
     }
+    if (!this._admitted) this._admitted = new Set()
+    this._admitted.add(event.task_id)
 
     // Reject if paused or hibernating
     if (this.paused) {
@@ -2366,6 +2389,13 @@ LIMIT ${limit}
         // The server refused it as LATE and has already marked it expired. Reporting a failure
         // now would overwrite the truer status, so drop it quietly (#187568).
         console.log(`[daemon] Task ${event.task_id} arrived after its deadline — expired on the server, not running it`)
+        return
+      }
+      // #184886 — the platform already ENDED it (cancelled while the push was in flight). The
+      // "422 → proceed" tolerance below would have run it anyway.
+      const endedAs = acceptErr instanceof Error ? endedAtAccept(acceptErr) : null
+      if (endedAs) {
+        console.log(`[daemon] Task ${event.task_id} is already ${endedAs} on the platform — not running it`)
         return
       }
       if (acceptErr instanceof Error) {
@@ -2445,6 +2475,14 @@ LIMIT ${limit}
       task._source = 'pusher'
       _t.accepted = Date.now()
 
+      if (this._cancelBeforeStart && this._cancelBeforeStart.delete(String(task.id))) {
+        console.log(`[daemon] Task ${event.task_id} was cancelled before it started — not running it`)
+        return
+      }
+
+      // Started and not yet reported on — on disk, so a restart can say what it interrupted.
+      if (this.inflight) this.inflight.add(task.id)
+
       // Execute (executor.runningTasks will track it from here)
       await this.executor.execute(task)
 
@@ -2472,7 +2510,50 @@ LIMIT ${limit}
       } catch { /* best effort */ }
     } finally {
       this.pendingTaskIds.delete(event.task_id)
+      if (this._admitted) this._admitted.delete(event.task_id)
     }
+  }
+
+  /** Slots taken: tasks running ∪ tasks admitted and still on their way to the executor (#191558). */
+  _slotsInUse () {
+    const ids = new Set(this._admitted || [])
+    if (this.executor) for (const id of this.executor.runningTasks.keys()) ids.add(id)
+    return ids.size
+  }
+
+  /**
+   * A task was cancelled on the platform (#184886). The push carries no authority — anyone who can
+   * publish to the channel could send one — so the task is re-read over this node's authenticated
+   * API and stopped only if the platform says it has ended.
+   */
+  async handleTaskCancelled (event) {
+    const id = event && event.task_id ? String(event.task_id) : null
+    if (!id || !this.executor) return false
+    const here = this.executor.runningTasks.has(id) || (this.executor.gate && this.executor.gate.isQueued && this.executor.gate.isQueued(id)) || this.pendingTaskIds.has(id)
+    if (!here) return false
+    let status = null
+    try {
+      const task = await this.cloud.fetchTask(id)
+      status = task && task.status
+    } catch (e) {
+      console.log(`[daemon] Cancel for ${id.slice(0, 8)} not confirmed (${e.message}) — the next heartbeat decides`)
+      return false
+    }
+    if (!ENDED_STATUSES.has(status)) {
+      console.log(`[daemon] Cancel for ${id.slice(0, 8)} ignored — the platform says it is ${status}`)
+      return false
+    }
+    const stopped = this.executor.killTask(id, `${status} on the platform`)
+    if (stopped) {
+      console.log(`[daemon] stopped task ${id.slice(0, 8)} — ${status} on the platform`)
+    } else if (this.pendingTaskIds.has(id)) {
+      // Still on its way to the executor (fetch/accept in flight): make sure it never starts.
+      if (!this._cancelBeforeStart) this._cancelBeforeStart = new Set()
+      this._cancelBeforeStart.add(id)
+      console.log(`[daemon] task ${id.slice(0, 8)} is ${status} on the platform — it will not be started`)
+      return true
+    }
+    return stopped
   }
 
   // ─── A2A Forwarding ──────────────────────────────────────────────
@@ -3137,8 +3218,19 @@ LIMIT ${limit}
       console.log('[a2a] HTTP server stopped')
     }
 
-    // Kill running tasks (also cleans up tmux sessions)
-    this.executor.killAll()
+    // Kill running tasks (also cleans up tmux sessions) — and SAY so (#191560). The process used to
+    // log "Killing task" and exit; the platform kept the task "pending 1%" for 20+ minutes.
+    const interrupted = [...new Set([
+      ...this.executor.runningTasks.keys(),
+      ...(this.inflight ? this.inflight.list() : []),
+    ])]
+    const why = `the IRIS daemon on ${this.nodeName} was stopped (${signal}) while this task ran; it did not finish`
+    this.executor.killAll(why)
+    if (interrupted.length) {
+      const done = await reportInterrupted(this.cloud, interrupted, why, 3000)
+      if (this.inflight) for (const id of done) this.inflight.remove(id)
+      console.log(`[daemon] Reported ${done.length}/${interrupted.length} interrupted task(s) to the platform`)
+    }
 
     // Stop tmux zombie cleanup interval
     if (this._tmuxCleanupInterval) clearInterval(this._tmuxCleanupInterval)

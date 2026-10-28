@@ -2082,10 +2082,13 @@ class TaskExecutor {
       // back here, before `finally` deletes the entry.
       const runningEntry = this.runningTasks.get(taskId)
       const exitCode = runningEntry?._exitCode ?? null
+      // #191560 — killed on purpose (a cancel, or this daemon shutting down): say that, not the
+      // bare "Process exited with code null" a signal leaves behind.
+      const stopReason = runningEntry?._stopReason || this._stopReason || null
 
       await this.cloud.submitResult(taskId, {
         status: 'failed',
-        error: err.message,
+        error: stopReason ? `Interrupted: ${stopReason}` : err.message,
         output: outputLines.join('\n'),
         duration_ms: Date.now() - startTime,
         exit_code: exitCode,
@@ -2097,6 +2100,7 @@ class TaskExecutor {
         stdout: typeof err.stdout === 'string' ? err.stdout : undefined,
         stderr: typeof err.stderr === 'string' ? err.stderr : undefined,
         metadata: {
+          ...(stopReason ? { interrupted: true, interrupted_reason: stopReason } : {}),
           exit_code: exitCode,
           executed_by_node_id: this.nodeId ?? null,
           executed_by_node_name: this.nodeName ?? null,
@@ -5737,30 +5741,45 @@ exit 1
    * the status it already set.
    */
   killTask (taskId, reason = 'stopped') {
+    // Not started yet — waiting in the admission gate's queue: drop it so it never starts.
+    if (this.gate && typeof this.gate.drop === 'function' && this.gate.drop(taskId)) {
+      console.log(`[executor] Dropped queued task ${taskId}: ${reason}`)
+      return true
+    }
     const entry = this.runningTasks.get(taskId)
     if (!entry) return false
     console.log(`[executor] Stopping task ${taskId}: ${reason}`)
+    entry._stopReason = reason
+    this._stopEntry(entry)
+    return true
+  }
+
+  /**
+   * Stop one running entry and EVERYTHING it started (#184886). Killing only the direct child let
+   * a cancelled job's `sleep` (and whatever came after it, in a subshell) run on to the end.
+   */
+  _stopEntry (entry) {
+    const { killTree } = require('./task-stop')
     if (entry?.tmux && entry.sessionName) {
+      // Read the pane's process tree BEFORE the session is killed, then kill both.
+      let pids = []
+      try { pids = typeof this.tmux.panePids === 'function' ? this.tmux.panePids(entry.sessionName) : [] } catch {}
+      for (const pid of pids) killTree({ pid, exitCode: null }, 3000)
       try { this.tmux.cleanup(entry.sessionName) } catch {}
     } else if (entry?.kill) {
-      require('./child-lifecycle').killWithEscalation(entry, 3000)
+      killTree(entry, 3000)
     }
-    return true
   }
 
   /**
    * Kill all running tasks (used during shutdown).
    */
-  killAll () {
+  killAll (reason = null) {
+    // Read by each killed task's own failure report (#191560), after this map is cleared.
+    if (reason) this._stopReason = reason
     for (const [taskId, entry] of this.runningTasks) {
       console.log(`[executor] Killing task ${taskId}`)
-      if (entry?.tmux && entry.sessionName) {
-        // tmux-managed task — kill the session
-        try { this.tmux.cleanup(entry.sessionName) } catch {}
-      } else if (entry?.kill) {
-        // Direct child process
-        require('./child-lifecycle').killWithEscalation(entry, 3000)
-      }
+      this._stopEntry(entry)
     }
     this.runningTasks.clear()
     // Clean up any remaining tmux sessions

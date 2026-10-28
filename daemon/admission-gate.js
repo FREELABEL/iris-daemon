@@ -133,6 +133,13 @@ class AdmissionGate {
     return !(entry && this._isDeadTmux(entry))
   }
 
+  /** Remove a task that is waiting in the queue (cancelled before it started). True if it was there. */
+  drop (taskId) {
+    const before = this._queue.length
+    this._queue = this._queue.filter(i => i.task.id !== taskId)
+    return this._queue.length !== before
+  }
+
   isQueued (taskId) {
     return this._queue.some(i => i.task.id === taskId)
   }

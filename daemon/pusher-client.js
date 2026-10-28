@@ -57,6 +57,13 @@ class PusherClient {
         }
       })
 
+      // #184886 — a task this node holds was cancelled on the platform.
+      this.channel.bind('task.cancelled', (data) => {
+        if (this.onCancelCallback) {
+          this.onCancelCallback(data)
+        }
+      })
+
       // Connection state logging
       this.pusher.connection.bind('state_change', (states) => {
         if (states.current === 'disconnected') {
@@ -73,6 +80,10 @@ class PusherClient {
 
   onTaskDispatched (callback) {
     this.onTaskCallback = callback
+  }
+
+  onTaskCancelled (callback) {
+    this.onCancelCallback = callback
   }
 
   disconnect () {
