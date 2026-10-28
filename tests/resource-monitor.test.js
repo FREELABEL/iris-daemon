@@ -1,7 +1,24 @@
 const { describe, it, beforeEach } = require('node:test')
 const assert = require('node:assert/strict')
 const os = require('os')
-const { ResourceMonitor } = require('../daemon/resource-monitor')
+const { ResourceMonitor, cpuPercent, cpuTimeTotals } = require('../daemon/resource-monitor')
+
+// A fake os.cpus() snapshot: `cores` cores, each with `busyMs` busy and `idleMs` idle time.
+function fakeCpus (cores, busyMs, idleMs) {
+  return Array.from({ length: cores }, () => ({
+    model: 'test', speed: 1000,
+    times: { user: busyMs * 0.7, nice: 0, sys: busyMs * 0.3, idle: idleMs, irq: 0 }
+  }))
+}
+
+// Run fn with os.cpus/loadavg/freemem replaced; always restores.
+function withFakeOs ({ cpus, loadAvg = 0, freeMemMB = 4096 }, fn) {
+  const orig = { cpus: os.cpus, loadavg: os.loadavg, freemem: os.freemem }
+  os.cpus = () => cpus
+  os.loadavg = () => [loadAvg, 0, 0]
+  os.freemem = () => freeMemMB * 1024 * 1024
+  try { return fn() } finally { Object.assign(os, orig) }
+}
 
 // Helper: create a monitor with controlled battery + CPU
 function createMonitor (batteryOverride, cpuOverride) {
@@ -14,23 +31,17 @@ function createMonitor (batteryOverride, cpuOverride) {
 
   // Override OS methods for CPU control if needed
   if (cpuOverride) {
+    // cpuOverride: { cores, busyPct, loadAvg }. The first poll uses the since-boot times,
+    // so a snapshot that is busyPct busy makes that poll report busyPct.
     const origPoll = monitor._poll.bind(monitor)
     monitor._poll = function () {
-      // Temporarily override os functions — restore after
-      const origCpus = os.cpus
-      const origLoadavg = os.loadavg
-      const origFreemem = os.freemem
       const cores = cpuOverride.cores || 12
-
-      os.cpus = () => Array(cores).fill({ model: 'test' })
-      os.loadavg = () => [cpuOverride.loadAvg || 0, 0, 0]
-      os.freemem = () => (cpuOverride.freeMemMB || 4096) * 1024 * 1024
-
-      origPoll()
-
-      os.cpus = origCpus
-      os.loadavg = origLoadavg
-      os.freemem = origFreemem
+      const busy = cpuOverride.busyPct || 0
+      withFakeOs({
+        cpus: fakeCpus(cores, busy * 1000, (100 - busy) * 1000),
+        loadAvg: cpuOverride.loadAvg || 0,
+        freeMemMB: cpuOverride.freeMemMB
+      }, origPoll)
     }
   }
 
@@ -88,7 +99,7 @@ describe('ResourceMonitor', () => {
       // 50% battery, low CPU = should be idle, not hibernating
       const monitor = createMonitor(
         { onBattery: true, percent: 50 },
-        { cores: 12, loadAvg: 1.2 } // ~10% CPU
+        { cores: 12, busyPct: 10, loadAvg: 58 } // 10% CPU, load 483%
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'idle')
@@ -101,7 +112,7 @@ describe('ResourceMonitor', () => {
     it('should report idle when CPU < 30%', () => {
       const monitor = createMonitor(
         { onBattery: false, percent: 100 },
-        { cores: 10, loadAvg: 2.0 } // 20% CPU
+        { cores: 10, busyPct: 20, loadAvg: 48.6 } // 20% CPU, load 486%
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'idle')
@@ -110,7 +121,7 @@ describe('ResourceMonitor', () => {
     it('should report light when CPU 30-60%', () => {
       const monitor = createMonitor(
         { onBattery: false, percent: 100 },
-        { cores: 10, loadAvg: 4.5 } // 45% CPU
+        { cores: 10, busyPct: 45 } // 45% CPU
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'light')
@@ -119,7 +130,7 @@ describe('ResourceMonitor', () => {
     it('should report busy when CPU 60-80%', () => {
       const monitor = createMonitor(
         { onBattery: false, percent: 100 },
-        { cores: 10, loadAvg: 7.0 } // 70% CPU
+        { cores: 10, busyPct: 70 } // 70% CPU
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'busy')
@@ -128,7 +139,7 @@ describe('ResourceMonitor', () => {
     it('should report overloaded when CPU >= 80%', () => {
       const monitor = createMonitor(
         { onBattery: false, percent: 100 },
-        { cores: 10, loadAvg: 9.0 } // 90% CPU
+        { cores: 10, busyPct: 90, loadAvg: 0.5 } // 90% CPU, load low
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'overloaded')
@@ -200,7 +211,7 @@ describe('ResourceMonitor', () => {
     it('returns false when overloaded', () => {
       const monitor = createMonitor(
         { onBattery: false, percent: 100 },
-        { cores: 10, loadAvg: 9.0 }
+        { cores: 10, busyPct: 90 }
       )
       monitor._poll()
       assert.equal(monitor.capacity.level, 'overloaded')
@@ -208,10 +219,10 @@ describe('ResourceMonitor', () => {
     })
 
     it('returns true for idle, light, and busy', () => {
-      for (const [loadAvg, expected] of [[1.0, 'idle'], [4.0, 'light'], [7.0, 'busy']]) {
+      for (const [busyPct, expected] of [[10, 'idle'], [40, 'light'], [70, 'busy']]) {
         const monitor = createMonitor(
           { onBattery: false, percent: 100 },
-          { cores: 10, loadAvg }
+          { cores: 10, busyPct, loadAvg: 48.6 }
         )
         monitor._poll()
         assert.equal(monitor.capacity.level, expected)
@@ -227,18 +238,7 @@ describe('ResourceMonitor', () => {
       const monitor = new ResourceMonitor({ intervalMs: 999999999, maxCpuThreshold: 50 })
       monitor._checkBattery = () => ({ onBattery: false, percent: 100 })
 
-      const origCpus = os.cpus
-      const origLoadavg = os.loadavg
-      const origFreemem = os.freemem
-      os.cpus = () => Array(10).fill({ model: 'test' })
-      os.loadavg = () => [5.5, 0, 0] // 55% — above 50% threshold
-      os.freemem = () => 4096 * 1024 * 1024
-
-      monitor._poll()
-
-      os.cpus = origCpus
-      os.loadavg = origLoadavg
-      os.freemem = origFreemem
+      withFakeOs({ cpus: fakeCpus(10, 55000, 45000), loadAvg: 0.1 }, () => monitor._poll()) // 55% CPU
 
       assert.equal(monitor.capacity.level, 'overloaded',
         'CPU at 55% should be overloaded when maxCpuThreshold=50')
@@ -250,6 +250,59 @@ describe('ResourceMonitor', () => {
       monitor._poll()
       assert.equal(monitor.capacity.level, 'hibernating',
         'Hibernating should win over maxCpuThreshold override')
+    })
+  })
+
+  // ─── Real CPU, not load average (#191603) ─────────────────────
+
+  describe('cpu_pct is CPU time, not load average (#191603)', () => {
+    it('reports the CPU busy share between two polls, ignoring a huge load average', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      // Boot to poll 1: 50% busy. Poll 1 to poll 2: 10 cores x (1000 busy + 9000 idle) = 10%.
+      withFakeOs({ cpus: fakeCpus(10, 50000, 50000), loadAvg: 48.6 }, () => monitor._poll())
+      withFakeOs({ cpus: fakeCpus(10, 51000, 59000), loadAvg: 48.6 }, () => monitor._poll())
+      assert.equal(monitor.capacity.cpu_pct, 10)
+      assert.equal(monitor.capacity.cpu_sample, 'interval')
+      assert.equal(monitor.capacity.load_avg, 48.6, 'load_avg is still reported as its own field')
+      assert.equal(monitor.capacity.level, 'idle', 'a full-disk Mac with idle cores is not overloaded')
+      assert.equal(monitor.canAcceptTasks(), true)
+    })
+
+    it('reports a busy CPU as busy even when load is low', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      withFakeOs({ cpus: fakeCpus(8, 0, 100000), loadAvg: 0.2 }, () => monitor._poll())
+      withFakeOs({ cpus: fakeCpus(8, 9500, 100500), loadAvg: 0.2 }, () => monitor._poll())
+      assert.equal(monitor.capacity.cpu_pct, 95)
+      assert.equal(monitor.capacity.level, 'overloaded')
+    })
+
+    it('first poll uses the since-boot average, never a load-based guess', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      withFakeOs({ cpus: fakeCpus(4, 25000, 75000), loadAvg: 19.4 }, () => monitor._poll())
+      assert.equal(monitor.capacity.cpu_pct, 25)
+      assert.equal(monitor.capacity.cpu_sample, 'since_boot')
+    })
+
+    it('never reports above 100 or below 0', () => {
+      const cases = [
+        [{ total: 0, idle: 0 }, { total: 1000, idle: -500 }],
+        [{ total: 0, idle: 0 }, { total: 1000, idle: 2000 }],
+        [{ total: 5000, idle: 4000 }, { total: 5000, idle: 4000 }],
+        [{ total: 9000, idle: 8000 }, { total: 1000, idle: 500 }],
+        [null, { total: 0, idle: 0 }]
+      ]
+      for (const [prev, cur] of cases) {
+        const { pct } = cpuPercent(prev, cur)
+        assert.ok(pct >= 0 && pct <= 100, `cpuPercent(${JSON.stringify(prev)}, ${JSON.stringify(cur)}) = ${pct}`)
+      }
+      // Fully pegged with huge load on one core still caps at 100.
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      withFakeOs({ cpus: fakeCpus(1, 1000, 0), loadAvg: 40 }, () => monitor._poll())
+      assert.equal(monitor.capacity.cpu_pct, 100)
+    })
+
+    it('cpuTimeTotals sums every core', () => {
+      assert.deepEqual(cpuTimeTotals(fakeCpus(2, 300, 700)), { total: 2000, idle: 1400 })
     })
   })
 })
