@@ -81,6 +81,9 @@ const OPENCODE_BIN = process.env.OPENCODE_BIN || '/opt/homebrew/bin/opencode'
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'
 const IRIS_API_URL = process.env.IRIS_API_URL || 'https://freelabel.net'
 const BRIDGE_VERSION = require('./package.json').version
+// Freeze WHICH COMMIT this process loaded, now, before an update can swap the tree under it
+// (#191614). Read lazily, an old process would report the new commit after the swap.
+try { require('./lib/version-manifest').running() } catch { /* reports unknown */ }
 
 // ─── Hive Inbox (read API for the web UI — Option B) ────────────
 // The encrypted Send/Inbox store lives at ~/.iris/hive/inbox/. The daemon
@@ -1098,8 +1101,15 @@ app.get('/health', async (req, res) => {
     }
   } catch { /* not available */ }
 
+  // Which commit this process loaded, and whether the files on disk still match it (#191614).
+  // `iris daemon update` reads daemon_commit here to prove the NEW code is the one running.
+  let versionReport = { daemon_commit: 'unknown', daemon_drift: 'unknown', daemon_installed_at: null }
+  try { versionReport = require('./lib/version-manifest').running().report() } catch { /* stays unknown */ }
+
   res.json({
     status: 'ok',
+    ...versionReport,
+    daemon_version: require('./lib/version-manifest').versionString(BRIDGE_VERSION, versionReport),
     providers: ['claude_code', 'opencode', 'ollama'],
     ollama: { status: ollamaStatus, host: OLLAMA_HOST, sessions: ollamaSessions.size, models: ollamaModels },
     daemon: embeddedDaemon
