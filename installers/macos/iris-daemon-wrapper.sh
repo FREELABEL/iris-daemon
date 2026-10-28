@@ -122,12 +122,14 @@ if [ "${IRIS_WRAPPER_PRINT_NODE:-}" = "1" ]; then
 fi
 
 # ─── Read Config ──────────────────────────────────────────────
+# No config.json is the NORMAL state of a machine that has never joined: since #185896 the daemon
+# is the one writer of the node key and enrolls the machine itself (ensureNodeKey) with the
+# signed-in account, writing config.json as it does. This used to exit here, so a fresh machine
+# was relaunched by launchd forever and never registered — the installer, `iris hive enroll`,
+# `iris hive connect` and `iris-daemon register` all ended in it (#191475).
 if [ ! -f "${CONFIG_FILE}" ]; then
-  echo "[iris-daemon] ERROR: Config file not found: ${CONFIG_FILE}" >&2
-  echo "[iris-daemon] Run the installer first: bash ~/.iris/daemon/installers/install.sh" >&2
-  exit 1
-fi
-
+  echo "[iris-daemon] no ${CONFIG_FILE} yet — starting the daemon so it can enroll this machine" >&2
+else
 # Parse config.json using node (guaranteed available at this point)
 eval "$("${NODE_BIN}" -e "
   const c = require('${CONFIG_FILE}');
@@ -136,6 +138,7 @@ eval "$("${NODE_BIN}" -e "
   if (c.pusher_key) console.log('export PUSHER_KEY=' + JSON.stringify(c.pusher_key));
   if (c.pusher_cluster) console.log('export PUSHER_CLUSTER=' + JSON.stringify(c.pusher_cluster));
 " 2>/dev/null)"
+fi
 
 # Data directory
 export DAEMON_DATA_DIR="${IRIS_DIR}/data"
