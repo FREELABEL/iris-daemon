@@ -4,8 +4,7 @@ import {
   DiscoveredProfile,
   DiscoveryConfig,
   DiscoveryResult,
-  dismissInstagramPopups,
-} from './base-provider';
+  dismissInstagramPopups, keepDiscovered } from './base-provider';
 
 export class InstagramFollowersProvider extends BaseDiscoveryProvider {
   readonly platform = 'instagram';
@@ -96,7 +95,7 @@ export class InstagramFollowersProvider extends BaseDiscoveryProvider {
             sourceContext: `follower of ${config.targetUrl}`,
             rawMetadata: { isVerified: f.isVerified },
           };
-          if (!config.filterFn || config.filterFn(profile)) {
+          if (keepDiscovered(profile, config)) {
             profiles.push(profile);
           }
         }

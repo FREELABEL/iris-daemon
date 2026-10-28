@@ -23,8 +23,12 @@
  *   npx playwright test capture-replies.spec.ts
  */
 import { test, Browser, BrowserContext } from '@playwright/test';
-import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
+import { InstagramInboxJsonProvider } from './helpers/providers/instagram-inbox-json-provider';
 import { syncInbox, sendDiscordAlert } from './helpers/inbox-scanner';
+import {
+  runCaptureAccounts, formatCaptureSummary, resolveSessionFile, assertSessionIsDistinct, SessionUnusableError,
+} from './helpers/capture-run';
+const igAccounts = require('./helpers/ig-accounts');
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -75,38 +79,32 @@ function accounts(): CaptureAccount[] {
 
 /** Session files live next to this spec, or at the repo root on legacy installs. */
 function sessionFile(account: string): string | null {
-  const candidates = [
-    process.env.BROWSER_SESSION_FILE,
-    path.join(__dirname, `instagram-auth-${account}.json`),
-    path.join(__dirname, '../../..', `instagram-auth-${account}.json`),
-    path.join(__dirname, 'instagram-auth.json'),
-  ].filter(Boolean) as string[];
-
-  return candidates.find(p => fs.existsSync(p)) || null;
+  return resolveSessionFile(account, {
+    dirs: [__dirname, path.join(__dirname, '../../..')],
+    override: process.env.BROWSER_SESSION_FILE,
+    legacyFile: path.join(__dirname, 'instagram-auth.json'),
+    // An override or the legacy file is ONE login; it may only stand in for the one account (#191635).
+    singleAccount: !(process.env.CAPTURE_ACCOUNTS || '').trim(),
+  });
 }
 
+/** Read one account. Throws on any failure; runCaptureAccounts isolates it from the others. */
 async function captureAccount(
   browser: Browser,
   { account, boardId }: CaptureAccount,
-  failures: string[],
   summary: Record<string, any>[],
-): Promise<void> {
+): Promise<string> {
   const label = `@${account} / Board ${boardId}`;
   console.log(`\n${'='.repeat(60)}\n  CAPTURE ${label}\n${'='.repeat(60)}`);
 
   const file = sessionFile(account);
-  if (!file) {
-    console.log(`  SKIP: no Instagram session file for @${account}`);
-    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — no session** @${account} (board ${boardId})`);
-    failures.push(`@${account}: no session file`);
-    return;
-  }
+  if (!file) throw new SessionUnusableError(`no Instagram session file for @${account}`);
+  // Another account's login under this name reads as that account (#191635) — refuse it, naming both.
+  assertSessionIsDistinct(file, account);
 
   const state = JSON.parse(fs.readFileSync(file, 'utf-8'));
   if (!state.cookies || state.cookies.length === 0) {
-    console.log(`  SKIP: session file has no cookies (${file})`);
-    failures.push(`@${account}: session file has no cookies`);
-    return;
+    throw new SessionUnusableError(`session file has no cookies (${file})`);
   }
 
   let context: BrowserContext | null = null;
@@ -139,6 +137,13 @@ async function captureAccount(
     const withReplies = inbox.profiles.filter(p => p.rawMetadata?.hasTheirMessage === true);
     console.log(`  ${withReplies.length} of ${inbox.profiles.length} threads contain a message from them; ` +
       `${inbox.profiles.filter(p => p.rawMetadata?.lastFromThem).length} are waiting on us`);
+    // The provider confirmed the inbox is logged in as @account: record that in the file, so a
+    // copy pushed to the cloud can be checked on the way back down (#191635).
+    if (!DRY_RUN && path.basename(file) === `instagram-auth-${account}.json`) {
+      try { igAccounts.stampVerifiedAuthFile(path.dirname(file), account); } catch (err: any) {
+        console.log(`  session not stamped as verified: ${err.message}`);
+      }
+    }
     if (DRY_RUN) {
       for (const p of withReplies.slice(0, 25)) {
         console.log(`    @${p.username}${p.rawMetadata?.lastFromThem ? '  [waiting on us]' : ''}  "${String(p.rawMetadata?.lastMessage || '').slice(0, 70)}"`);
@@ -148,7 +153,7 @@ async function captureAccount(
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, JSON.stringify(inbox.profiles, null, 1));
       console.log(`  [DRY RUN] parsed threads written to ${out}`);
-      return;
+      return `dry run, read ${inbox.profiles.length}`;
     }
     const stats = await syncInbox(API_BASE, TOKEN, boardId, 'instagram', account, withReplies, '', { createMissing: true });
     if (stats === null) throw new Error(`inbox-sync rejected the capture for @${account}`);
@@ -167,11 +172,7 @@ async function captureAccount(
         recent: String(p.rawMetadata?.fullMessages || '').split('\n').slice(-6),
       })),
     });
-  } catch (err: any) {
-    const kind = err instanceof InstagramIdentityError ? 'wrong or expired session' : 'failed';
-    console.log(`  CAPTURE FAILED (${kind}) for ${label}: ${err.message}`);
-    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — ${kind}** ${label}\n${err.message}`);
-    failures.push(`${label}: ${err.message}`);
+    return `read ${inbox.profiles.length}, ${withReplies.length} with replies`;
   } finally {
     await context?.close().catch(() => {});
   }
@@ -184,14 +185,18 @@ test('Capture Instagram replies — every account, read-only', async ({ browser 
   test.setTimeout(Math.max(600_000, list.length * 1_800_000));
   console.log(`Capturing replies for ${list.length} account(s), limit ${CAPTURE_LIMIT} threads each`);
 
-  const failures: string[] = [];
   const summary: Record<string, any>[] = [];
-  for (const entry of list) {
-    await captureAccount(browser, entry, failures, summary);
-  }
+  // Each account is isolated: a logged-out or broken one is reported and the next is still read (#191634).
+  const rows = await runCaptureAccounts(list, entry => captureAccount(browser, entry, summary), async (entry, row) => {
+    console.log(`  CAPTURE FAILED (${row.status}) for @${entry.account} / Board ${entry.boardId}: ${row.detail}`);
+    await sendDiscordAlert(DISCORD_WEBHOOK, `**IG Reply Capture — ${row.status}** @${entry.account} / Board ${entry.boardId}\n${row.detail}`);
+  });
   console.log(`\nCAPTURE SUMMARY ${JSON.stringify(summary)}`);
-  // One account failing must not hide behind the others passing.
-  if (failures.length > 0) {
-    throw new Error(`reply capture failed for ${failures.length} of ${list.length} account(s):\n  ` + failures.join('\n  '));
+  console.log(formatCaptureSummary(rows));
+  // One account failing must not hide behind the others passing — but only after all were read.
+  const failed = rows.filter(r => r.status !== 'ok');
+  if (failed.length > 0) {
+    throw new Error(`reply capture failed for ${failed.length} of ${list.length} account(s):\n  ` +
+      failed.map(r => `@${r.account} (${r.status}): ${r.detail}`).join('\n  '));
   }
 });

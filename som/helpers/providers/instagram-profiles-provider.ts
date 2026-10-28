@@ -5,8 +5,7 @@ import {
   DiscoveryConfig,
   DiscoveryResult,
   dismissInstagramPopups,
-  scrapeProfileStats,
-} from './base-provider';
+  scrapeProfileStats, keepDiscovered } from './base-provider';
 
 export class InstagramProfilesProvider extends BaseDiscoveryProvider {
   readonly platform = 'instagram';
@@ -76,7 +75,7 @@ export class InstagramProfilesProvider extends BaseDiscoveryProvider {
         const status = stats.isPrivate ? '(private)' : `${followerStr} followers`;
         console.log(`      ${stats.displayName || username} — ${status}${stats.isVerified ? ' ✓' : ''}`);
 
-        if (!config.filterFn || config.filterFn(profile)) {
+        if (keepDiscovered(profile, config)) {
           profiles.push(profile);
         } else {
           console.log(`      Filtered out by criteria`);

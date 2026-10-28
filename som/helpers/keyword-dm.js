@@ -129,8 +129,10 @@ function writeLedger (file, ledger) {
  * `only`, when non-empty, is the list a person confirmed after a dry run: nobody outside it is sent,
  * so a comment that arrived between the preview and the send is not messaged unseen.
  */
-function selectTargets ({ commenters, keywords, account, handled, max, only }) {
+function selectTargets ({ commenters, keywords, account, handled, max, only, owned }) {
   const self = normalizeHandle(account)
+  // Every account we own, not just the one sending: ours comment on each other's posts (#191633).
+  const ours = owned || require('./ig-accounts').ownedHandles()
   const allow = only && only.size ? only : null
   const done = handled || new Set()
   const cap = clampMax(max)
@@ -144,7 +146,7 @@ function selectTargets ({ commenters, keywords, account, handled, max, only }) {
     const keyword = matchKeyword(comment, keywords)
     if (!keyword) continue // not asking; not listed, not a skip
     seen.add(handle)
-    if (handle === self) { skipped.push({ handle, comment, reason: 'own account' }); continue }
+    if (handle === self || ours.has(handle)) { skipped.push({ handle, comment, reason: 'own account' }); continue }
     if (done.has(handle)) { skipped.push({ handle, comment, reason: 'already in ledger' }); continue }
     if (allow && !allow.has(handle)) { skipped.push({ handle, comment, reason: 'not in the confirmed list' }); continue }
     if (targets.length >= cap) { skipped.push({ handle, comment, reason: `over cap (${cap})` }); continue }

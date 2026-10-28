@@ -10,6 +10,7 @@ import * as https from 'https';
 import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
+const igAccounts = require('./helpers/ig-accounts');
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
@@ -824,6 +825,13 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
           continue;
         }
+        // Never DM one of our own accounts, even if it ended up on the board as a lead (#191633).
+        if (!IS_LINKEDIN && igAccounts.isOwnedHandle(igHandle)) {
+          console.log(`  @${igHandle} is one of our own accounts — skipping`);
+          results.skipped++;
+          leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'skip' });
+          continue;
+        }
 
         // Crash-proof dedup check (local file)
         const sentFile = IS_LINKEDIN ? LI_DM_SENT_FILE : DM_SENT_FILE;
@@ -1579,6 +1587,11 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       const nameIsHandle = !name.includes(' ') && /^[a-z0-9._]+$/i.test(name);
       if (!nameIsHandle && !rowAttrs.igHandle) {
         console.log(`⏭️  No Instagram handle — skipping (name: "${name}")`);
+        results.skipped++; continue;
+      }
+      // Never DM one of our own accounts (#191633).
+      if (igAccounts.isOwnedHandle(rowAttrs.igHandle || name)) {
+        console.log(`⏭️  @${igAccounts.normalizeHandle(rowAttrs.igHandle || name)} is one of our own accounts — skipping`);
         results.skipped++; continue;
       }
 

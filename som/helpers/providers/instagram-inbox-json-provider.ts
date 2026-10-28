@@ -4,8 +4,7 @@ import {
   DiscoveredProfile,
   DiscoveryConfig,
   DiscoveryResult,
-  dismissInstagramPopups,
-} from './base-provider';
+  dismissInstagramPopups, keepDiscovered } from './base-provider';
 
 /**
  * Instagram Inbox (JSON) Provider — reads the DM inbox from the data the Instagram web app
@@ -292,7 +291,8 @@ export class InstagramInboxJsonProvider extends BaseDiscoveryProvider {
     }
 
     const all = [...threads.values()].sort((a, b) => b.lastActivityMs - a.lastActivityMs);
-    const profiles = all.map(threadToProfile);
+    // Our own accounts message each other; they are not people to capture (#191633).
+    const profiles = all.map(threadToProfile).filter(p => keepDiscovered(p, config));
     console.log(`    Read ${profiles.length} threads from ${payloads} inbox payloads in ${((Date.now() - start) / 1000).toFixed(1)}s` +
       ` — ${all.filter(t => t.lastFromThem).length} with their message last, ${all.filter(t => t.unread).length} unread`);
 

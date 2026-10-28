@@ -4,8 +4,7 @@ import {
   DiscoveredProfile,
   DiscoveryConfig,
   DiscoveryResult,
-  dismissInstagramPopups,
-} from './base-provider';
+  dismissInstagramPopups, keepDiscovered } from './base-provider';
 
 /**
  * Instagram Inbox Provider — scrapes DM conversations from instagram.com/direct/inbox/
@@ -178,7 +177,7 @@ export class InstagramInboxProvider extends BaseDiscoveryProvider {
           },
         };
 
-        if (!config.filterFn || config.filterFn(profile)) {
+        if (keepDiscovered(profile, config)) {
           profiles.push(profile);
         }
       }
