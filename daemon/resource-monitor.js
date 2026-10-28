@@ -4,7 +4,7 @@
  * Inspired by organic fungal networks: a tree doesn't share nutrients when
  * it's dying. A MacBook doesn't process AI tasks when it's on battery.
  *
- * Polls CPU load, free memory, and power state every 30s.
+ * Polls CPU use, free memory, and power state every 30s.
  * Reports capacity level to the hub so it can route tasks intelligently:
  *   - hibernating: on battery below 10% → rejects all new tasks
  *   - idle: load < 30% → accepts heavy tasks
@@ -80,9 +80,10 @@ class ResourceMonitor extends EventEmitter {
   // ─── Internal polling ────────────────────────────────────────
 
   _poll () {
-    const cores = os.cpus().length
+    const cpus = os.cpus()
+    const cores = cpus.length
     const loadAvg1m = os.loadavg()[0]
-    const cpuPct = Math.round((loadAvg1m / cores) * 100)
+    const cpuPct = this._cpuPercent(cpus, loadAvg1m)
     const freeMemMB = Math.round(os.freemem() / (1024 ** 2))
     const totalMemMB = Math.round(os.totalmem() / (1024 ** 2))
 
@@ -130,6 +131,34 @@ class ResourceMonitor extends EventEmitter {
         this.emit('capacity-changed', { level, previous: prev, capacity: this.capacity })
       }
     }
+  }
+
+  /**
+   * Share of CPU time spent working since the last poll, 0-100 (#191542).
+   *
+   * This was load average / cores. macOS load average counts threads waiting on disk and IO,
+   * not only ones on a core, so a 10-core Mac at load 19 reported "190%" while its cores were
+   * mostly idle (measured 2026-10-28) and the cloud refused every task pinned to it. Until there
+   * are two samples to diff (the first poll, or os.cpus() without times), fall back to load
+   * average, capped at 100.
+   */
+  _cpuPercent (cpus, loadAvg1m) {
+    const times = cpus.every(c => c && c.times) ? cpus.map(c => c.times) : null
+    const prev = this._prevCpuTimes
+    this._prevCpuTimes = times
+    if (times && prev && prev.length === times.length) {
+      let busy = 0
+      let total = 0
+      times.forEach((t, i) => {
+        const p = prev[i]
+        const idle = t.idle - p.idle
+        const work = (t.user - p.user) + (t.nice - p.nice) + (t.sys - p.sys) + (t.irq - p.irq)
+        busy += work
+        total += work + idle
+      })
+      if (total > 0) return Math.round((busy / total) * 100)
+    }
+    return Math.min(100, Math.round((loadAvg1m / Math.max(1, cpus.length)) * 100))
   }
 
   /**

@@ -252,4 +252,51 @@ describe('ResourceMonitor', () => {
         'Hibernating should win over maxCpuThreshold override')
     })
   })
+
+  // ─── Real CPU time, not load average (#191542) ────────────────
+  //
+  // macOS load average counts threads waiting on disk/IO, not just ones on a CPU, so a
+  // 10-core Mac routinely sits at load 15-20 while its cores are mostly idle. Measured
+  // 2026-10-28: Alexs-MacBook-Pro reported "CPU at 190%" and every pinned task was refused.
+
+  describe('CPU from cpu time between polls', () => {
+    // cumulative per-core times, as os.cpus() reports them
+    const sample = (cores, busy, idle) =>
+      Array(cores).fill(null).map(() => ({ model: 'test', times: { user: busy, nice: 0, sys: 0, idle, irq: 0 } }))
+
+    function pollWith (monitor, { cpus, loadAvg }) {
+      const origCpus = os.cpus
+      const origLoadavg = os.loadavg
+      os.cpus = () => cpus
+      os.loadavg = () => [loadAvg, 0, 0]
+      try { monitor._poll() } finally {
+        os.cpus = origCpus
+        os.loadavg = origLoadavg
+      }
+    }
+
+    it('reports real CPU use when load average is inflated', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      pollWith(monitor, { cpus: sample(10, 1000, 9000), loadAvg: 19 })
+      // next 30s: 200 busy + 800 idle per core = 20% busy, while load average says 190%
+      pollWith(monitor, { cpus: sample(10, 1200, 9800), loadAvg: 19 })
+      assert.equal(monitor.capacity.cpu_pct, 20)
+      assert.equal(monitor.capacity.level, 'idle')
+      assert.equal(monitor.capacity.load_avg, 19)
+    })
+
+    it('still reports overloaded when the cores really are busy', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      pollWith(monitor, { cpus: sample(10, 1000, 9000), loadAvg: 3 })
+      pollWith(monitor, { cpus: sample(10, 1950, 9050), loadAvg: 3 })
+      assert.equal(monitor.capacity.cpu_pct, 95)
+      assert.equal(monitor.capacity.level, 'overloaded')
+    })
+
+    it('never reports more than 100% before it has two samples', () => {
+      const monitor = createMonitor({ onBattery: false, percent: 100 })
+      pollWith(monitor, { cpus: sample(10, 1000, 9000), loadAvg: 19 })
+      assert.ok(monitor.capacity.cpu_pct <= 100, `cpu_pct was ${monitor.capacity.cpu_pct}`)
+    })
+  })
 })
