@@ -66,5 +66,9 @@ test('describeFailure names the board, the reason and the real choices', () => {
 test('the batch spec no longer carries a generic stand-in message to send', () => {
   const spec = fs.readFileSync(path.join(__dirname, '..', 'batch-with-login.spec.ts'), 'utf8');
   assert.ok(!spec.includes("Noticed you're doing some interesting work"), 'generic filler is back in the batch spec');
+  assert.ok(!spec.includes("I saw you're into some cool stuff") && !spec.includes("I saw you\\'re into some cool stuff"), 'UI-path filler is back in the batch spec');
+  // Any "msg || '<text>'" is a stand-in a real person would receive.
+  assert.ok(!/\bmsg\s*\|\|\s*['"`]/.test(spec), 'a msg || "<text>" fallback is back in the batch spec');
+  assert.match(spec, /if \(!msg\) \{[\s\S]{0,400}?results\.failed\+\+; continue;/, 'the empty-message skip after GET MESSAGE is missing');
   assert.match(spec, /checkStrategy\(BOARD_ID, STRATEGY_NAME/);
 });

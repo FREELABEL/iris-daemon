@@ -1897,6 +1897,12 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         msg = (await msgEl.textContent().catch(() => ''))?.trim() || '';
         console.log(`→ Msg: "${msg.substring(0, 60)}..."`);
       }
+      if (!msg) {
+        // No message rendered (slow page, UI change, empty script): skip — never type a
+        // generic stand-in to a real person, on Instagram or LinkedIn (#191275).
+        console.log(`✗ No message in the outreach panel for "${STRATEGY_NAME}" — skipping this lead, nothing sent`);
+        await page.keyboard.press('Escape'); results.failed++; continue;
+      }
 
       // ── 9. OPEN LINKEDIN or OPEN INSTAGRAM ──
       if (IS_LINKEDIN) {
@@ -2343,7 +2349,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
               const dmInput = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text], p[placeholder*="Message"]').first();
 
               if (await dmInput.isVisible({ timeout: 8000 }).catch(() => false)) {
-                const dmText = msg || 'Hey! I saw you\'re into some cool stuff. Would love to connect!';
+                const dmText = msg; // never empty here: an empty message skipped the lead at step 8 (#191275)
                 await dmInput.click();
                 await dmInput.fill(dmText).catch(async () => {
                   // fill() can fail on contenteditable — fallback to keyboard
