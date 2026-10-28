@@ -1,0 +1,53 @@
+# IRIS Compute Node — systemd USER unit (Linux), the counterpart of the macOS LaunchAgent
+# installers/macos/io.heyiris.daemon.plist (#191615).
+#
+# Installed to ~/.config/systemd/user/iris-daemon.service by `iris-daemon supervise` (also run
+# by `iris-daemon start` and installers/install.sh). __BRIDGE_DIR__ is replaced with the daemon's
+# directory (~/.iris/bridge for `iris node install`, ~/.iris/daemon for install.sh).
+#
+# USER-LEVEL ONLY, like the LaunchAgent: no root, no secrets. The node key is read from
+# ~/.iris/config.json by the wrapper at start — never written here.
+#
+# LINGER: a user unit is stopped when its user's last session ends, and is not started at boot,
+# unless lingering is on (`loginctl enable-linger $USER`). The installer turns it on where it
+# is permitted and says so plainly where it is not.
+
+[Unit]
+Description=IRIS Hive daemon (supervised)
+Documentation=https://github.com/FREELABEL/iris-daemon
+# A crash loop must end. With the back-off below, 10 starts in 10 minutes cannot be reached
+# by a daemon that runs at all; one that dies at once on every start stops being retried after
+# the 10th, instead of hammering the hub forever. `iris-daemon start` clears the counter.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=__BRIDGE_DIR__
+Environment=IRIS_DIR=%h/.iris
+Environment=IRIS_DAEMON_DIR=__BRIDGE_DIR__
+# The user manager's PATH has no ~/.iris/bin, so the daemon could not find `iris` (or the
+# agent CLIs in ~/.local/bin). This is the PATH the hand-written system unit gave it, plus those.
+Environment=PATH=%h/.iris/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# The SAME entry the LaunchAgent runs: the wrapper finds and pins ONE node binary
+# (~/.iris/daemon-node), exports the config, `cd`s into the daemon dir and execs daemon.js —
+# so MainPID is the daemon itself, not a shell.
+ExecStart=/bin/bash "__BRIDGE_DIR__/installers/macos/iris-daemon-wrapper.sh"
+# `iris doctor` reads ~/.iris/daemon.pid (#187776). Keep it true for as long as this runs.
+ExecStartPost=/bin/sh -c 'echo "$MAINPID" > "$IRIS_DIR/daemon.pid"'
+ExecStopPost=/bin/rm -f %h/.iris/daemon.pid
+Restart=always
+# 5s, doubling to at most 5 minutes between attempts (systemd 254+; older versions ignore
+# these two keys and retry every 5s until the start limit above stops them).
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=300
+# The daemon's SIGTERM handler closes the socket and shuts down; give it time before SIGKILL.
+TimeoutStopSec=20
+# The log files the LaunchAgent writes, so `iris-daemon logs` and `iris-daemon doctor` read
+# the same place on both platforms (#184929).
+StandardOutput=append:%h/.iris/logs/daemon.stdout.log
+StandardError=append:%h/.iris/logs/daemon.stderr.log
+
+[Install]
+WantedBy=default.target

@@ -84,6 +84,19 @@ async function main () {
     warn(`Unknown process on port 3200:\n      ${portOwner.split('\n')[1] || portOwner}`)
   }
 
+  // ─── 1b. Supervision (Linux, #191615) ─────────────────
+  // A node nobody restarts is one crash from an outage nobody notices. On macOS launchd
+  // supervises; on Linux this fails unless systemd owns the process holding :3200.
+  if (process.platform === 'linux') {
+    console.log('\nSupervision:')
+    const { collect, verdict } = require('./lib/linux-supervision')
+    const holder = parseInt(exec(`lsof -ti :${PORT} -sTCP:LISTEN 2>/dev/null`).split('\n')[0], 10)
+    const v = verdict(collect(), Number.isInteger(holder) ? holder : null)
+    if (v.status === 'pass') ok(v.detail)
+    else if (v.status === 'fail') fail(v.detail)
+    else info(v.detail)
+  }
+
   // ─── 2. Bridge health check ───────────────────────────
   console.log('\nBridge health:')
   const health = await fetchJSON(`http://localhost:${PORT}/health`)
