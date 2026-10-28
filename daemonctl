@@ -134,6 +134,179 @@ report_not_ready() {
     echo "  Check:  iris-daemon status   then   iris-daemon logs" >&2
 }
 
+# ─── Linux supervision: systemd --user (#191615) ────────────────
+# macOS has launchd (io.heyiris.daemon, KeepAlive). Linux had NOTHING: `start` fell through to
+# nohup, so on iris-hive-001 — the always-on node every business calls into — a crash meant an
+# outage until a person noticed. `iris daemon restart` printed "Started unsupervised" there.
+#
+# The rule launchd taught us (#185150, the split brain above): a supervisor PLUS an unsupervised
+# orphan is worse than either alone — the supervisor restarts the copy that is not serving and
+# everyone reports success. So on Linux, when systemd --user is available, EVERY start goes
+# through the unit (installing it if needed), every stop stops the unit first and then sweeps
+# orphans, and a start is only reported once the unit's own MainPID is the :3200 listener.
+# nohup survives ONLY where there is no systemd user manager (containers, non-systemd distros),
+# and says so loudly.
+#
+# A SYSTEM-scope iris-daemon.service (hand-written on iris-hive-001, #187774) is a supervisor too.
+# Killing its child just makes systemd respawn it beside whatever we start — so it is driven via
+# sudo, or refused with the command that moves it to the user unit (`iris-daemon supervise`).
+SYSTEMD_UNIT="iris-daemon.service"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_UNIT_FILE="$SYSTEMD_USER_DIR/$SYSTEMD_UNIT"
+SYSTEMD_UNIT_TEMPLATE="$BRIDGE_DIR/installers/linux/$SYSTEMD_UNIT"
+DAEMON_PID_FILE="$HOME/.iris/daemon.pid"
+
+is_linux() { [ "$(uname -s 2>/dev/null)" = "Linux" ]; }
+
+# Can we talk to THIS user's systemd manager? Not "is systemctl installed": in a container or
+# under `sudo -u` there is a systemctl binary and no user bus, and every --user call fails.
+systemd_user_ok() {
+    is_linux || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"   # cron / bare ssh sessions do not set it
+    fi
+    systemctl --user show-environment >/dev/null 2>&1
+}
+user_unit_installed() { [ -f "$SYSTEMD_UNIT_FILE" ]; }
+user_unit_active() { systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null; }
+user_unit_pid() {
+    _p="$(systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)"
+    [ -n "$_p" ] && [ "$_p" != "0" ] && echo "$_p"
+}
+
+# A system-scope unit of the same name that is still IN CHARGE: enabled (comes back at boot) or
+# running. A disabled, stopped one is retired and ignored — that is the state `supervise` leaves.
+legacy_system_unit_owns() {
+    is_linux && command -v systemctl >/dev/null 2>&1 || return 1
+    [ "$(systemctl show -p LoadState --value "$SYSTEMD_UNIT" 2>/dev/null)" = "loaded" ] || return 1
+    systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null && return 0
+    systemctl is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null && return 0
+    return 1
+}
+legacy_system_unit_pid() {
+    _p="$(systemctl show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)"
+    [ -n "$_p" ] && [ "$_p" != "0" ] && echo "$_p"
+}
+legacy_refusal() {
+    echo "This machine's daemon is owned by the SYSTEM unit $SYSTEMD_UNIT (systemctl cat $SYSTEMD_UNIT)." >&2
+    echo "  Killing its process only makes systemd start another beside ours, so this needs root:" >&2
+    echo "    sudo systemctl $1 $SYSTEMD_UNIT" >&2
+    echo "  Or move it to the supported user unit, once:  iris-daemon supervise" >&2
+}
+
+linger_on() {
+    [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = "yes" ]
+}
+# Without linger a user unit dies when its user's last session logs out and does not start at
+# boot. Say that plainly when we cannot fix it — "supervised" with linger off is supervised
+# until the operator closes their ssh session.
+ensure_linger() {
+    _u="$(id -un)"
+    if linger_on; then echo "  linger: on for $_u (the daemon runs with nobody logged in, and starts at boot)"; return 0; fi
+    if command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$_u" 2>/dev/null && linger_on; then
+        echo "  linger: enabled for $_u (the daemon runs with nobody logged in, and starts at boot)"
+        return 0
+    fi
+    echo "WARNING: could not enable linger for $_u — this account is not permitted to." >&2
+    echo "  Without linger, systemd STOPS the daemon when $_u's last session logs out, and does" >&2
+    echo "  not start it at boot. Ask an admin to run:  sudo loginctl enable-linger $_u" >&2
+    return 1
+}
+
+# Pin the node the daemon runs on, before the unit's first start: the binary the RUNNING daemon
+# uses if there is one (so moving it under systemd changes nothing about its runtime or native
+# modules), else the node daemonctl resolved. The wrapper honours ~/.iris/daemon-node.
+pin_daemon_node() {
+    _pin="$HOME/.iris/daemon-node"
+    [ -s "$_pin" ] && return 0
+    _exe=""
+    _cur="$(port_holder_pid)"
+    [ -n "$_cur" ] && _exe="$(readlink "/proc/$_cur/exe" 2>/dev/null)"
+    case "$_exe" in */node) ;; *) _exe="$(command -v node 2>/dev/null)" ;; esac
+    [ -n "$_exe" ] && [ -x "$_exe" ] && printf '%s\n' "$_exe" > "$_pin" && echo "  node: pinned to $_exe ($_pin)"
+    return 0
+}
+
+# Write the unit (template + this daemon's directory), reload, enable. Does not start it.
+install_user_unit() {
+    if [ ! -f "$SYSTEMD_UNIT_TEMPLATE" ]; then
+        echo "Cannot install the systemd unit: $SYSTEMD_UNIT_TEMPLATE is missing from this build." >&2
+        return 1
+    fi
+    mkdir -p "$SYSTEMD_USER_DIR" "$IRIS_LOG_DIR" || return 1
+    # % is a systemd specifier; a literal one in the path must be doubled.
+    _bd="$(printf '%s' "$BRIDGE_DIR" | sed -e 's/%/%%/g' -e 's/[|&\\]/\\&/g')"
+    sed "s|__BRIDGE_DIR__|$_bd|g" "$SYSTEMD_UNIT_TEMPLATE" > "$SYSTEMD_UNIT_FILE.tmp.$$" \
+        && mv -f "$SYSTEMD_UNIT_FILE.tmp.$$" "$SYSTEMD_UNIT_FILE" || { rm -f "$SYSTEMD_UNIT_FILE.tmp.$$"; return 1; }
+    echo "  unit: $SYSTEMD_UNIT_FILE"
+    systemctl --user daemon-reload || { echo "systemctl --user daemon-reload failed" >&2; return 1; }
+    systemctl --user enable "$SYSTEMD_UNIT" >/dev/null 2>&1 \
+        || { echo "systemctl --user enable $SYSTEMD_UNIT failed" >&2; return 1; }
+    pin_daemon_node
+    ensure_linger || true
+    return 0
+}
+
+# Start the unit and report only what was OBSERVED: ready, and the unit's MainPID is the pid
+# serving :3200 (not an orphan that happened to be there).
+start_user_unit() {
+    systemctl --user reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1 || true   # clear a tripped start limit
+    if ! systemctl --user start "$SYSTEMD_UNIT"; then
+        echo "systemctl --user start $SYSTEMD_UNIT failed. See: journalctl --user -u $SYSTEMD_UNIT -n 50" >&2
+        return 1
+    fi
+    echo "Handed to systemd — waiting for the daemon to serve /health..."
+    if ! wait_ready 45; then report_not_ready 45; return 1; fi
+    _main="$(user_unit_pid)"
+    _holder="$(port_holder_pid)"
+    if [ -n "$_holder" ] && [ "$_holder" != "$_main" ]; then
+        echo "SPLIT BRAIN: systemd's child is pid ${_main:-none} but pid $_holder holds :$BRIDGE_PORT." >&2
+        echo "  That process is not supervised. Fix: iris-daemon restart   Diagnose: iris-daemon doctor" >&2
+        return 1
+    fi
+    echo "Daemon started (systemd, PID: $_main)"
+    linger_on || echo "WARNING: linger is off — this daemon stops when you log out. Fix: sudo loginctl enable-linger $(id -un)" >&2
+    return 0
+}
+
+# One line, for `status`. Linux only (macOS status is unchanged).
+supervision_line() {
+    _holder="$(port_holder_pid)"
+    if legacy_system_unit_owns; then
+        _m="$(legacy_system_unit_pid)"
+        if systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null && { [ -z "$_holder" ] || [ "$_holder" = "$_m" ]; }; then
+            echo "Supervisor: supervised by systemd (SYSTEM unit $SYSTEMD_UNIT, pid ${_m:-none}) — move it to the user unit: iris-daemon supervise"
+        else
+            echo "Supervisor: UNSUPERVISED listener pid ${_holder:-none}; the system unit $SYSTEMD_UNIT has pid ${_m:-none}. Fix: iris-daemon supervise"
+        fi
+        return
+    fi
+    if systemd_user_ok && user_unit_installed && user_unit_active; then
+        _m="$(user_unit_pid)"
+        if [ -n "$_holder" ] && [ "$_holder" != "$_m" ]; then
+            echo "Supervisor: SPLIT BRAIN — systemd's child is pid ${_m:-none} but pid $_holder holds :$BRIDGE_PORT (UNSUPERVISED). Fix: iris-daemon restart"
+        else
+            echo "Supervisor: supervised by systemd (user unit $SYSTEMD_UNIT, pid ${_m:-none})"
+            linger_on || echo "  WARNING: linger is off — systemd stops it when you log out. Fix: sudo loginctl enable-linger $(id -un)"
+        fi
+        return
+    fi
+    if [ -n "$_holder" ]; then
+        if systemd_user_ok; then
+            echo "Supervisor: UNSUPERVISED (pid $_holder) — nothing restarts it if it crashes. Fix: iris-daemon supervise"
+        else
+            echo "Supervisor: UNSUPERVISED (pid $_holder) — systemd --user is not available here, nothing restarts it if it crashes"
+        fi
+    elif systemd_user_ok && user_unit_installed; then
+        echo "Supervisor: systemd user unit installed, not running. Start: iris-daemon start"
+    elif systemd_user_ok; then
+        echo "Supervisor: none installed. Install and start: iris-daemon supervise"
+    else
+        echo "Supervisor: none — systemd --user is not available here"
+    fi
+}
+
 # ─── Log rotation ───────────────────────────────────────────────
 # Rotates daemon logs before each start. Keeps last 5 archives per
 # log file. No-op when logs are under 10MB (avoids rotating on
@@ -187,7 +360,16 @@ case "${1:-status}" in
         fi
         SOCK="$HOME/.iris/daemon.sock"
         if [ -S "$SOCK" ] && node -e "require('net').createConnection('$SOCK',()=>{console.log('alive');process.exit(0)}).on('error',()=>process.exit(1))" 2>/dev/null; then
-            echo "Daemon already running"; exit 0
+            echo "Daemon already running"
+            # Running is not the same as supervised. Say which, without touching it: `start`
+            # never kills a live daemon.
+            if is_linux; then
+                case "$(supervision_line)" in
+                    *UNSUPERVISED*|*"SPLIT BRAIN"*) supervision_line >&2
+                        echo "  Hand it to systemd: iris-daemon restart" >&2 ;;
+                esac
+            fi
+            exit 0
         fi
         rm -f "$SOCK"
         # Prefer the supervisor when one exists. `stop` boots the launchd job out, so a
@@ -209,10 +391,36 @@ case "${1:-status}" in
             fi
         fi
 
+        # Linux: systemd --user, exactly as launchd above (#191615).
+        if is_linux; then
+            if legacy_system_unit_owns; then
+                # sudo -n: works where root is passwordless, fails fast (never prompts) elsewhere.
+                if sudo -n systemctl start "$SYSTEMD_UNIT" 2>/dev/null; then
+                    echo "Started the system unit $SYSTEMD_UNIT — waiting for /health..."
+                    if wait_ready 45; then echo "Daemon started (systemd, system unit)"; exit 0; fi
+                    report_not_ready 45; exit 1
+                fi
+                legacy_refusal start
+                exit 1
+            fi
+            if systemd_user_ok; then
+                if ! user_unit_installed; then
+                    echo "Installing the systemd user unit, so a crash is restarted:"
+                    install_user_unit || exit 1
+                fi
+                start_user_unit && exit 0
+                exit 1
+            fi
+            echo "WARNING: systemd --user is not available here (a container, a non-systemd init, or no" >&2
+            echo "  user session bus). Starting UNSUPERVISED: if the daemon crashes, NOTHING restarts it." >&2
+        fi
+
         mkdir -p "$IRIS_LOG_DIR"
         nohup node "$BRIDGE_DIR/daemon.js" \
             >> "$DAEMON_STDOUT_LOG" 2>> "$DAEMON_STDERR_LOG" &
         _NOHUP_PID=$!
+        # `iris doctor` reads this file (#187776); nothing wrote it on an unsupervised start.
+        echo "$_NOHUP_PID" > "$DAEMON_PID_FILE" 2>/dev/null || true
         echo "Started unsupervised (PID: $_NOHUP_PID) — waiting for /health..."
         if wait_ready 45; then
             echo "Hive daemon started (PID: $_NOHUP_PID)"
@@ -247,6 +455,20 @@ case "${1:-status}" in
             sleep 1
         fi
 
+        # Linux: the same rule — stop the UNIT, then sweep whatever it did not own (#191615).
+        # systemd does not restart a unit that was stopped on purpose (Restart=always covers
+        # crashes and kills, not `systemctl stop`).
+        if is_linux; then
+            if legacy_system_unit_owns && systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+                if ! sudo -n systemctl stop "$SYSTEMD_UNIT" 2>/dev/null; then
+                    legacy_refusal stop
+                    exit 1
+                fi
+            elif systemd_user_ok && user_unit_installed; then
+                systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
+            fi
+        fi
+
         # -sTCP:LISTEN IS LOAD-BEARING. `lsof -ti :3200` alone also matches outbound CLIENT
         # sockets, so every running `iris` process talking to the bridge lands in this list —
         # and this list gets `kill`ed. The same missing flag made bridgectl no-op and exit 0
@@ -257,6 +479,7 @@ case "${1:-status}" in
         PIDS=$(echo $PIDS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')
 
         if [ -z "$(echo $PIDS | tr -d ' ')" ]; then
+            rm -f "$DAEMON_PID_FILE" 2>/dev/null || true
             if [ -S "$SOCK" ]; then rm -f "$SOCK"; echo "Cleaned stale socket"
             else echo "Not running"; fi
             exit 0
@@ -288,6 +511,7 @@ case "${1:-status}" in
             echo "FAILED to stop daemon:$STILL — still running" >&2
             exit 1
         fi
+        rm -f "$DAEMON_PID_FILE" 2>/dev/null || true
         echo "Daemon stopped (PID:$PIDS)" ;;
     restart)
         # Under launchd, `kickstart -k` is the only restart that is guaranteed to replace the
@@ -324,8 +548,11 @@ case "${1:-status}" in
             fi
         fi
 
-        # Unsupervised fallback. `stop` exits non-zero if the process survived, so do not
-        # carry on to `start` — it would find the old process and report success for it.
+        # Linux (#191615) and the unsupervised fallback. On Linux `stop` stops the systemd unit
+        # and THEN sweeps every orphan off :3200, and `start` starts the unit and accepts only
+        # its own MainPID as the listener — so a restart cannot leave an orphan beside the
+        # supervised process. `stop` exits non-zero if a process survived, so do not carry on
+        # to `start` — it would find the old process and report success for it.
         if ! "$0" stop; then
             echo "Not restarting: the old daemon is still running." >&2
             exit 1
@@ -339,7 +566,66 @@ case "${1:-status}" in
         _GA_NODE="$(head -n 1 "$HOME/.iris/daemon-node" 2>/dev/null | tr -d '[:space:]')"
         [ -x "$_GA_NODE" ] || _GA_NODE="$(command -v node)"
         IRIS_DAEMONCTL="$0" exec "$_GA_NODE" "$BRIDGE_DIR/scripts/grant-access.js" "${@:2}" ;;
+    supervise)
+        # THE MIGRATION (#191615): a Linux node running unsupervised (nohup) or under a
+        # hand-written SYSTEM unit moves to the systemd user unit in one command, with no
+        # moment where two daemons hold :3200 — the old one is stopped and the port verified
+        # free BEFORE the unit starts. Downtime is one daemon startup.
+        if ! is_linux; then
+            echo "supervise is for Linux. On macOS the LaunchAgent io.heyiris.daemon supervises the daemon."
+            exit 1
+        fi
+        if ! systemd_user_ok; then
+            echo "systemd --user is not available here (a container, a non-systemd init, or no user bus)." >&2
+            echo "  Nothing was changed. Run the daemon under this host's own supervisor." >&2
+            exit 1
+        fi
+        _old="$(port_holder_pid)"
+        _legacy=""; legacy_system_unit_owns && _legacy=1
+        if [ "${2:-}" = "--dry-run" ]; then
+            echo "Would:"
+            echo "  1. install $SYSTEMD_UNIT_FILE (Restart=always) for $BRIDGE_DIR, enable it, enable linger"
+            [ -n "$_legacy" ] && echo "  2. sudo systemctl disable --now $SYSTEMD_UNIT   (the SYSTEM unit, pid $(legacy_system_unit_pid || echo none))"
+            echo "  3. stop the daemon now holding :$BRIDGE_PORT (pid ${_old:-none}) and verify the port is free"
+            echo "  4. systemctl --user start $SYSTEMD_UNIT and verify its MainPID serves /health"
+            exit 0
+        fi
+        echo "[1/4] Installing the systemd user unit"
+        install_user_unit || exit 1
+        if [ -n "$_legacy" ]; then
+            # Retire the system unit FIRST: two supervisors take the socket from each other
+            # forever (daemon/socket-lock.js), and an enabled one would come back at boot.
+            echo "[2/4] Retiring the SYSTEM unit $SYSTEMD_UNIT (needs sudo)"
+            if ! sudo systemctl disable --now "$SYSTEMD_UNIT"; then
+                echo "Could not disable the system unit. The daemon is still running under it, unchanged." >&2
+                echo "  The user unit is installed but was not started. Retry: iris-daemon supervise" >&2
+                exit 1
+            fi
+        else
+            echo "[2/4] No system unit to retire"
+        fi
+        echo "[3/4] Stopping the unsupervised daemon (pid ${_old:-none})"
+        if ! "$0" stop; then
+            echo "Not starting the unit: the old daemon is still running." >&2
+            exit 1
+        fi
+        _left="$(port_holder_pid)"
+        if [ -n "$_left" ]; then
+            echo "Not starting the unit: pid $_left still holds :$BRIDGE_PORT." >&2
+            exit 1
+        fi
+        echo "[4/4] Starting under systemd"
+        if ! "$0" start; then
+            echo "The supervised daemon did not come up. Logs: iris-daemon logs   journalctl --user -u $SYSTEMD_UNIT" >&2
+            [ -n "$_legacy" ] && echo "  To go back to the system unit: sudo systemctl enable --now $SYSTEMD_UNIT" >&2
+            exit 1
+        fi
+        echo "Supervised by systemd (pid ${_old:-none} -> $(user_unit_pid))."
+        [ -n "$_legacy" ] && echo "  Optional cleanup: sudo rm /etc/systemd/system/$SYSTEMD_UNIT && sudo systemctl daemon-reload"
+        echo "  Check: iris-daemon status   iris-daemon doctor"
+        exit 0 ;;
     status)
+        is_linux && supervision_line
         SOCK="$HOME/.iris/daemon.sock"
         if [ -S "$SOCK" ]; then
             node "$BRIDGE_DIR/daemon.js" --status 2>/dev/null || echo "Not running. Start with: iris-daemon start"
@@ -391,5 +677,5 @@ case "${1:-status}" in
         # Current TOTP code for a vault credential, generated here (#187916).
         shift
         exec node "$BRIDGE_DIR/lib/node-vault-cli.js" otp "$@" ;;
-    *) echo "Usage: iris-daemon {start|stop|restart|status|register|logs|doctor|grant-access|creds|vaults|otp}" ;;
+    *) echo "Usage: iris-daemon {start|stop|restart|status|supervise [--dry-run]|register|logs|doctor|grant-access|creds|vaults|otp}" ;;
 esac

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────
-# IRIS Compute Node — One-Line Installer (macOS)
+# IRIS Compute Node — One-Line Installer (macOS, Linux)
 #
 # Usage:
 #   curl -fsSL https://heyiris.io/install-daemon | bash
@@ -12,14 +12,16 @@
 #   2. Installs Node.js dependencies
 #   3. Writes config to ~/.iris/config.json
 #   4. Runs hardware profiling
-#   5. Installs a macOS LaunchAgent (auto-start on login)
+#   5. Installs a supervisor that restarts the daemon if it crashes:
+#        macOS — a LaunchAgent (auto-start on login)
+#        Linux — a systemd USER unit + linger (`iris-daemon supervise`, #191615)
 #   6. Starts the daemon
 #
 # What this does NOT do:
 #   - No root/sudo required
-#   - No system-level daemon (user-level LaunchAgent only)
+#   - No system-level daemon (user-level LaunchAgent / systemd --user unit only)
 #   - No Docker dependency
-#   - No modifications outside ~/.iris/ and ~/Library/LaunchAgents/
+#   - No modifications outside ~/.iris/, ~/Library/LaunchAgents/ and ~/.config/systemd/user/
 # ─────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -98,9 +100,8 @@ done
 # ─── OS Check ─────────────────────────────────────────────────
 
 OS="$(uname -s)"
-if [ "${OS}" != "Darwin" ]; then
-  echo -e "${RED}Error: This installer currently supports macOS only.${NC}"
-  echo "Linux and Windows support coming soon."
+if [ "${OS}" != "Darwin" ] && [ "${OS}" != "Linux" ]; then
+  echo -e "${RED}Error: This installer supports macOS and Linux.${NC}"
   echo ""
   echo "For manual installation on ${OS}:"
   echo "  git clone ${REPO_URL} ~/.iris/daemon"
@@ -109,7 +110,7 @@ if [ "${OS}" != "Darwin" ]; then
   exit 1
 fi
 
-echo -e "${GREEN}[1/8]${NC} macOS detected ($(uname -m))"
+echo -e "${GREEN}[1/8]${NC} ${OS} detected ($(uname -m))"
 
 # ─── Node.js Check ────────────────────────────────────────────
 
@@ -249,7 +250,19 @@ node -e "
   });
 " 2>/dev/null || echo -e "  ${YELLOW}(hardware profiling skipped)${NC}"
 
-# ─── Install LaunchAgent ──────────────────────────────────────
+# ─── Install the supervisor ───────────────────────────────────
+
+if [ "${OS}" = "Linux" ]; then
+  # systemd --user unit + linger, and the move off any nohup/system-unit daemon already running,
+  # in the one place that knows how (#191615). It says plainly if linger is not permitted.
+  chmod +x "${DAEMON_DIR}/daemonctl"
+  if "${DAEMON_DIR}/daemonctl" supervise; then
+    echo -e "${GREEN}[7/8]${NC} systemd user unit installed (restarts on crash, starts at boot with linger)"
+  else
+    echo -e "${YELLOW}[7/8] Could not supervise the daemon with systemd (see above) — starting it unsupervised.${NC}"
+    "${DAEMON_DIR}/daemonctl" start || true
+  fi
+else
 
 # Unload existing LaunchAgent if present
 if launchctl list | grep -q "io.heyiris.daemon" 2>/dev/null; then
@@ -268,6 +281,7 @@ sed "s|__HOME__|${HOME}|g" "${DAEMON_DIR}/installers/macos/${PLIST_NAME}" > "${P
 launchctl load "${PLIST_DEST}"
 
 echo -e "${GREEN}[7/8]${NC} LaunchAgent installed (auto-starts on login)"
+fi
 
 # ─── Create CLI Symlink ───────────────────────────────────────
 
@@ -337,5 +351,5 @@ echo ""
 echo -e "${BOLD}Uninstall:${NC}"
 echo "  bash ~/.iris/daemon/installers/uninstall.sh"
 echo ""
-echo -e "${GREEN}${BOLD}Your MacBook is now a sovereign compute node.${NC}"
+echo -e "${GREEN}${BOLD}This machine is now a sovereign compute node.${NC}"
 echo ""

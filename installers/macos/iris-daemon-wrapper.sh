@@ -16,6 +16,9 @@ set -euo pipefail
 IRIS_DIR="${HOME}/.iris"
 CONFIG_FILE="${IRIS_DIR}/config.json"
 DAEMON_DIR="${IRIS_DIR}/daemon"
+# The Linux systemd unit runs this wrapper in place (no sed'd copy) and names the daemon dir
+# here (#191615). The line above stays verbatim: the iris CLI installer sed-rewrites it.
+if [ -n "${IRIS_DAEMON_DIR:-}" ]; then DAEMON_DIR="${IRIS_DAEMON_DIR}"; fi
 
 # Say WHERE this aborted. `set -e` plus launchd's bare environment means any unexpected
 # failure kills the wrapper with no output at all — the daemon simply never appears, and

@@ -20,7 +20,7 @@ beforeEach(() => {
   fs.mkdirSync(bin, { recursive: true })
   fs.writeFileSync(
     path.join(bin, 'node'),
-    `#!/bin/sh\nif [ "$1" = "daemon.js" ]; then echo "LAUNCHED daemon.js key=\${NODE_API_KEY:-none}"; fi\nexit 0\n`,
+    `#!/bin/sh\nif [ "$1" = "daemon.js" ]; then echo "LAUNCHED daemon.js key=\${NODE_API_KEY:-none} cwd=$PWD"; fi\nexit 0\n`,
     { mode: 0o755 },
   )
   fs.mkdirSync(path.join(home, '.iris', 'daemon'), { recursive: true })
@@ -46,5 +46,20 @@ describe('daemon wrapper on a machine that has never joined', () => {
     const r = run()
     assert.equal(r.code, 0, r.err)
     assert.match(r.out, /LAUNCHED daemon\.js/)
+  })
+
+  // #191615: the Linux systemd unit runs this wrapper in place and names the daemon dir in
+  // IRIS_DAEMON_DIR (~/.iris/bridge for `iris node install`), instead of a sed'd copy.
+  it('runs daemon.js from IRIS_DAEMON_DIR when the systemd unit sets it', () => {
+    const bridge = path.join(home, '.iris', 'bridge')
+    fs.mkdirSync(bridge, { recursive: true })
+    fs.writeFileSync(path.join(bridge, 'daemon.js'), '')
+    const r = spawnSync('/bin/bash', [WRAPPER], { env: { HOME: home, PATH: '/usr/bin:/bin', IRIS_DAEMON_DIR: bridge }, encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(r.stdout.includes(`cwd=${fs.realpathSync(bridge)}`) || r.stdout.includes(`cwd=${bridge}`), r.stdout)
+  })
+
+  it('keeps the DAEMON_DIR line the iris CLI installer sed-rewrites, verbatim', () => {
+    assert.ok(fs.readFileSync(WRAPPER, 'utf8').includes('DAEMON_DIR="${IRIS_DIR}/daemon"\n'))
   })
 })
