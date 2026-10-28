@@ -42,6 +42,9 @@
 // other module captures a reference to it — a probe loaded later would miss every call site
 // that did `const { readdirSync } = require('fs')` at import time (#182371).
 require('./daemon/slow-fs-probe').install()
+// Freeze WHICH COMMIT this process loaded, now, before an update can swap the tree under it
+// (#191614). Read lazily, an old process would report the new commit after the swap.
+try { require('./lib/version-manifest').running() } catch { /* reports unknown */ }
 
 const path = require('path')
 const fs = require('fs')

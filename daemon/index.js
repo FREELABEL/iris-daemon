@@ -56,6 +56,19 @@ const IRIS_DIR = path.join(os.homedir(), '.iris')
 const STATUS_FILE = path.join(IRIS_DIR, 'status.json')
 const CONFIG_FILE = path.join(IRIS_DIR, 'config.json')
 
+// The heartbeat's version fields (#191614). Never throws: a broken manifest reads "unknown".
+function versionFields () {
+  let pkg = 'unknown'
+  try { pkg = require('../package.json').version || 'unknown' } catch { /* unknown */ }
+  try {
+    const vm = require('../lib/version-manifest')
+    const r = vm.running().report()
+    return { daemon_version: vm.versionString(pkg, r), daemon_commit: r.daemon_commit, daemon_drift: r.daemon_drift }
+  } catch {
+    return { daemon_version: pkg, daemon_commit: 'unknown', daemon_drift: 'unknown' }
+  }
+}
+
 class Daemon {
   constructor (config) {
     this.config = config
@@ -537,13 +550,13 @@ class Daemon {
       // daemons that predate `bridge_call` — they were correctly excluded from routing and
       // completely invisible in the fleet view, so local data sources silently worked on
       // exactly one machine (#178758). A fleet you cannot inventory cannot be rolled out to.
-      daemon_version: (() => {
-        try {
-          return require('../package.json').version || 'unknown'
-        } catch {
-          return 'unknown'
-        }
-      })(),
+      //
+      // package.json is 2.0.0 forever, so the COMMIT is the version (#191614): daemon_commit /
+      // daemon_drift come from the install manifest (lib/version-manifest.js), "unknown" without
+      // one. The hub stores only whitelisted keys and daemon_version is one of them, so the
+      // commit also rides inside it as build metadata ("2.0.0+<sha>[.drift]") — visible in the
+      // fleet with no server change.
+      ...versionFields(),
       // Separate from the package version on purpose: this is the CONTRACT version for what
       // the daemon can serve. Bump it when capabilities change, so the cloud can answer "is
       // this node new enough for X" without string-comparing release numbers.

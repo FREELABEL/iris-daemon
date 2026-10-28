@@ -26,3 +26,14 @@ r1-devices.json
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Install manifest written by `iris daemon update` (#191614): which commit this copy is.
+.iris-daemon-version.json
+
+# Runtime files the daemon writes into this directory that were not listed (#191614 audit).
+# `iris daemon update` carries every ignored file over to the new version, so a runtime file
+# missing here would be refused as an "untracked local change" instead.
+r1-frames.jsonl
+ollama-sessions/
+*-auth-backup.json
+.output/
