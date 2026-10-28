@@ -570,6 +570,13 @@ class TmuxManager {
    * @param {string} sessionName
    * @param {object} [completion] - Optional { exitCode, durationMs } for ledger
    */
+  /** The pids of the processes running in a session's panes (#184886) — read before killing it. */
+  panePids (sessionName) {
+    const raw = this._execSafe(['list-panes', '-t', sessionName, '-F', '#{pane_pid}'])
+    if (!raw) return []
+    return raw.split('\n').map(Number).filter((n) => Number.isInteger(n) && n > 0)
+  }
+
   cleanup (sessionName, completion) {
     // Record completion in ledger before deleting
     if (completion) {

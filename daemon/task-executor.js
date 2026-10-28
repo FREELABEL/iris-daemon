@@ -5737,15 +5737,34 @@ exit 1
    * the status it already set.
    */
   killTask (taskId, reason = 'stopped') {
+    // Not started yet — waiting in the admission gate's queue: drop it so it never starts.
+    if (this.gate && typeof this.gate.drop === 'function' && this.gate.drop(taskId)) {
+      console.log(`[executor] Dropped queued task ${taskId}: ${reason}`)
+      return true
+    }
     const entry = this.runningTasks.get(taskId)
     if (!entry) return false
     console.log(`[executor] Stopping task ${taskId}: ${reason}`)
+    entry._stopReason = reason
+    this._stopEntry(entry)
+    return true
+  }
+
+  /**
+   * Stop one running entry and EVERYTHING it started (#184886). Killing only the direct child let
+   * a cancelled job's `sleep` (and whatever came after it, in a subshell) run on to the end.
+   */
+  _stopEntry (entry) {
+    const { killTree } = require('./task-stop')
     if (entry?.tmux && entry.sessionName) {
+      // Read the pane's process tree BEFORE the session is killed, then kill both.
+      let pids = []
+      try { pids = typeof this.tmux.panePids === 'function' ? this.tmux.panePids(entry.sessionName) : [] } catch {}
+      for (const pid of pids) killTree({ pid, exitCode: null }, 3000)
       try { this.tmux.cleanup(entry.sessionName) } catch {}
     } else if (entry?.kill) {
-      require('./child-lifecycle').killWithEscalation(entry, 3000)
+      killTree(entry, 3000)
     }
-    return true
   }
 
   /**
@@ -5754,13 +5773,7 @@ exit 1
   killAll () {
     for (const [taskId, entry] of this.runningTasks) {
       console.log(`[executor] Killing task ${taskId}`)
-      if (entry?.tmux && entry.sessionName) {
-        // tmux-managed task — kill the session
-        try { this.tmux.cleanup(entry.sessionName) } catch {}
-      } else if (entry?.kill) {
-        // Direct child process
-        require('./child-lifecycle').killWithEscalation(entry, 3000)
-      }
+      this._stopEntry(entry)
     }
     this.runningTasks.clear()
     // Clean up any remaining tmux sessions
