@@ -4,8 +4,7 @@ import {
   DiscoveredProfile,
   DiscoveryConfig,
   DiscoveryResult,
-  dismissInstagramPopups,
-} from './base-provider';
+  dismissInstagramPopups, keepDiscovered } from './base-provider';
 
 export class InstagramCommentsProvider extends BaseDiscoveryProvider {
   readonly platform = 'instagram';
@@ -225,7 +224,7 @@ export class InstagramCommentsProvider extends BaseDiscoveryProvider {
               timestamp: c.timestamp || '',
             },
           };
-          if (!config.filterFn || config.filterFn(profile)) {
+          if (keepDiscovered(profile, config)) {
             profiles.push(profile);
           }
         }

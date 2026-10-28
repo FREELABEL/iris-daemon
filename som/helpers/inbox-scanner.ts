@@ -6,6 +6,24 @@
  * provider, lead field mapping) and delegates scanning to this module.
  */
 import * as https from 'https';
+const igAccounts = require('./ig-accounts');
+
+/** Our own Instagram accounts (#191633). Reading one of our inboxes shows our OTHER accounts as
+ *  people who messaged it; they are never a lead, never DM'd, never counted. */
+export function isOwnedInstagramHandle(handle: string | undefined | null, owned?: Set<string>): boolean {
+  return igAccounts.isOwnedHandle(handle, owned || igAccounts.ownedHandles());
+}
+
+/** Drop conversations with our own accounts. Only Instagram handles are compared. */
+export function withoutOwnedAccounts<T extends InboxProfile>(platform: string, profiles: T[], owned?: Set<string>): T[] {
+  if (platform !== 'instagram') return profiles;
+  const kept = profiles.filter(p => !isOwnedInstagramHandle(p.username, owned));
+  if (kept.length !== profiles.length) {
+    const dropped = profiles.filter(p => !kept.includes(p)).map(p => '@' + p.username);
+    console.log(`  Skipped ${dropped.length} conversation(s) with our own accounts: ${dropped.join(', ')}`);
+  }
+  return kept;
+}
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -48,6 +66,8 @@ export interface ScanResult {
 
 export interface RunOptions {
   autoDetectOurName?: boolean;
+  /** Override the owned-account list (tests). Defaults to ig-accounts' ownedHandles(). */
+  ownedHandles?: Set<string>;
   onEnrich?: (lead: Lead, contactPhone: string, contactName: string) => Promise<void>;
 }
 
@@ -92,20 +112,37 @@ export function phoneMatch(a: string, b: string): boolean {
   return na === nb;
 }
 
-/** Send a Discord webhook alert (fire-and-forget) */
-export function sendDiscordAlert(webhook: string, message: string): Promise<void> {
+/** Send a Discord webhook alert (fire-and-forget).
+ *  An alert must never break the run it reports on (#191634, same rule as #191404): no webhook
+ *  configured means log and skip, and a bad URL or a network error resolves instead of throwing.
+ *  `request` is injectable so tests never touch the network. */
+export function sendDiscordAlert(
+  webhook: string | undefined | null,
+  message: string,
+  request: typeof https.request = https.request,
+): Promise<void> {
   return new Promise((resolve) => {
-    const body = JSON.stringify({ content: message });
-    const url = new URL(webhook);
-    const req = https.request({
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, () => resolve());
-    req.on('error', () => resolve());
-    req.write(body);
-    req.end();
+    if (!webhook || !String(webhook).trim()) {
+      console.log(`  (no Discord webhook configured — alert not sent: ${String(message).split('\n')[0].slice(0, 120)})`);
+      resolve();
+      return;
+    }
+    try {
+      const body = JSON.stringify({ content: message });
+      const url = new URL(String(webhook).trim());
+      const req = request({
+        hostname: url.hostname,
+        path: url.pathname,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      }, () => resolve());
+      req.on('error', () => resolve());
+      req.write(body);
+      req.end();
+    } catch (err: any) {
+      console.log(`  Discord alert not sent: ${err?.message || err}`);
+      resolve();
+    }
   });
 }
 
@@ -215,9 +252,10 @@ export async function syncInbox(
   account: string,
   profiles: InboxProfile[],
   ourName: string,
-  options?: { createMissing?: boolean },
+  options?: { createMissing?: boolean; ownedHandles?: Set<string> },
 ): Promise<Record<string, number> | null> {
-  const conversations = profiles.map(profile => {
+  // Never send our own accounts to inbox-sync: with create_missing they became leads (#191633).
+  const conversations = withoutOwnedAccounts(platform, profiles, options?.ownedHandles).map(profile => {
     const contactHandle = profile.rawMetadata?.phoneNumber || profile.username || profile.displayName || '';
     const fullMessages = profile.rawMetadata?.fullMessages || '';
     const lines = fullMessages.split('\n').filter(Boolean);
@@ -443,7 +481,9 @@ export async function runInboxScan(
   const unmatchedProfiles: InboxProfile[] = [];
   let alreadyTaggedCount = 0;
 
-  for (const profile of profiles) {
+  // Our own accounts are not people: never matched, tagged or counted (#191633).
+  const theirs = withoutOwnedAccounts(config.platform, profiles, options?.ownedHandles);
+  for (const profile of theirs) {
     const contactName = profile.displayName || profile.username || '';
     const contactHandle = profile.username || '';
     const contactPhone = profile.rawMetadata?.phoneNumber || '';
@@ -500,7 +540,7 @@ export async function runInboxScan(
     }
   }
 
-  return { tagged, unmatched, unmatchedProfiles, alreadyTaggedCount, scannedCount: profiles.length, ourName };
+  return { tagged, unmatched, unmatchedProfiles, alreadyTaggedCount, scannedCount: theirs.length, ourName };
 }
 
 // ── Output ────────────────────────────────────────────────────────

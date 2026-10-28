@@ -1,4 +1,5 @@
 import { Page, BrowserContext } from '@playwright/test';
+const igAccounts = require('../ig-accounts');
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -18,6 +19,7 @@ export interface DiscoveryConfig {
   scrollDelay?: number;       // ms between scroll attempts (default: 2000)
   filterFn?: (profile: DiscoveredProfile) => boolean;
   existingHandles?: Set<string>; // Handles already on the board — skip during scraping
+  ownedHandles?: Set<string>;    // Our own accounts (default: ig-accounts' ownedHandles()) — never returned (#191633)
 }
 
 export interface DiscoveryResult {
@@ -71,6 +73,19 @@ export abstract class BaseDiscoveryProvider {
 }
 
 // ── Shared Helpers ─────────────────────────────────────────────────
+
+/**
+ * Whether a discovered profile may be returned: never one of our own Instagram accounts
+ * (#191633 — they comment on, follow and message each other), then the caller's filterFn.
+ * Every provider's push goes through this, so no discovery path can hand a self-lead onward.
+ */
+export function keepDiscovered(profile: DiscoveredProfile, config: Pick<DiscoveryConfig, 'filterFn' | 'ownedHandles'>): boolean {
+  if (profile.platform === 'instagram' &&
+      igAccounts.isOwnedHandle(profile.username, config.ownedHandles || igAccounts.ownedHandles())) {
+    return false;
+  }
+  return !config.filterFn || config.filterFn(profile);
+}
 
 /** Dismiss common IG popups ("Not Now", "Cancel", etc.) */
 export async function dismissInstagramPopups(page: Page): Promise<void> {

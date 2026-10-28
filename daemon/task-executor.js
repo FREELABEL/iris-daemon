@@ -461,11 +461,24 @@ async function getCampaignConfigs (freelabelRoot) {
 // behind bugs #133740/#133744). Sessions live in platform_credentials keyed by
 // bloq_id+platform; we fetch the decrypted storageState per active campaign board
 // and write som/instagram-auth-<igAccount>.json. Best-effort + loud on absence.
-async function ensureSomSessions (somDir, configs) {
-  const { userId, token } = resolveDaemonIdentity()
-  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
+//
+// #191635: the cloud holds ONE Instagram login per BOARD, not per account. @thediscoverpage_ and
+// @freelabelnet both run on board 80, so this wrote @freelabelnet's login (the board's newest)
+// into instagram-auth-thediscoverpage_.json — byte-identical files on 2026-10-03 and 2026-10-26.
+// Now a pulled session is written only when (a) its board belongs to one account, and (b) the
+// session carries a verified stamp naming this account and the login it holds; ig-accounts'
+// writeAuthFile also refuses a login another account's file already holds.
+async function ensureSomSessions (somDir, configs, deps = {}) {
+  const igAccounts = require('../som/helpers/ig-accounts')
+  const identity = deps.identity || resolveDaemonIdentity()
+  const { userId, token } = identity
+  const doFetch = deps.fetch || fetch
+  const log = deps.log || ((m) => console.log(m))
+  const apiBase = deps.apiBase || process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
   const seen = new Set()
   const missing = []
+  const refused = []
+  const shared = igAccounts.sharedBoards(configs)
   for (const c of Object.values(configs || {})) {
     const ig = c.igAccount
     const board = c.boardId
@@ -473,33 +486,47 @@ async function ensureSomSessions (somDir, configs) {
     seen.add(ig)
     const sessionFile = path.join(somDir, `instagram-auth-${ig}.json`)
     if (fs.existsSync(sessionFile)) continue // already present locally
+    const sharing = shared.get(String(board))
+    if (sharing) {
+      const why = `board ${board} is shared by ${sharing.map(h => '@' + h).join(' and ')}, and the cloud keeps one Instagram login per board — it cannot say whose it is`
+      log(`[executor] ⚠️  Not pulling a cloud IG session for ${ig}: ${why}. Log @${ig} in on this machine.`)
+      refused.push({ account: ig, reason: why })
+      missing.push(ig)
+      continue
+    }
     try {
       const url = `${apiBase}/api/v1/project-credentials/session?bloq_id=${board}&platform=instagram&user_id=${userId}`
-      const res = await fetch(url, {
+      const res = await doFetch(url, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
         signal: AbortSignal.timeout(10000),
       })
       if (!res.ok) {
-        console.log(`[executor] No cloud IG session for ${ig} (board ${board}): ${res.status} — run 'iris som push-sessions'`)
+        log(`[executor] No cloud IG session for ${ig} (board ${board}): ${res.status} — run 'iris som push-sessions'`)
         missing.push(ig)
         continue
       }
       const data = await res.json()
-      if (data && data.credentials) {
-        fs.writeFileSync(sessionFile, JSON.stringify(data.credentials, null, 2))
-        console.log(`[executor] Pulled IG session for ${ig} from cloud → ${sessionFile}`)
-      } else {
+      if (!(data && data.credentials)) { missing.push(ig); continue }
+      const problem = igAccounts.pulledSessionProblem(ig, data.credentials)
+      if (problem) {
+        log(`[executor] ⚠️  Not saving the cloud IG session for ${ig} (board ${board}): ${problem}`)
+        refused.push({ account: ig, reason: problem })
         missing.push(ig)
+        continue
       }
+      const { [igAccounts.STAMP_KEY]: stamp, ...state } = data.credentials
+      igAccounts.writeAuthFile(somDir, ig, state, { verifiedUsername: stamp.handle, now: () => stamp.verifiedAt })
+      log(`[executor] Pulled IG session for ${ig} from cloud → ${sessionFile}`)
     } catch (err) {
-      console.log(`[executor] IG session fetch failed for ${ig}: ${err.message}`)
+      log(`[executor] IG session fetch failed for ${ig}: ${err.message}`)
+      if (err instanceof igAccounts.DuplicateAuthError) refused.push({ account: ig, reason: err.message })
       missing.push(ig)
     }
   }
   if (missing.length) {
-    console.log(`[executor] ⚠️  ${missing.length} campaign account(s) have no IG session (cloud or local): ${missing.join(', ')} — run 'iris som push-sessions' from a machine that has them`)
+    log(`[executor] ⚠️  ${missing.length} campaign account(s) have no IG session (cloud or local): ${missing.join(', ')} — run 'iris som push-sessions' from a machine that has them`)
   }
-  return { missing }
+  return { missing, refused }
 }
 
 // SOM Preflight — delegated to som-config.js (single source of truth).
@@ -5903,4 +5930,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }
+module.exports = { ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }

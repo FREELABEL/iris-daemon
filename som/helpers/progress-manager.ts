@@ -18,7 +18,7 @@ export interface ProgressConfig {
 
 export interface CreationResult {
   username: string;
-  status: 'created' | 'duplicate' | 'error';
+  status: 'created' | 'duplicate' | 'error' | 'owned'; // owned: one of our own accounts, refused (#191633)
   leadId?: number;
   error?: string;
 }

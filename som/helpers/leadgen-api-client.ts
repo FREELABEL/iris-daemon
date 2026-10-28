@@ -8,6 +8,7 @@
 // API base URL — defaults to production API proxy.
 // Override with LEADGEN_API_URL env var for local dev (e.g., http://localhost:8000/api/v1)
 const BASE_URL = process.env.LEADGEN_API_URL || 'https://raichu.heyiris.io/api/v1';
+const igAccounts = require('./ig-accounts');
 
 export interface CreateLeadPayload {
   name: string;
@@ -23,6 +24,7 @@ export interface CreateLeadPayload {
 export interface ApiResponse {
   success: boolean;
   duplicate?: boolean;
+  owned?: boolean;            // refused: the handle is one of our own accounts (#191633)
   message?: string;
   data?: any;
 }
@@ -35,7 +37,7 @@ export interface BatchConfig {
 
 export interface BatchResultEntry {
   username: string;
-  status: 'created' | 'duplicate' | 'error';
+  status: 'created' | 'duplicate' | 'error' | 'owned';
   leadId?: number;
   error?: string;
 }
@@ -45,6 +47,7 @@ export interface BatchCreateResult {
   created: number;
   duplicates: number;
   errors: number;
+  owned?: number;             // our own accounts, refused (#191633)
   results: BatchResultEntry[];
 }
 
@@ -52,9 +55,13 @@ export class LeadgenApiClient {
   private token: string;
   private boardId: number;
 
-  constructor(token: string, boardId: number) {
+  private owned?: Set<string>;
+
+  /** owned: our own IG handles (defaults to ig-accounts' ownedHandles()); tests pass their own. */
+  constructor(token: string, boardId: number, opts: { ownedHandles?: Set<string> } = {}) {
     this.token = token;
     this.boardId = boardId;
+    this.owned = opts.ownedHandles;
   }
 
   /**
@@ -62,6 +69,12 @@ export class LeadgenApiClient {
    * The backend has its own duplicate detection (by instagram handle within the same bloq).
    */
   async createLead(payload: CreateLeadPayload): Promise<ApiResponse> {
+    // Never a lead for one of our own accounts (#191633) — whichever provider found it.
+    const ig = payload.contact_info?.instagram || (payload as any).nickname;
+    if (ig && igAccounts.isOwnedHandle(ig, this.owned || igAccounts.ownedHandles())) {
+      console.log(`  Skipped @${igAccounts.normalizeHandle(ig)}: one of our own accounts, not a lead`);
+      return { success: false, owned: true, message: `@${igAccounts.normalizeHandle(ig)} is one of our own accounts` };
+    }
     const body = {
       ...payload,
       bloqId: String(this.boardId),
@@ -490,6 +503,7 @@ export class LeadgenApiClient {
       created: 0,
       duplicates: 0,
       errors: 0,
+      owned: 0,
       results: [],
     };
 
@@ -502,12 +516,13 @@ export class LeadgenApiClient {
 
         const entry: BatchResultEntry = {
           username: payload.contact_info?.instagram || payload.name,
-          status: resp.duplicate ? 'duplicate' : resp.success ? 'created' : 'error',
+          status: resp.owned ? 'owned' : resp.duplicate ? 'duplicate' : resp.success ? 'created' : 'error',
           leadId: resp.data?.id || resp.data?.data?.id,
-          error: resp.success || resp.duplicate ? undefined : resp.message,
+          error: resp.success || resp.duplicate || resp.owned ? undefined : resp.message,
         };
 
-        if (resp.duplicate) result.duplicates++;
+        if (resp.owned) result.owned = (result.owned || 0) + 1;
+        else if (resp.duplicate) result.duplicates++;
         else if (resp.success) result.created++;
         else result.errors++;
 
