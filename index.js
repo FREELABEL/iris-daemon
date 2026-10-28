@@ -72,6 +72,7 @@ const { logDriverError } = require('./daemon/tcc-notice')
 // machines do not. `iris hive vpn serve 3200` publishes this port to a tailnet
 // that carries client machines, so that gap was one command from being live.
 const { OPEN_PATHS, OPEN_PREFIXES } = require('./lib/bridge-auth-policy')
+const mailCompose = require('./lib/mail-compose')
 app.use(bridgeAuth({ openPaths: OPEN_PATHS, openPrefixes: OPEN_PREFIXES }))
 
 // Full paths to CLIs (avoids PATH issues in subprocess)
@@ -2240,69 +2241,29 @@ app.get('/api/mail/accounts', async (req, res) => {
 /**
  * POST /api/mail/send
  * Send an email via Apple Mail.app using AppleScript.
- * Body: { to_email: string, to_name?: string, subject: string, body_text: string }
- * Requires macOS with Mail.app installed.
+ * Body: { to_email: string|string[], to_name?, cc_email?: string|string[], bcc_email?: string|string[],
+ *         from_email?, subject, body_text, attachments?, draft?,
+ *         in_reply_to?, reply_account?, reply_mailbox? }   (reply fields come from GET /api/mail/message)
+ * The message and its script are built by lib/mail-compose.js — shared with daemon/index.js (#191605).
  */
 app.post('/api/mail/send', async (req, res) => {
   if (process.platform !== 'darwin') {
     return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
   }
 
-  const { to_email, to_name, cc_email, from_email, subject, body_text, attachments, draft } = req.body
-
-  if (!to_email || !subject || !body_text) {
-    return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
-  }
+  const parsed = mailCompose.parseSendRequest(req.body)
+  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const m = parsed.message
 
   if (!(await ensureMailRunning())) {
     return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
   }
 
-  // Escape for AppleScript string literals
-  const escapeForAppleScript = (str) => (str || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-
-  const escapedTo = escapeForAppleScript(to_email)
-  const escapedName = escapeForAppleScript(to_name || to_email)
-  const escapedSubject = escapeForAppleScript(subject)
-  const escapedBody = escapeForAppleScript(body_text)
-
-  // Build attachment lines (array of absolute file paths)
-  let attachmentLines = ''
-  if (attachments && Array.isArray(attachments) && attachments.length > 0) {
-    attachmentLines = attachments.map(fp =>
-      `  make new attachment with properties {file name:POSIX file "${escapeForAppleScript(fp)}"} at after the last paragraph of content of msg`
-    ).join('\n')
-  }
-
-  // Build CC line
-  let ccLine = ''
-  if (cc_email) {
-    const ccAddresses = Array.isArray(cc_email) ? cc_email : [cc_email]
-    ccLine = ccAddresses.map(addr =>
-      `  make new cc recipient at beginning of cc recipients of msg with properties {address:"${escapeForAppleScript(addr)}"}`
-    ).join('\n')
-  }
-
-  // ── Resolve the sending account BEFORE composing anything ──────────────────
-  //
-  // This block used to live inside the compose script and was broken two ways at once:
-  //
-  //   1. `address of addr` throws -1700 — `email addresses` is a list of TEXT, not objects. The
-  //      throw happened AFTER `make new outgoing message` and BEFORE `send msg`, so every Apple
-  //      Mail send that named a from_email failed with an opaque AppleScript error and left an
-  //      invisible outgoing message behind. The whole apple_mail sender-binding path had never
-  //      worked; nothing noticed because sends without a from_email take the other branch.
-  //
-  //   2. Had it worked, the guard was `if senderAccount is not null then set sender` — so an
-  //      address matching NO account would silently fall through and Mail.app would send from its
-  //      DEFAULT while reporting ok:true. A message signed by one identity and delivered from
-  //      another is what spoofing looks like to a recipient and to a spam filter, and reporting it
-  //      as success is worse than failing.
-  //
-  // Resolving first means an unknown address is a 422 naming the addresses that DO work, and no
-  // half-composed draft is left behind in Mail.app.
-  let senderLine = ''
-  if (from_email) {
+  // Resolve the sending account BEFORE composing anything: an address matching no Mail.app
+  // account is a 422 naming the ones that work, never a silent send from the DEFAULT account
+  // (a message signed by one identity and delivered from another is what spoofing looks like).
+  let senderAddress = null
+  if (m.from) {
     let accounts
     try {
       accounts = await listMailAccounts()
@@ -2310,41 +2271,27 @@ app.post('/api/mail/send', async (req, res) => {
       return res.status(500).json({ error: `Could not read Mail.app accounts: ${err.message}` })
     }
 
-    const wanted = String(from_email).trim().toLowerCase()
+    const wanted = m.from.trim().toLowerCase()
     const known = accounts.flatMap((a) => a.addresses)
     const match = known.find((a) => a.toLowerCase() === wanted)
 
     if (!match) {
       return res.status(422).json({
-        error: `Mail.app has no account for "${from_email}", so this message would be sent from the default account instead — refusing.`,
-        requested_from: from_email,
+        error: `Mail.app has no account for "${m.from}", so this message would be sent from the default account instead — refusing.`,
+        requested_from: m.from,
         available_addresses: known,
       })
     }
-
     // Use the address as Mail.app spells it, not as the caller typed it.
-    senderLine = `  set sender of msg to "${escapeForAppleScript(match)}"`
+    senderAddress = match
   }
 
-  // draft=true opens compose window without sending; default sends immediately
-  const isDraft = draft === true || draft === 'true'
-  const sendOrShow = isDraft
-    ? `  set visible of msg to true\n  activate`
-    : `  delay 1\n  send msg`
-
-  const script = `tell application "Mail"
-  set msg to make new outgoing message with properties {subject:"${escapedSubject}", content:"${escapedBody}", visible:false}
-  make new to recipient at beginning of to recipients of msg with properties {name:"${escapedName}", address:"${escapedTo}"}
-${senderLine}
-${ccLine}
-${attachmentLines}
-${sendOrShow}
-end tell`
+  const script = mailCompose.buildSendScript(m, senderAddress)
 
   try {
     await new Promise((resolve, reject) => {
       const { execFile } = require('child_process')
-      execFile('/usr/bin/osascript', ['-e', script], { timeout: 20000 }, (err, stdout, stderr) => {
+      execFile('/usr/bin/osascript', ['-e', script], { timeout: m.reply ? 90000 : 20000 }, (err, stdout, stderr) => {
         if (err) {
           reject(new Error(stderr || err.message))
         } else {
@@ -2353,12 +2300,31 @@ end tell`
       })
     })
 
-    const action = isDraft ? 'Drafted' : 'Sent'
-    console.log(`[apple-mail] ${action} to ${to_email}: ${subject}`)
-    res.json({ ok: true, provider: 'apple-mail', mode: isDraft ? 'draft' : 'sent', to_email, subject })
+    const action = m.draft ? 'Drafted' : 'Sent'
+    console.log(`[apple-mail] ${action} to ${m.to.join(', ')}${m.reply ? ' (reply)' : ''}: ${m.subject}`)
+    res.json({ ok: true, provider: 'apple-mail', mode: m.draft ? 'draft' : 'sent', to_email: m.to.join(', '), subject: m.subject, ...mailCompose.describeSent(m) })
   } catch (err) {
     console.error(`[apple-mail] Send failed: ${err.message}`)
-    res.status(500).json({ error: `Apple Mail send failed: ${err.message}` })
+    const notFound = /\(1404\)|not found in/.test(err.message)
+    res.status(notFound ? 404 : 500).json({ error: `Apple Mail send failed: ${err.message}` })
+  }
+})
+
+/** GET /api/mail/capabilities — what /api/mail/send understands (see lib/mail-compose.js). */
+app.get('/api/mail/capabilities', (req, res) => {
+  res.json(mailCompose.CAPABILITIES)
+})
+
+/** GET /api/mail/message?id=<message-id>&days=90&account= — one message's envelope, for a reply. */
+app.get('/api/mail/message', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+  }
+  try {
+    const out = await mailCompose.lookupMessage(require('child_process').execFile, req.query)
+    res.status(out.status).json(out.body)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
 })
 

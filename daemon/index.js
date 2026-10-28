@@ -36,6 +36,7 @@ const { LoopLiveness } = require('./loop-liveness')
 const { WorkspaceManager } = require('./workspace-manager')
 const { isPhiTask } = require('../lib/phi-task')
 const { writeFileAtomic } = require('../lib/atomic-write')
+const mailCompose = require('../lib/mail-compose')
 const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter, resolveLocalLlmConfig } = require('./local-llm')
@@ -1915,16 +1916,14 @@ end tell`
         return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
       }
 
-      const { to_email, to_name, cc_email, from_email, subject, body_text, attachments, draft } = req.body || {}
+      // Several To, CC and BCC, and a reply to one specific message (#191605) — the message and
+      // its script are built by lib/mail-compose.js, shared with index.js and unit-tested there.
+      const parsed = mailCompose.parseSendRequest(req.body)
+      if (parsed.error) return res.status(400).json({ error: parsed.error })
+      const m = parsed.message
 
-      if (!to_email || !subject || !body_text) {
-        return res.status(400).json({ error: 'to_email, subject, and body_text are required' })
-      }
-
-      const esc = (str) => (str || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-
-      let senderLine = ''
-      if (from_email) {
+      let senderAddress = null
+      if (m.from) {
         let accounts
         try {
           accounts = await listMailAccounts()
@@ -1932,62 +1931,57 @@ end tell`
           return res.status(500).json({ error: `Could not read Mail.app accounts: ${err.message}` })
         }
 
-        const wanted = String(from_email).trim().toLowerCase()
+        const wanted = m.from.trim().toLowerCase()
         const known = accounts.flatMap((a) => a.addresses)
         const match = known.find((a) => a.toLowerCase() === wanted)
 
         if (!match) {
           return res.status(422).json({
-            error: `Mail.app has no account for "${from_email}", so this message would be sent from the default account instead — refusing.`,
-            requested_from: from_email,
+            error: `Mail.app has no account for "${m.from}", so this message would be sent from the default account instead — refusing.`,
+            requested_from: m.from,
             available_addresses: known,
           })
         }
-
-        senderLine = `  set sender of msg to "${esc(match)}"`
+        senderAddress = match
       }
 
-      let ccLine = ''
-      if (cc_email) {
-        const ccAddresses = Array.isArray(cc_email) ? cc_email : [cc_email]
-        ccLine = ccAddresses.map((addr) =>
-          `  make new cc recipient at beginning of cc recipients of msg with properties {address:"${esc(addr)}"}`
-        ).join('\n')
-      }
-
-      let attachmentLines = ''
-      if (attachments && Array.isArray(attachments) && attachments.length > 0) {
-        attachmentLines = attachments.map((fp) =>
-          `  make new attachment with properties {file name:POSIX file "${esc(fp)}"} at after the last paragraph of content of msg`
-        ).join('\n')
-      }
-
-      const isDraft = draft === true || draft === 'true'
-      const sendOrShow = isDraft ? `  set visible of msg to true\n  activate` : `  delay 1\n  send msg`
-
-      const script = `tell application "Mail"
-  set msg to make new outgoing message with properties {subject:"${esc(subject)}", content:"${esc(body_text)}", visible:false}
-  make new to recipient at beginning of to recipients of msg with properties {name:"${esc(to_name || to_email)}", address:"${esc(to_email)}"}
-${senderLine}
-${ccLine}
-${attachmentLines}
-${sendOrShow}
-end tell`
+      const script = mailCompose.buildSendScript(m, senderAddress)
 
       try {
         await new Promise((resolve, reject) => {
           const { execFile } = require('child_process')
-          execFile('/usr/bin/osascript', ['-e', script], { timeout: 45000 }, (err, stdout, stderr) => {
+          execFile('/usr/bin/osascript', ['-e', script], { timeout: m.reply ? 90000 : 45000 }, (err, stdout, stderr) => {
             if (err) return reject(new Error((stderr || err.message || '').trim().slice(0, 300)))
             resolve(stdout)
           })
         })
 
-        console.log(`[apple-mail] ${isDraft ? 'Drafted' : 'Sent'} to ${to_email}: ${subject}`)
-        res.json({ ok: true, provider: 'apple-mail', mode: isDraft ? 'draft' : 'sent', to_email, subject })
+        console.log(`[apple-mail] ${m.draft ? 'Drafted' : 'Sent'} to ${m.to.join(', ')}${m.reply ? ' (reply)' : ''}: ${m.subject}`)
+        res.json({ ok: true, provider: 'apple-mail', mode: m.draft ? 'draft' : 'sent', to_email: m.to.join(', '), subject: m.subject, ...mailCompose.describeSent(m) })
       } catch (err) {
         console.error(`[apple-mail] Send failed: ${err.message}`)
-        res.status(500).json({ error: `Apple Mail send failed: ${err.message}` })
+        const notFound = /\(1404\)|not found in/.test(err.message)
+        res.status(notFound ? 404 : 500).json({ error: `Apple Mail send failed: ${err.message}` })
+      }
+    })
+
+    // What this bridge's /api/mail/send understands. A CLI asking for several To, a BCC or a
+    // threaded reply checks this FIRST: an older bridge ignores fields it does not know, so it
+    // would send an unthreaded mail to fewer people and report success.
+    app.get(`${prefix}/api/mail/capabilities`, (req, res) => {
+      res.json(mailCompose.CAPABILITIES)
+    })
+
+    // One message's envelope by RFC Message-ID — what a reply / reply-all is computed from.
+    app.get(`${prefix}/api/mail/message`, async (req, res) => {
+      if (process.platform !== 'darwin') {
+        return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
+      }
+      try {
+        const out = await mailCompose.lookupMessage(require('child_process').execFile, req.query)
+        res.status(out.status).json(out.body)
+      } catch (err) {
+        res.status(500).json({ error: err.message })
       }
     })
 
