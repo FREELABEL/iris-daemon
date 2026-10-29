@@ -2,7 +2,8 @@
 # scrape-leads.sh <url> [<url> ...] [--follow team,about,...] [--no-follow] [--max-pages N]
 #                                  [--next "Next"] [--delay SECONDS]
 #
-# Reads PUBLIC pages in a throwaway headless Chrome and extracts people and company contacts:
+# Reads PUBLIC pages in a throwaway headless Chrome — Playwright's Chromium (scrape-leads.js, the
+# default: every bridge ships it) or browser-use (scrape-leads.py, the fallback; SL_ENGINE forces one) and extracts people and company contacts:
 # schema.org Person data, team-card blocks, loose mailto:/tel: links. Deterministic — no model.
 # Obeys robots.txt, waits between pages, follows only same-site links, pages directories with
 # safe_click (refuses a covered or ambiguous "Next"). No login, so no logged-in session.
@@ -23,7 +24,7 @@ while [ $# -gt 0 ]; do
     --max-pages) MAX="$2"; shift 2 ;;
     --next) NEXT="$2"; shift 2 ;;
     --delay) DELAY="$2"; shift 2 ;;
-    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,15p "$0"; exit 0 ;;
     *) URLS+=("$1"); shift ;;
   esac
 done
@@ -37,14 +38,50 @@ for u in "${URLS[@]}"; do case "$u" in http://*|https://*) ;; *) cant "url must 
 case "$MAX" in ''|*[!0-9]*) cant "--max-pages must be a number" ;; esac
 [ "$MAX" -le 50 ] || cant "--max-pages is capped at 50 — this reads someone else's site"
 
+export SL_URLS="$(printf '%s\n' "${URLS[@]}")" SL_FOLLOW="$FOLLOW" SL_MAX_PAGES="$MAX" SL_NEXT="$NEXT" \
+  SL_DELAY="$DELAY" SL_EXTRACT_FILE="$HERE/scrape-leads.extract.js"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.iris/runtime/bin:$PATH"
+
+finish () {   # $1 = the SL_RESULT= line
+  JSON="${1#SL_RESULT=}"
+  echo "$JSON"
+  printf '%s' "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(2 if not d.get("measured") else (0 if d["ok"] else 1))'
+  exit $?
+}
+
+# ENGINE (#191700). Playwright first: every Hive node's bridge ships playwright and the daemon
+# provisions its Chromium, while browser-use is installed nowhere by default — the field audit of
+# 2026-10-29 died here with "browser-use not installed" before reading a URL. Same extractor, same
+# output. SL_ENGINE=playwright|browser-use forces one.
+ENGINE="${SL_ENGINE:-auto}"
+PW_WHY=""
+if [ "$ENGINE" != "browser-use" ]; then
+  if command -v node >/dev/null 2>&1; then
+    PW_ERR="$(mktemp "${TMPDIR:-/tmp}/scrape-leads-pw.XXXXXX")"
+    LINE="$(node "$HERE/scrape-leads.js" 2>"$PW_ERR" | grep '^SL_RESULT=' | tail -1)"
+    PW_TAIL="$(grep -v '^\s' "$PW_ERR" | tail -2 | tr '\n' ' ' | tail -c 300)"; rm -f "$PW_ERR"
+    if [ -n "$LINE" ] && ! printf '%s' "$LINE" | grep -q '"engine_unavailable": *true'; then finish "$LINE"; fi
+    if [ -n "$LINE" ]; then
+      PW_WHY="$(printf '%s' "${LINE#SL_RESULT=}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))')"
+    else
+      PW_WHY="the Playwright engine printed no result${PW_TAIL:+: $PW_TAIL}"
+    fi
+  else
+    PW_WHY="node not found on PATH (the Playwright engine needs it — iris daemon update installs one)"
+  fi
+  [ "$ENGINE" = "playwright" ] && cant "no browser engine: $PW_WHY"
+fi
+
+# Fallback: browser-use. If it is not here either, say what to install for EITHER engine.
+if ! command -v browser-use >/dev/null 2>&1 && ! command -v uvx >/dev/null 2>&1; then
+  cant "no browser engine: ${PW_WHY:-Playwright engine not tried}; and browser-use not installed. Fix: run \`iris daemon update\` (installs the bridge's Playwright), then if Chromium is missing: cd $(cd "$HERE/../.." && pwd) && npx playwright install chromium — or install browser-use: uv tool install browser-use"
+fi
+
 # shellcheck source=_chrome.sh
 . "$HERE/_chrome.sh"
 bu_start scrape-leads
 
-RAW="$(SL_URLS="$(printf '%s\n' "${URLS[@]}")" SL_FOLLOW="$FOLLOW" SL_MAX_PAGES="$MAX" SL_NEXT="$NEXT" \
-  SL_DELAY="$DELAY" "${BU[@]}" < "$HERE/scrape-leads.py" 2>"$WORK/bu.err")"
+RAW="$("${BU[@]}" < "$HERE/scrape-leads.py" 2>"$WORK/bu.err")"
 LINE="$(printf '%s\n' "$RAW" | grep '^SL_RESULT=' | tail -1)"
 [ -n "$LINE" ] || cant "browser-use failed: $(bu_last_error)"
-JSON="${LINE#SL_RESULT=}"
-echo "$JSON"
-printf '%s' "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(2 if not d.get("measured") else (0 if d["ok"] else 1))'
+finish "$LINE"

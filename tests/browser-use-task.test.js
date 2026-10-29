@@ -281,7 +281,14 @@ print("RESULT=" + json.dumps(out))
 //    "General Partner" are name-shaped, so every card looked like it held two people.
 //  - nav links ("Startup Directory", "Hacker News") are name-shaped too.
 //  - O'Neil and "Dr. Priya van der Berg" were rejected by the first name rule.
-describe('scrape-leads.sh', { skip: !canRunBrowser() && 'no Chrome or browser-use on this machine' }, () => {
+// Either engine can run these: Playwright (the default, #191700) or browser-use. They are the SAME
+// assertions for both — the Playwright engine shares the extractor and must not change a result.
+function canRunPlaywright () {
+  if (process.platform === 'win32' || process.env.SKIP_BROWSER_E2E) return false
+  try { execFileSync('node', [path.join(ROOT, 'scripts/browser-use/scrape-leads.js'), '--probe'], { stdio: 'ignore' }) } catch { return false }
+  return true
+}
+describe('scrape-leads.sh', { skip: !(canRunPlaywright() || canRunBrowser()) && 'no Playwright Chromium, Chrome or browser-use on this machine' }, () => {
   const { execFile } = require('child_process')
   const SL = path.join(ROOT, 'scripts/browser-use/scrape-leads.sh')
   let server, base
