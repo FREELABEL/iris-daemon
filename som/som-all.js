@@ -852,8 +852,8 @@ async function main() {
       const cpus = os.cpus().length;
       const freeMem = Math.round(os.freemem() / 1024 / 1024 / 1024 * 10) / 10; // GB
       const totalMem = Math.round(os.totalmem() / 1024 / 1024 / 1024 * 10) / 10;
-      const loadAvg = os.loadavg()[0]; // 1-min load average
-      const loadPct = Math.round((loadAvg / cpus) * 100);
+      const loadAvg = Math.round(os.loadavg()[0] * 10) / 10; // shown only — load is not CPU (#191622)
+      const cpuPct = await require('./som-lock').sampleCpuPct({ ms: 750 }); // real CPU 0-100
 
       // Battery check (macOS)
       let battery = null;
@@ -867,20 +867,20 @@ async function main() {
       } catch {}
 
       console.log('  ── Resource Check ──');
-      console.log(`  CPU: ${cpus} cores, load: ${loadPct}%`);
+      console.log(`  CPU: ${cpus} cores, ${cpuPct}% busy (load avg ${loadAvg})`);
       console.log(`  Memory: ${freeMem}GB free / ${totalMem}GB total`);
       if (battery !== null) {
         console.log(`  Battery: ${battery}% ${isCharging ? '(charging)' : '(battery)'}`);
       }
 
       const maxParallel = require('./som-lock').parallelLimit({
-        freeGb: freeMem, loadPct, battery, charging: isCharging,
+        freeGb: freeMem, cpuPct, battery, charging: isCharging,
         requested: parseInt(process.env.SOM_MAX_PARALLEL || '2', 10),
       });
 
       if (maxParallel < campaigns.length) {
         console.log(`  ⚠️  Throttling: ${maxParallel} campaigns at a time (was ${campaigns.length})`);
-        console.log(`     Reason: ${freeMem < 4 ? 'low memory' : loadPct > 50 ? 'high CPU' : maxParallel === 2 ? 'two browsers at most' : 'low battery'}`);
+        console.log(`     Reason: ${freeMem < 4 ? 'low memory' : cpuPct > 50 ? 'high CPU' : maxParallel === 2 ? 'two browsers at most' : 'low battery'}`);
       } else {
         console.log(`  ✅ Resources OK — running ${campaigns.length} campaigns in parallel`);
       }
