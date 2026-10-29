@@ -323,8 +323,19 @@ function nodeAgentRequest (cloud, routePath) {
   }
 }
 
-async function resolveUserScriptAssets (slug, cloud) {
-  const { url, headers } = nodeAgentRequest(cloud, `/api/v6/node-agent/scripts/${encodeURIComponent(slug)}/assets`)
+/**
+ * The pull path for a script, FOR THIS TASK (#191674). With a task id the hub answers with the
+ * exact script and version it signed into the task — which may be another account's script shared
+ * with the caller — and re-checks the caller's access at pull time. Without one (an older hub, a
+ * task with no id) the pull is the node owner's own script, as it always was.
+ */
+function scriptPullPath (slug, taskId, suffix = '') {
+  const base = `/api/v6/node-agent/scripts/${encodeURIComponent(slug)}${suffix}`
+  return taskId ? `${base}?task_id=${encodeURIComponent(taskId)}` : base
+}
+
+async function resolveUserScriptAssets (slug, cloud, taskId = null) {
+  const { url, headers } = nodeAgentRequest(cloud, scriptPullPath(slug, taskId, '/assets'))
 
   const res = await fetch(url, { headers })
   if (res.status === 404) return []                       // no such script here — the caller already failed
@@ -337,7 +348,7 @@ async function resolveUserScriptAssets (slug, cloud) {
   return data
 }
 
-async function resolveUserScriptBySlug (slug, expectedSha = null, cloud = null) {
+async function resolveUserScriptBySlug (slug, expectedSha = null, cloud = null, taskId = null) {
   const contentDir = path.join(os.homedir(), '.iris', 'data', 'scripts', 'by-content')
   const sha = (s) => crypto.createHash('sha256').update(s, 'utf-8').digest('hex')
 
@@ -358,7 +369,7 @@ async function resolveUserScriptBySlug (slug, expectedSha = null, cloud = null) 
     }
   }
 
-  const { url, headers } = nodeAgentRequest(cloud, `/api/v6/node-agent/scripts/${encodeURIComponent(slug)}`)
+  const { url, headers } = nodeAgentRequest(cloud, scriptPullPath(slug, taskId))
   console.log(`[executor] user_script '${slug}' — pulling from cloud`)
   const res = await fetch(url, { headers })
   if (!res.ok) throw new Error(`Failed to pull script '${slug}' from cloud: HTTP ${res.status}`)
@@ -2321,7 +2332,7 @@ class TaskExecutor {
           const slug = (task.config?.script_slug || task.prompt || '').trim()
           if (!slug) throw new Error('user_script requires a script_slug')
           const expectedSha = task.config?.script_sha256 || null
-          const script = await resolveUserScriptBySlug(slug, expectedSha, this.cloud)
+          const script = await resolveUserScriptBySlug(slug, expectedSha, this.cloud, task.id)
           const runtime = task.config?.runtime || script.runtime || 'bash'
           const ext = { bash: 'sh', node: 'js', python: 'py', playwright: 'spec.ts' }[runtime] || 'sh'
           const scriptPath = path.join(workspace.dir, `user-script.${ext}`)
@@ -2332,7 +2343,7 @@ class TaskExecutor {
           // reported here, with the asset's name, instead of as whatever the script does when
           // its input is absent.
           try {
-            const assets = await resolveUserScriptAssets(slug, this.cloud)
+            const assets = await resolveUserScriptAssets(slug, this.cloud, task.id)
             if (assets.length) materialiseAssets(workspace.dir, assets)
           } catch (e) {
             // A script whose inputs are incomplete should not start. Throwing here fails the

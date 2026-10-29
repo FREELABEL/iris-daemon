@@ -49,7 +49,7 @@ before(async () => {
       const body = Buffer.from('the-watermark')
       return res.end(JSON.stringify({ data: [{ path: 'mark.txt', bytes: body.length, sha256: require('crypto').createHash('sha256').update(body).digest('hex'), content_base64: body.toString('base64') }] }))
     }
-    if (req.url.endsWith('/assets')) return res.end('{"data":[]}')
+    if (req.url.split('?')[0].endsWith('/assets')) return res.end('{"data":[]}')
     if (req.url.includes('/scripts/runs')) return res.end(JSON.stringify({ data: { script_content: 'cat mark.txt; echo; echo ran-ok\n', runtime: 'bash' } }))
     res.end(JSON.stringify({ data: { script_content: 'echo hi\n', runtime: 'bash' } }))
   })
@@ -77,6 +77,25 @@ describe('node-agent script routes authenticate as the NODE', () => {
     const assets = await resolveUserScriptAssets('auth-probe', cloud())
     assert.deepEqual(assets, [])
     assert.equal(seen[0].auth, `Bearer ${NODE_KEY}`)
+  })
+})
+
+describe('a pull FOR A TASK names the task (#191674)', () => {
+  // The hub answers a task-scoped pull with the exact script + version it signed into that task —
+  // possibly another account's script shared with the caller — and re-checks access at pull time.
+  // Without the task id the node can only ever get its owner's own current script.
+  it('the script and asset pulls carry task_id', async () => {
+    seen.length = 0
+    await resolveUserScriptBySlug('auth-probe', null, cloud(), 'task-123')
+    await resolveUserScriptAssets('auth-probe', cloud(), 'task-123')
+    assert.equal(seen[0].path, '/api/v6/node-agent/scripts/auth-probe?task_id=task-123')
+    assert.equal(seen[1].path, '/api/v6/node-agent/scripts/auth-probe/assets?task_id=task-123')
+  })
+
+  it('a pull with no task stays the owner-scoped path', async () => {
+    seen.length = 0
+    await resolveUserScriptBySlug('auth-probe', null, cloud())
+    assert.equal(seen[0].path, '/api/v6/node-agent/scripts/auth-probe')
   })
 })
 
