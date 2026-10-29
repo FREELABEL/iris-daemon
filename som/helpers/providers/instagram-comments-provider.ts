@@ -260,11 +260,12 @@ export class InstagramCommentsProvider extends BaseDiscoveryProvider {
         });
 
         // Stop faster at bottom — 2 empty scrolls at bottom is enough
-        if (atBottom && noNewCount >= 2) {
+        if (atBottom && noNewCount >= Math.max(2, Number(process.env.NO_NEW_LIMIT || 4) - 2)) {
           console.log(`    Reached bottom of comments — stopping`);
           break;
         }
-        if (noNewCount >= 4) {
+        // comments load in bursts on big posts; NO_NEW_LIMIT lets a long run wait longer before giving up
+        if (noNewCount >= Number(process.env.NO_NEW_LIMIT || 4)) {
           console.log(`    No new comments after ${noNewCount} scrolls — stopping`);
           break;
         }

@@ -1758,9 +1758,26 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
         if (IS_AUTO_STEP) {
           if (firstPendingIndex === -1 && totalSteps > 0) {
-            // All steps completed — skip this lead
-            console.log('⏭️  All steps completed — skipping');
-            await page.keyboard.press('Escape'); results.skipped++; continue;
+            // The panel can still show the PREVIOUS lead's steps (2026-10-28, #191666: three fresh leads
+            // with 0 steps in the API were skipped as "1/1 completed" right after a send). Ask the API
+            // before believing the ✓ marks: no completed steps there means the screen is stale.
+            let apiCompleted = -1;
+            if (rowAttrs.id) {
+              try {
+                const r = await fetch(`${process.env.LEADGEN_API_URL || 'https://raichu.heyiris.io/api/v1'}/leads/${rowAttrs.id}/outreach-steps`,
+                  { headers: { Authorization: `Bearer ${process.env.HEYIRIS_TOKEN}`, Accept: 'application/json' } });
+                const j: any = await r.json();
+                apiCompleted = Number(j?.data?.stats?.completed ?? -1);
+              } catch { /* fall through to the old behaviour */ }
+            }
+            if (apiCompleted === 0) {
+              console.log(`→ Panel shows ${completedCount}/${totalSteps} done but the API has 0 completed steps for #${rowAttrs.id}: stale panel, sending step 1`);
+              firstPendingIndex = 0;
+            } else {
+              // All steps completed — skip this lead
+              console.log(`⏭️  All steps completed (API completed=${apiCompleted}) — skipping`);
+              await page.keyboard.press('Escape'); results.skipped++; continue;
+            }
           }
           if (totalSteps === 0) {
             // Fresh lead with no steps — treat as step 0 (first contact)
