@@ -138,10 +138,60 @@ test('a board shared by two accounts is never pulled into either account\'s file
     freelabelnet: { boardId: '80', igAccount: 'freelabelnet' },
   }
   const r = await ensureSomSessions(dir, configs, deps(fetch))
+  // A board-keyed (older) cloud: neither file is written, though @freelabelnet's login is stamped.
   assert.deepStrictEqual(fs.readdirSync(dir), [])
-  assert.deepStrictEqual(fetch.calls, [])
   assert.deepStrictEqual(r.missing.sort(), ['freelabelnet', 'thediscoverpage_'])
   assert.match(r.refused[0].reason, /shared by @freelabelnet and @thediscoverpage_/)
+})
+
+// #191640 — the per-handle cloud: asked by handle, it answers with that account's own row.
+function fakeHandleFetch (byHandle, { echo = true } = {}) {
+  const calls = []
+  const fn = async (url) => {
+    calls.push(url)
+    const h = new URL(url).searchParams.get('account_handle')
+    const cred = byHandle[h]
+    if (!cred) return { ok: false, status: 404, json: async () => ({}) }
+    return { ok: true, status: 200, json: async () => ({ credentials: cred, ...(echo ? { account_handle: h } : {}) }) }
+  }
+  fn.calls = calls
+  return fn
+}
+
+test('two handles on one board each get their own login from a per-handle cloud', async () => {
+  const dir = tmp()
+  const fetch = fakeHandleFetch({
+    thediscoverpage_: session(111, { [ig.STAMP_KEY]: { handle: 'thediscoverpage_', userId: '111' } }),
+    freelabelnet: session(555, { [ig.STAMP_KEY]: { handle: 'freelabelnet', userId: '555' } }),
+  })
+  const configs = {
+    creators: { boardId: '80', igAccount: 'thediscoverpage_' },
+    freelabelnet: { boardId: '80', igAccount: 'freelabelnet' },
+  }
+  const r = await ensureSomSessions(dir, configs, deps(fetch))
+  assert.deepStrictEqual(r.missing, [])
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(), ['instagram-auth-freelabelnet.json', 'instagram-auth-thediscoverpage_.json'])
+  const read = (h) => ig.sessionUserId(JSON.parse(fs.readFileSync(path.join(dir, `instagram-auth-${h}.json`), 'utf8')))
+  assert.strictEqual(read('thediscoverpage_'), '111')
+  assert.strictEqual(read('freelabelnet'), '555')
+  assert.ok(fetch.calls.every(u => new URL(u).searchParams.get('account_handle')))
+  assert.deepStrictEqual(ig.findDuplicateAuthFiles(dir), [])
+})
+
+test('an answer for a different handle is refused even on an unshared board', async () => {
+  const dir = tmp()
+  const fetch = async () => ({ ok: true, status: 200, json: async () => ({ account_handle: 'freelabelnet', credentials: session(555, { [ig.STAMP_KEY]: { handle: 'thediscoverpage_', userId: '555' } }) }) })
+  const r = await ensureSomSessions(dir, { c: { boardId: 9, igAccount: 'thediscoverpage_' } }, deps(fetch))
+  assert.deepStrictEqual(fs.readdirSync(dir), [])
+  assert.match(r.refused[0].reason, /answered with @freelabelnet/)
+})
+
+test('a per-handle answer still has to carry this handle\'s stamp', async () => {
+  const dir = tmp()
+  const fetch = fakeHandleFetch({ thediscoverpage_: session(111) })
+  const r = await ensureSomSessions(dir, { c: { boardId: '80', igAccount: 'thediscoverpage_' }, f: { boardId: '80', igAccount: 'freelabelnet' } }, deps(fetch))
+  assert.deepStrictEqual(fs.readdirSync(dir), [])
+  assert.ok(r.refused.some(x => /never verified/.test(x.reason)))
 })
 
 test('an unverified or wrong-account cloud session is not written; a verified one is', async () => {

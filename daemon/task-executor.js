@@ -479,6 +479,11 @@ async function getCampaignConfigs (freelabelRoot) {
 // Now a pulled session is written only when (a) its board belongs to one account, and (b) the
 // session carries a verified stamp naming this account and the login it holds; ig-accounts'
 // writeAuthFile also refuses a login another account's file already holds.
+//
+// #191640: the cloud now keys sessions by handle. We ask for `account_handle`; an API that answers
+// per handle echoes it back, and then a shared board is no obstacle — the answer is that account's
+// own row. An older API ignores the parameter and answers per board, without echoing a handle, so
+// on a shared board that answer is still refused (the stamp checks below apply either way).
 async function ensureSomSessions (somDir, configs, deps = {}) {
   const igAccounts = require('../som/helpers/ig-accounts')
   const identity = deps.identity || resolveDaemonIdentity()
@@ -498,15 +503,9 @@ async function ensureSomSessions (somDir, configs, deps = {}) {
     const sessionFile = path.join(somDir, `instagram-auth-${ig}.json`)
     if (fs.existsSync(sessionFile)) continue // already present locally
     const sharing = shared.get(String(board))
-    if (sharing) {
-      const why = `board ${board} is shared by ${sharing.map(h => '@' + h).join(' and ')}, and the cloud keeps one Instagram login per board — it cannot say whose it is`
-      log(`[executor] ⚠️  Not pulling a cloud IG session for ${ig}: ${why}. Log @${ig} in on this machine.`)
-      refused.push({ account: ig, reason: why })
-      missing.push(ig)
-      continue
-    }
     try {
-      const url = `${apiBase}/api/v1/project-credentials/session?bloq_id=${board}&platform=instagram&user_id=${userId}`
+      const q = new URLSearchParams({ bloq_id: String(board), platform: 'instagram', account_handle: igAccounts.normalizeHandle(ig), user_id: String(userId) })
+      const url = `${apiBase}/api/v1/project-credentials/session?${q}`
       const res = await doFetch(url, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
         signal: AbortSignal.timeout(10000),
@@ -518,6 +517,21 @@ async function ensureSomSessions (somDir, configs, deps = {}) {
       }
       const data = await res.json()
       if (!(data && data.credentials)) { missing.push(ig); continue }
+      const perHandle = data.account_handle != null && igAccounts.normalizeHandle(data.account_handle) === igAccounts.normalizeHandle(ig)
+      if (data.account_handle != null && !perHandle) {
+        const why = `the cloud answered with @${igAccounts.normalizeHandle(data.account_handle)}'s session`
+        log(`[executor] ⚠️  Not saving the cloud IG session for ${ig} (board ${board}): ${why}`)
+        refused.push({ account: ig, reason: why })
+        missing.push(ig)
+        continue
+      }
+      if (sharing && !perHandle) {
+        const why = `board ${board} is shared by ${sharing.map(h => '@' + h).join(' and ')}, and this cloud answered per board, not per account — it cannot say whose login it is (update fl-iris-api, #191640)`
+        log(`[executor] ⚠️  Not saving a cloud IG session for ${ig}: ${why}. Log @${ig} in on this machine.`)
+        refused.push({ account: ig, reason: why })
+        missing.push(ig)
+        continue
+      }
       const problem = igAccounts.pulledSessionProblem(ig, data.credentials)
       if (problem) {
         log(`[executor] ⚠️  Not saving the cloud IG session for ${ig} (board ${board}): ${problem}`)
