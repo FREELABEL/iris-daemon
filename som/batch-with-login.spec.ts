@@ -311,8 +311,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         console.log(`✓ Instagram session loaded for @${IG_ACCOUNT} (${state.cookies.length} cookies)`);
       }
     } else {
-      console.log(`⚠️  No instagram-auth-${IG_ACCOUNT}.json found — run save-instagram-session first`);
-      console.log(`   IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\n`);
+      console.log(`⚠️  No instagram-auth-${IG_ACCOUNT}.json found — log it in first: iris som login ${IG_ACCOUNT} --node <this machine>`);
+      console.log(`   iris som login ${IG_ACCOUNT}  (or on this Mac: node som/login.js ${IG_ACCOUNT})\n`);
     }
   }
 
@@ -351,7 +351,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       } else if (onLogin || hasForm || hasLoggedOutSplash) {
         console.log(`\n${'='.repeat(70)}`);
         console.log(`  SESSION EXPIRED: @${IG_ACCOUNT}`);
-        console.log(`  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`);
+        console.log(`  Fix: iris som login ${IG_ACCOUNT}  (or on this Mac: node som/login.js ${IG_ACCOUNT})`);
         console.log(`${'='.repeat(70)}\n`);
         fs.mkdirSync('test-results/screenshots', { recursive: true });
         await checkPage.screenshot({ path: `test-results/screenshots/session-expired-preflight-${IG_ACCOUNT}.png` }).catch(() => {});
@@ -2027,11 +2027,11 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           const igSplashLogout = await igPage.locator('a:has-text("Log in"), button:has-text("Log in")').first().isVisible({ timeout: 1000 }).catch(() => false)
             && !(await igPage.locator('svg[aria-label="Home"]').isVisible({ timeout: 500 }).catch(() => false));
           if (isLoginPage || hasLoginForm || igSplashLogout) {
-            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`;
+            const errMsg = `Instagram session expired for @${IG_ACCOUNT} — re-run: iris som login ${IG_ACCOUNT}  (or on this Mac: node som/login.js ${IG_ACCOUNT})`;
             console.log(`\n\x1b[31m${'='.repeat(70)}\x1b[0m`);
             console.log(`\x1b[31m  SESSION EXPIRED: @${IG_ACCOUNT}\x1b[0m`);
             console.log(`\x1b[31m  Instagram redirected to login page: ${igUrl.substring(0, 80)}\x1b[0m`);
-            console.log(`\x1b[31m  Fix: IG_ACCOUNT=${IG_ACCOUNT} npx playwright test tests/e2e/save-instagram-session.spec.ts --headed\x1b[0m`);
+            console.log(`\x1b[31m  Fix: iris som login ${IG_ACCOUNT}  (or on this Mac: node som/login.js ${IG_ACCOUNT})\x1b[0m`);
             console.log(`\x1b[31m${'='.repeat(70)}\x1b[0m\n`);
             await igPage.screenshot({ path: `test-results/screenshots/session-expired-${IG_ACCOUNT}.png` }).catch(() => {});
             await sendDiscordAlert(

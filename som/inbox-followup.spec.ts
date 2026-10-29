@@ -183,7 +183,7 @@ test(`Inbox Follow-up — Board ${BOARD_ID} / @${IG_ACCOUNT}`, async ({ page, co
     }
   } else {
     console.log(`⚠ No Instagram session file found for @${IG_ACCOUNT}`);
-    console.log(`  Run: npx playwright test tests/e2e/save-instagram-session.spec.ts --headed`);
+    console.log(`  Run: iris som login <account>  (or on this Mac: node som/login.js <account>)`);
     return;
   }
 
