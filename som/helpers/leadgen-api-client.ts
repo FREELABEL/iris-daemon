@@ -585,8 +585,40 @@ export class LeadgenApiClient {
         body: JSON.stringify(data),
       });
       const json = await resp.json();
-      return { success: resp.ok, data: json, message: json.message };
+      // Also write the lead's comms log, the record the lead timeline shows. record-dm only writes the
+      // outreach message, so every SOM and hand-approved DM was missing from comms (2026-10-29: 0 of 0
+      // comms on leads 30313 and 30316 despite a sent DM). Best effort: a comms failure never fails a send.
+      const comms = await this.logComms(leadId, {
+        body: data.message, channel: 'instagram', direction: 'outbound',
+        subject: `IG DM from @${data.channel_account}`,
+        metadata: { logged_via: 'som record-dm', channel_account: data.channel_account, campaign: data.campaign_name ?? null, step_index: data.step_index ?? null },
+      });
+      return { success: resp.ok, data: { ...json, comms_logged: comms.success }, message: json.message };
     } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
+   * Write one entry to the lead's comms log (POST /api/v1/atlas/comms/log, as `iris comms log` does).
+   */
+  async logComms(leadId: number, entry: {
+    body: string; channel: string; direction: 'outbound' | 'inbound'; subject?: string; sentAt?: string; metadata?: Record<string, any>;
+  }): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}/atlas/comms/log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}`, 'Accept': 'application/json' },
+        body: JSON.stringify({
+          lead_id: leadId, channel: entry.channel, direction: entry.direction, body: entry.body,
+          subject: entry.subject ?? null, sent_at: entry.sentAt ?? new Date().toISOString(),
+          metadata: entry.metadata ?? {},
+        }),
+      });
+      if (!resp.ok) console.log(`    ⚠ comms log HTTP ${resp.status} for lead #${leadId}`);
+      return { success: resp.ok };
+    } catch (err: any) {
+      console.log(`    ⚠ comms log failed for lead #${leadId}: ${err.message}`);
       return { success: false, message: err.message };
     }
   }
