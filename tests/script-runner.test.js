@@ -219,9 +219,14 @@ describe('filename validation', () => {
 })
 
 describe('persistence', () => {
+  // An ephemeral run writes its own `.run-<uuid>-<name>` file (#191734), so "probe.sh is gone"
+  // would pass even if that file leaked. Nothing may be left in the folder at all.
+  const leftovers = () => fs.readdirSync(path.join(tmpDir, 'scripts')).filter((f) => f.startsWith('.run-') || f.endsWith('.tmp'))
+
   it('removes the script when persist is false', async () => {
     await run('#!/usr/bin/env bash\ntrue\n', { persist: false })
     assert.equal(fs.existsSync(path.join(tmpDir, 'scripts', 'probe.sh')), false)
+    assert.deepEqual(leftovers(), [])
   })
 
   it('keeps the script and reports its path when persist is true', async () => {
@@ -235,6 +240,12 @@ describe('persistence', () => {
     // a cleanup path that only runs on success accumulates the worst scripts on the node.
     await run('#!/usr/bin/env bash\nsleep 20\n', { timeoutMs: 1000, persist: false })
     assert.equal(fs.existsSync(path.join(tmpDir, 'scripts', 'probe.sh')), false)
+    assert.deepEqual(leftovers(), [])
+  })
+
+  it('a persisted push leaves no temp file behind', async () => {
+    await run('#!/usr/bin/env bash\ntrue\n', { persist: true })
+    assert.deepEqual(leftovers(), [])
   })
 })
 
@@ -277,6 +288,43 @@ describe('stress', () => {
         if (j !== i) assert.ok(!new RegExp(`token-${j}\\b`).test(res.stdout), `run ${i} leaked run ${j}'s output`)
       }
     })
+  })
+
+  it('runs many copies of the SAME filename concurrently, each its own content (#191734)', async () => {
+    // The reported repro: 30 concurrent pushes of probe.sh gave 6 × exit 127, because one run
+    // unlinked the shared file another was about to exec — and a run could exec ANOTHER request's
+    // content. Distinct tokens per run catch the second, quieter failure as well as the first.
+    const N = 30
+    const results = await Promise.all(Array.from({ length: N }, (_, i) =>
+      runScript({
+        scriptsDir: path.join(tmpDir, 'scripts'),
+        filename: 'probe.sh',
+        content: `#!/usr/bin/env bash\necho same-${i}\nsleep 0.2\n`,
+        timeoutMs: 20_000
+      })
+    ))
+    results.forEach((res, i) => {
+      assert.equal(res.exit_code, 0, `run ${i} failed: ${res.stderr}`)
+      assert.equal(res.stdout.trim(), `same-${i}`, `run ${i} ran another request's content`)
+    })
+    assert.deepEqual(fs.readdirSync(path.join(tmpDir, 'scripts')).filter((f) => f.startsWith('.run-')), [])
+  })
+
+  it('re-persisting a script does not change a run already in flight', async () => {
+    // bash reads a script AS IT RUNS. Rewriting the persisted file in place hands a running
+    // script the new version's bytes from wherever its read offset is; the rename means it keeps
+    // the file it opened.
+    const dir = path.join(tmpDir, 'scripts')
+    const first = runScript({ scriptsDir: dir, filename: 'live.sh', persist: true, timeoutMs: 20_000,
+      content: '#!/usr/bin/env bash\nsleep 1\necho first-finished\n' })
+    await new Promise((r) => setTimeout(r, 300))
+    const second = await runScript({ scriptsDir: dir, filename: 'live.sh', persist: true, timeoutMs: 20_000,
+      content: '#!/usr/bin/env bash\necho second-ran-xxxxxxxxxxxxxxxxxxxxxxxx\n' })
+    const done = await first
+    assert.match(done.stdout, /first-finished/)
+    assert.doesNotMatch(done.stdout, /second-ran/)
+    assert.match(second.stdout, /second-ran/)
+    assert.match(fs.readFileSync(path.join(dir, 'live.sh'), 'utf8'), /second-ran/, 'the persisted path holds the latest push')
   })
 
   it('survives a script that floods stdout without exhausting memory', async () => {

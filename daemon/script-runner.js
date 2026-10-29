@@ -2,6 +2,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const { spawn } = require('child_process')
 
 /**
@@ -29,6 +30,14 @@ const { spawn } = require('child_process')
  * before anything gets trimmed — the cap protected the RESPONSE, never the node. Buffering here
  * is bounded as chunks arrive, and truncation is REPORTED rather than silent, because output
  * that vanishes without a marker is indistinguishable from output that was never produced.
+ *
+ * THE THIRD BUG (#191734, measured 2026-10-29). Every run wrote to `<scriptsDir>/<filename>` and
+ * an ephemeral run unlinked that path when it finished. Two runs of the same filename shared one
+ * file: 30 concurrent pushes of probe.sh gave 6 × exit 127 ("No such file or directory") — a run
+ * deleted the file another was about to exec — and, worse, a run could exec ANOTHER request's
+ * content. An ephemeral run now gets its own file; only a persisted script keeps the shared
+ * path, and it is replaced atomically, because bash reads a script as it runs and an in-place
+ * rewrite changes the code under a run already in flight.
  */
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -136,9 +145,20 @@ function runScript (opts) {
   }
 
   if (!fs.existsSync(scriptsDir)) fs.mkdirSync(scriptsDir, { recursive: true })
-  const scriptPath = path.join(scriptsDir, filename)
-  fs.writeFileSync(scriptPath, content, 'utf-8')
-  fs.chmodSync(scriptPath, '755')
+  // Ephemeral: a file of its own, so no other run can overwrite or unlink it. Same directory
+  // (the cwd and relative paths a script sees are unchanged) and the filename kept as a suffix
+  // (the extension picks the interpreter, and $0 still reads like the script's name).
+  //
+  // Persisted: the shared, documented path that schedules and `hive script exec` run — written
+  // to a temp file and renamed over it. A rename swaps the directory entry, so a run already
+  // executing keeps the inode it opened and never sees half of one version and half of another.
+  const scriptPath = persist
+    ? path.join(scriptsDir, filename)
+    : path.join(scriptsDir, `.run-${crypto.randomUUID()}-${filename}`)
+  const writePath = persist ? `${scriptPath}.${crypto.randomUUID()}.tmp` : scriptPath
+  fs.writeFileSync(writePath, content, { encoding: 'utf-8', mode: 0o755, flag: 'wx' })
+  fs.chmodSync(writePath, '755')
+  if (writePath !== scriptPath) fs.renameSync(writePath, scriptPath)
 
   const ext = path.extname(filename).toLowerCase()
   const cmd = INTERPRETERS[ext] || '/bin/bash'
