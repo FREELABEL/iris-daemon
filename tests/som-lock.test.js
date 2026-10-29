@@ -126,10 +126,39 @@ test('only Playwright browsers whose owner died are closed', () => {
 })
 
 test('a busier machine never gets more browsers', () => {
-  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10 }), 2)
-  assert.strictEqual(parallelLimit({ freeGb: 3, loadPct: 10 }), 1)
-  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 60 }), 1)
-  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, battery: 20, charging: false }), 1)
-  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, requested: 1 }), 1)
-  assert.strictEqual(parallelLimit({ freeGb: 16, loadPct: 10, requested: 5 }), 2)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: 10 }), 2)
+  assert.strictEqual(parallelLimit({ freeGb: 3, cpuPct: 10 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: 60 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: 10, battery: 20, charging: false }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: 10, requested: 1 }), 1)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: 10, requested: 5 }), 2)
+})
+
+// #191622: the throttle read load average as CPU. Load 28 on 10 cores is "280%", but the cores
+// were 28% busy (a MacBook waiting on its disk). The decision must use real CPU from os.cpus().
+const { sampleCpuPct } = require('../som/som-lock')
+const snap = (busyMs, idleMs, cores = 10) => Array.from({ length: cores }, () => ({ times: { user: busyMs, nice: 0, sys: 0, idle: idleMs, irq: 0 } }))
+
+test('SOM throttles on real CPU from two os.cpus() snapshots, not load average', async () => {
+  const snaps = [snap(1000, 1000), snap(1000 + 280, 1000 + 720)] // 28% busy over the window
+  let slept = null
+  const pct = await sampleCpuPct({ ms: 750, cpus: () => snaps.shift(), sleep: async t => { slept = t } })
+  assert.strictEqual(slept, 750)
+  assert.strictEqual(pct, 28)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: pct }), 2) // was 1 at "281%"
+})
+
+test('a really busy CPU still throttles to one campaign', async () => {
+  const snaps = [snap(0, 0), snap(900, 100)]
+  const pct = await sampleCpuPct({ cpus: () => snaps.shift(), sleep: async () => {} })
+  assert.strictEqual(pct, 90)
+  assert.strictEqual(parallelLimit({ freeGb: 16, cpuPct: pct }), 1)
+})
+
+test('som-all decides on sampled CPU, never on load average', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'som', 'som-all.js'), 'utf8')
+  const block = src.slice(src.indexOf('Resource check'), src.indexOf('Pre-flight enrichment'))
+  assert.match(block, /sampleCpuPct\(/)
+  assert.match(block, /parallelLimit\(\{[^}]*cpuPct/)
+  assert.doesNotMatch(block, /loadAvg\s*\/\s*cpus/)
 })

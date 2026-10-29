@@ -89,9 +89,21 @@ function orphanBrowserPids (psOut) {
 
 // How many campaigns (one headed Chromium each) to run at once. Busier machine → fewer browsers;
 // the old check went from "all" to 3 under moderate load, which could ADD a browser (default was 2).
-function parallelLimit ({ freeGb, loadPct, battery = null, charging = true, requested = 2 }) {
-  const busy = freeGb < 4 || loadPct > 50 || (battery !== null && battery < 30 && !charging)
+// cpuPct is real CPU use, 0-100 (sampleCpuPct). It used to be loadavg/cores*100 (#191622): on a Mac
+// waiting on a busy or full disk, load 28 on 10 cores read as "281%" while the cores were 28% busy,
+// so SOM ran one campaign at a time for no reason.
+function parallelLimit ({ freeGb, cpuPct, battery = null, charging = true, requested = 2 }) {
+  const busy = freeGb < 4 || cpuPct > 50 || (battery !== null && battery < 30 && !charging)
   return Math.max(1, Math.min(requested, busy ? 1 : 2))
 }
 
-module.exports = { lockVerdict, pidAlive, ancestorPids, orphanPids, campaignCommand, hasXvfbRun, MAX_AGE_MS, descendantPids, orphanBrowserPids, parallelLimit }
+// Real CPU use, 0-100 across all cores, from two os.cpus() snapshots `ms` apart — the same math the
+// daemon's resource monitor uses for /daemon/capacity cpu_pct (#191603). cpus/sleep are injectable.
+async function sampleCpuPct ({ ms = 750, cpus = () => require('os').cpus(), sleep = t => new Promise(r => setTimeout(r, t)) } = {}) {
+  const { cpuTimeTotals, cpuPercent } = require('../daemon/resource-monitor')
+  const before = cpuTimeTotals(cpus())
+  await sleep(ms)
+  return cpuPercent(before, cpuTimeTotals(cpus())).pct
+}
+
+module.exports = { lockVerdict, pidAlive, ancestorPids, orphanPids, campaignCommand, hasXvfbRun, MAX_AGE_MS, descendantPids, orphanBrowserPids, parallelLimit, sampleCpuPct }
