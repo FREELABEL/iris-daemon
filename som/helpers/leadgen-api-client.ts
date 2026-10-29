@@ -408,33 +408,30 @@ export class LeadgenApiClient {
     const existing = new Set<string>();
 
     try {
-      const resp = await fetch(
-        `${BASE_URL}/leads?bloq_id=${this.boardId}&per_page=500`,
-        {
-          headers: {
-            'Authorization': `Bearer ${this.token}`,
-            'Accept': 'application/json',
-          },
-        }
-      );
-
-      const data = await resp.json();
-      const leads = data.data?.data || data.data || [];
-
-      if (Array.isArray(leads)) {
+      // Page through the WHOLE board. One page of 500 saw 473 of 10,456 leads on board 38 (2026-10-28),
+      // so most existing handles were scraped again and only caught by the server.
+      // Check EVERY outreach board, not just the target: a handle already on board 80 and created
+      // again on 38 gets DMs from two of our accounts (#191668). DEDUP_BOARDS overrides the list.
+      const boards = [...new Set([this.boardId, ...String(process.env.DEDUP_BOARDS || '38,80,224,176,355')
+        .split(',').map(b => Number(b.trim())).filter(Boolean)])];
+      for (const boardId of boards)
+      for (let page = 1; page <= 100; page++) {
+        const resp = await fetch(
+          `${BASE_URL}/leads?bloq_id=${boardId}&per_page=500&page=${page}`,
+          { headers: { 'Authorization': `Bearer ${this.token}`, 'Accept': 'application/json' } }
+        );
+        const data = await resp.json();
+        const leads = data.data?.data || data.data || [];
+        if (!Array.isArray(leads) || leads.length === 0) break;
         for (const lead of leads) {
-          // Check contact_info.instagram
           const ig = lead.contact_info?.instagram;
           if (ig) existing.add(ig.toLowerCase().replace(/^@/, ''));
-
-          // Check name for @handles
-          if (lead.nickname?.startsWith('@')) {
-            existing.add(lead.nickname.toLowerCase().replace(/^@/, ''));
-          }
-          if (lead.name?.startsWith('@')) {
-            existing.add(lead.name.toLowerCase().replace(/^@/, ''));
-          }
+          if (lead.nickname?.startsWith('@')) existing.add(lead.nickname.toLowerCase().replace(/^@/, ''));
+          if (lead.name?.startsWith('@')) existing.add(lead.name.toLowerCase().replace(/^@/, ''));
         }
+        const last = data.data?.last_page ?? data.meta?.last_page;
+        if (last && page >= last) break;
+        if (leads.length < 500) break;
       }
     } catch (err: any) {
       console.log(`    Warning: Could not fetch existing leads for dedup: ${err.message}`);
