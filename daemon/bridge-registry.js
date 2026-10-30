@@ -246,6 +246,10 @@ const PROVIDERS = {
       if (!appExists('Mail.app')) return { ok: false, reason: 'Mail.app is not installed' }
       return { ok: true }
     },
+    // The Mail.app accounts on this Mac (name, id, addresses) — never launches Mail (#191879).
+    accounts () {
+      return require('./mail-accounts').mailAccountsSnapshot()
+    },
     functions: {
       // `search_emails`, not `search` — matches fl-api's published name (#178748).
       search_emails: { method: 'GET', path: '/api/mail/search' },
@@ -324,6 +328,15 @@ function capabilities () {
       reason: probe.ok ? null : (probe.reason || 'unavailable'),
       detail: probe.detail || null,
       functions: Object.keys(provider.functions),
+    }
+    // WHICH mailboxes, not just "has Mail" (#191879): the CLI routes `--mail-account <address>`
+    // to the Mac that holds it. Names, ids and addresses only; read from a background cache.
+    if (key === 'apple_mail' && typeof provider.accounts === 'function') {
+      try {
+        Object.assign(out[key], provider.accounts())
+      } catch (e) {
+        Object.assign(out[key], { accounts: null, accounts_checked_at: null, accounts_reason: `accounts probe failed: ${e.message}` })
+      }
     }
   }
   return out
