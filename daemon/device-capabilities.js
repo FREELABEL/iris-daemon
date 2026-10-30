@@ -186,12 +186,59 @@ function probeMac () {
   })
 }
 
+/**
+ * Android phones attached over adb (#191796) — the night shift needs the cloud to know WHICH node
+ * has a phone, or `--requires android` has nowhere to go.
+ *
+ * `count` is AUTHORISED devices only: a phone still showing the USB-debugging prompt cannot be
+ * driven, and routing a task to it is routing on a lie (rule 1). `unauthorized` is reported so the
+ * fleet view can say "a phone is plugged in but waiting for you to tap Allow".
+ *
+ * No serials, no models. A serial identifies one person's handset; rule 3's spirit applies.
+ */
+function parseAdbDevices (stdout) {
+  const out = { count: 0, unauthorized: 0 }
+  for (const line of String(stdout || '').split('\n').slice(1)) {
+    const [serial, state] = line.trim().split(/\s+/)
+    if (!serial || !state) continue
+    if (state === 'device') out.count++
+    else if (state === 'unauthorized') out.unauthorized++
+  }
+  return out
+}
+
+function adbPath () {
+  if (process.env.IRIS_ADB && fs.existsSync(process.env.IRIS_ADB)) return process.env.IRIS_ADB
+  const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT
+  if (sdk) {
+    const p = path.join(sdk, 'platform-tools', 'adb')
+    if (fs.existsSync(p)) return p
+  }
+  return 'adb'
+}
+
+/**
+ * null when adb is not installed or does not answer — UNKNOWN, rule 2. A node without adb could
+ * still have a phone in its USB port; we just cannot see it, and saying 0 would clear the flag.
+ */
+function probeAndroid () {
+  return new Promise((resolve) => {
+    execFile(adbPath(), ['devices'], { timeout: 10 * 1000 }, (err, stdout) => {
+      if (err) return resolve(null)
+      resolve(parseAdbDevices(stdout))
+    })
+  })
+}
+
 /** Probe now. Resolves to a device report, or null when this platform cannot be probed. */
 async function detectDevices () {
   const platform = os.platform()
-  if (platform === 'darwin') return probeMac()
-  if (platform === 'linux') return probeLinux()
-  return null // Windows: unknown, not zero — see rule 2.
+  const base = platform === 'darwin' ? await probeMac() : platform === 'linux' ? probeLinux() : null
+  // Windows radios stay unknown (rule 2), but adb works there too — a phone on a Windows node is
+  // still a phone, so it is reported on its own when it is the only thing we can see.
+  const android = await probeAndroid()
+  if (!android) return base
+  return { ...(base || {}), android }
 }
 
 async function refresh () {
@@ -230,6 +277,7 @@ function getDeviceReport () {
 
 module.exports = {
   productCameraName,
+  parseAdbDevices,
   parseMacProfiler,
   probeLinux,
   detectDevices,
