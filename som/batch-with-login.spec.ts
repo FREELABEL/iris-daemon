@@ -745,7 +745,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   } // end if (!useApiDirect) — UI scanning block
 
   // The API's fresh leads were not among the rows the scan reached: open them by id (#190296).
-  if (!useApiDirect && leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: eligibleRows.length }) === 'api-fallback') {
+  if (!useApiDirect && leadSource({ mode: SOM_MODE, allowListSize: apiFilteredIds?.size || 0, uiEligible: eligibleRows.length, need: LEADS_TO_PROCESS }) === 'api-fallback') {
     console.log(`⚡ ${apiFilteredIds!.size} fresh lead(s) from the API are not in the ${scannedUpTo} rows scanned — opening them directly\n`);
     useApiDirect = true;
   }
@@ -948,6 +948,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         // 1. Get strategy script from outreach-strategy-templates (the REAL SOM scripts)
         // 2. Call generate-personalized-message with script + lead handle + name
         let msg = '';
+        let stepAiPrompt = '';
         try {
           // Fetch strategy templates for this board
           const stratRes = await fetch(
@@ -962,27 +963,34 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             const strat = templates.find((t: any) => t.name === STRATEGY_NAME);
             if (strat?.steps?.[0]) {
               scriptText = strat.steps[0].instructions || '';
+              stepAiPrompt = strat.steps[0].ai_prompt || strat.variation_prompt || '';
               console.log(`  Strategy script: "${scriptText.substring(0, 60)}..."`);
             }
           }
 
           if (scriptText) {
-            // Use the same endpoint as V1's "Vary It" button
+            // "Vary It" — the same endpoint as the UI button, with the step's own ai_prompt. The old
+            // code called generate-personalized-message and read `message`, but the API answers with
+            // `variation`, so every API-direct DM fell back to the raw script (2026-10-29: 20 identical).
             const msgRes = await fetch(
-              `${apiBase}/api/v1/ai/generate-personalized-message`,
+              `${apiBase}/api/v1/ai/generate-variation`,
               {
                 method: 'POST',
                 headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json', Accept: 'application/json' },
                 body: JSON.stringify({
-                  script_message: scriptText,
-                  instagram_handle: igHandle,
-                  lead_name: name,
+                  original_message: scriptText,
+                  platform: 'instagram',
+                  lead_name: name || null,
+                  custom_prompt: stepAiPrompt || null,
                 }),
               }
             );
             if (msgRes.ok) {
               const msgData = (await msgRes.json()) as any;
-              msg = msgData.data?.message || msgData.message || '';
+              msg = msgData.variation || msgData.data?.variation || msgData.data?.message || msgData.message || '';
+              if (msg) console.log(`  ✓ Varied: "${msg.substring(0, 60)}..."`);
+            } else {
+              console.log(`  ⚠ Vary It HTTP ${msgRes.status}`);
             }
           }
 
@@ -1225,7 +1233,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             await dismissIgPopup();
             // Verify we're now in DM view (URL changed or input appeared)
             const dmInputCheck = igPage.locator('div[aria-label*="Message"][contenteditable="true"], div[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], p[data-lexical-text]').first();
-            if (igPage.url().includes('/direct/') || await dmInputCheck.isVisible({ timeout: 3000 }).catch(() => false)) {
+            // The chat can open as a pop-up whose composer takes several seconds to render (2026-10-29: 3 false 'not opened').
+            if (igPage.url().includes('/direct/') || await dmInputCheck.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false)) {
               inDMView = true;
             } else {
               console.log('  Message button clicked but DM view not opened — trying PATH C');
