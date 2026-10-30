@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
+import { leadOutcome, timingStatus, undeliverableNote, outcomeLine } from './lead-outcome'; // countsTowardDailyCap: the cap file is only written on a confirmed send
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
 const igAccounts = require('./helpers/ig-accounts');
@@ -757,7 +758,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     const apiLeadIds = [...apiFilteredIds];
     console.log(`⚡ API-DIRECT: up to ${directLimit} lead(s) from ${apiLeadIds.length} candidates by direct navigation\n`);
 
-    const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0 };
+    const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0, undeliverable: 0 }; // undeliverable is a subset of failed (#191681)
     const leadTimings: { name: string; duration: number; status: string }[] = [];
     const batchStart = Date.now();
 
@@ -788,6 +789,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (idx >= apiLeadIds.length && !(await fetchMoreCandidates())) break;
       const leadId = apiLeadIds[idx];
       const leadStart = Date.now();
+      let apiSent = false, apiDryRunTyped = false, apiUndeliverable = ''; // #191681
       console.log(`\n━━━ Lead ${idx + 1}/${apiLeadIds.length} (ID: ${leadId}) ━━━\n`);
 
       try {
@@ -1302,24 +1304,24 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                   inDMView = true;
                 } else {
                   console.log('  Cannot DM this account — skipping');
-                  results.failed++;
+                  results.failed++; results.undeliverable++;
                   if (leadId) {
-                    apiClient.addNote(leadId, `[SOM FAIL] Cannot open DM for @${igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
+                    apiClient.addNote(leadId, undeliverableNote(IG_ACCOUNT, igHandle, 'no Send message, even after following')).catch(() => {});
                   }
                   await igPage.close().catch(() => {});
-                  leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+                  leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'undeliverable' });
                   continue;
                 }
               }
             }
           } else {
             console.log('  No options button found — skipping');
-            results.failed++;
+            results.failed++; results.undeliverable++;
             if (leadId) {
-              apiClient.addNote(leadId, `[SOM FAIL] No options button for @${igHandle} via @${IG_ACCOUNT}`).catch(() => {});
+              apiClient.addNote(leadId, undeliverableNote(IG_ACCOUNT, igHandle, 'no options (…) button')).catch(() => {});
             }
             await igPage.close().catch(() => {});
-            leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
+            leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'undeliverable' });
             continue;
           }
         }
@@ -1367,7 +1369,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             if (DRY_RUN) {
               await igPage.screenshot({ path: `test-results/screenshots/api-direct-dry-${idx + 1}.png` }).catch(() => {});
               console.log(`  [DRY RUN] Message typed to @${igHandle}: "${msg.substring(0, 50)}..."`);
-              results.sent++;
+              results.sent++; apiDryRunTyped = true;
             } else {
               const sendBtn = igPage.locator('button:has-text("Send"):not([disabled])').first();
               if (await sendBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -1384,7 +1386,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
               if (delivered) {
                 console.log('  DM sent!');
-                results.sent++;
+                results.sent++; apiSent = true;
                 recordDmSent(leadId);
                 if (leadId) {
                   let recOk = false;
@@ -1442,16 +1444,19 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           } else {
             console.log('  No DM input found in view');
             results.failed++;
-            // Record [SOM FAIL] for leads where DM view couldn't be opened
-            if (leadId) {
-              apiClient.addNote(leadId, `[SOM FAIL] Could not open DM view for @${igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
-            }
+            apiUndeliverable = 'DM input not found (private or DM-restricted)'; // note + count below
           }
         }
         await igPage.close().catch(() => {});
 
-        // leadTimings status is set by the catch block for errors; for normal flow, derive from results
-        leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: 'sent' });
+        // Status from what actually happened: this always said 'sent' (#191681).
+        const apiOutcome = leadOutcome({ sent: apiSent, dryRunTyped: apiDryRunTyped, undeliverableReason: apiUndeliverable });
+        if (apiOutcome === 'undeliverable') {
+          results.undeliverable++;
+          if (leadId) apiClient.addNote(leadId, undeliverableNote(IG_ACCOUNT, igHandle, apiUndeliverable)).catch(() => {});
+        }
+        console.log(outcomeLine(name, apiOutcome, ((Date.now() - leadStart) / 1000).toFixed(1), apiUndeliverable));
+        leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: timingStatus(apiOutcome) });
       } catch (err: any) {
         console.log(`Error: ${err.message?.substring(0, 100)}`);
         results.failed++;
@@ -1471,7 +1476,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     console.log(DRY_RUN ? '  DRY RUN COMPLETE (API-DIRECT)' : '  BATCH COMPLETE (API-DIRECT)');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`  Board: ${BOARD_ID}  |  Strategy: ${STRATEGY_NAME}`);
-    console.log(`  ${DRY_RUN ? 'Would send' : 'Sent'}: ${results.sent}  |  Skip: ${results.skipped}  |  Fail: ${results.failed}`);
+    console.log(`  ${DRY_RUN ? 'Would send' : 'Sent'}: ${results.sent}  |  Skip: ${results.skipped}  |  Fail: ${results.failed}${results.undeliverable ? ` (${results.undeliverable} undeliverable)` : ''}`);
     console.log(`  Total: ${totalDuration}s`);
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
@@ -1499,7 +1504,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     return;
   }
 
-  const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0 };
+  const results = { sent: 0, skipped: 0, failed: 0, repliedSkipped: 0, undeliverable: 0 }; // undeliverable is a subset of failed (#191681)
   const repliedLeads: { name: string; id: number | null; igHandle: string | null }[] = [];
   const leadTimings: { name: string; duration: number; status: string }[] = [];
   const batchStart = Date.now();
@@ -1544,6 +1549,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     const rowIndex = toProcess[idx];
     const leadStart = Date.now();
     let dmSentThisLead = false;
+    let dryRunTyped = false, undeliverableReason = ''; // #191681
     console.log(`\n━━━ Lead ${idx + 1}/${toProcess.length} (row ${rowIndex + 1}) ━━━\n`);
 
     try {
@@ -2341,24 +2347,30 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                           inDMView = true;
                         } else {
                           console.log('  ✗ Still can\'t open DM after follow');
+                          undeliverableReason = 'DM did not open after following';
+                          results.failed++; // this branch never counted at all
                         }
                       } else {
                         console.log('  ✗ Still no "Send message" after follow');
                         await igPage.locator('text=Cancel').first().click().catch(() => {});
+                        undeliverableReason = 'no Send message, even after following';
                         results.failed++;
                       }
                     } else {
+                      undeliverableReason = 'no options menu after following';
                       results.failed++;
                     }
                   } else {
                     console.log('  ✗ No Follow button either — cannot DM');
                     await igPage.screenshot({ path: `test-results/screenshots/no-send-msg-${idx + 1}.png` });
+                    undeliverableReason = 'no Message or Follow button';
                     results.failed++;
                   }
                 }
               } else {
                 console.log('  ✗ No ... button found');
                 await igPage.screenshot({ path: `test-results/screenshots/no-dots-${idx + 1}.png` });
+                undeliverableReason = 'no options (…) button';
                 results.failed++;
               }
             }
@@ -2401,6 +2413,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                   await igPage.screenshot({ path: `test-results/screenshots/dry-run-dm-${idx + 1}.png` });
                   console.log(`  [DRY RUN] Message typed but NOT sent: "${dmText.substring(0, 50)}..."`);
                   results.sent++; // count as "would have sent"
+                  dryRunTyped = true;
                 } else {
                   // Click Send button or press Enter
                   const sendBtn = igPage.locator('button:has-text("Send"):not([disabled])').first();
@@ -2470,10 +2483,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
               } else {
                 console.log('  ✗ No message input found');
                 await igPage.screenshot({ path: `test-results/screenshots/no-dm-input-${idx + 1}.png` });
+                undeliverableReason = 'DM input not found (private or DM-restricted)'; // note added at the end of the lead
                 results.failed++;
-                if (rowAttrs.id) {
-                  apiClient.addNote(rowAttrs.id, `[SOM FAIL] No DM input found for @${rowAttrs.igHandle} via @${IG_ACCOUNT} — account may be private or DM-restricted`).catch(() => {});
-                }
               }
             }
           }
@@ -2596,8 +2607,14 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       }
 
       const leadDuration = ((Date.now() - leadStart) / 1000).toFixed(1);
-      console.log(`✅ ${name} (${leadDuration}s)`);
-      leadTimings.push({ name, duration: parseFloat(leadDuration), status: 'sent' });
+      // "✅" and status 'sent' were printed for every lead that got this far, DM or not (#191681).
+      const outcome = leadOutcome({ sent: dmSentThisLead, dryRunTyped, undeliverableReason });
+      if (outcome === 'undeliverable') {
+        results.undeliverable++;
+        if (rowAttrs.id) apiClient.addNote(rowAttrs.id, undeliverableNote(IG_ACCOUNT, rowAttrs.igHandle, undeliverableReason)).catch(() => {});
+      }
+      console.log(outcomeLine(name, outcome, leadDuration, undeliverableReason));
+      leadTimings.push({ name, duration: parseFloat(leadDuration), status: timingStatus(outcome) });
 
       // ── CLOSE MODALS & PANEL ──
       const xClose = page.locator('text=X Close').first();
@@ -2645,7 +2662,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   console.log(DRY_RUN ? '  DRY RUN COMPLETE' : '  BATCH COMPLETE');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`  Board: ${BOARD_ID}  |  Strategy: ${STRATEGY_NAME}`);
-  console.log(`  ${DRY_RUN ? 'Would send' : 'Sent'}: ${results.sent}  |  Skip: ${results.skipped}${results.repliedSkipped ? ` (${results.repliedSkipped} replied)` : ''}  |  Fail: ${results.failed}`);
+  console.log(`  ${DRY_RUN ? 'Would send' : 'Sent'}: ${results.sent}  |  Skip: ${results.skipped}${results.repliedSkipped ? ` (${results.repliedSkipped} replied)` : ''}  |  Fail: ${results.failed}${results.undeliverable ? ` (${results.undeliverable} undeliverable)` : ''}`);
   if (enrichStats.checked > 0) {
     console.log(`  Enriched: ${enrichStats.enriched}/${enrichStats.checked}  |  Emails: ${enrichStats.emailsFound}  |  Already had: ${enrichStats.alreadyHad}`);
   }
