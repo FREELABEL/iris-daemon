@@ -50,6 +50,27 @@ test('a refused reply link falls back to a plain message, with still only ONE co
   } finally { s.restore(); }
 });
 
+test('a server error on a reply is NOT retried: it may already be stored', async () => {
+  const s = stubFetch([500, 200]);
+  try {
+    const out = await recordReply(new LeadgenApiClient('t', 38), 1, base);
+    expect(out.rec.success).toBe(false);
+    expect(out.recordedAs).toBe('not recorded (check the lead)');
+    expect(s.calls.filter(c => c.kind === 'record')).toHaveLength(1);
+  } finally { s.restore(); }
+});
+
+test('a network failure on a reply is NOT retried either', async () => {
+  const real = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; throw new Error('ECONNRESET'); }) as any;
+  try {
+    const out = await recordReply(new LeadgenApiClient('t', 38), 1, base);
+    expect(out.recordedAs).toBe('not recorded (check the lead)');
+    expect(calls).toBe(1);
+  } finally { globalThis.fetch = real; }
+});
+
 test('a campaign send (no kind) that fails still writes comms, as it did before', async () => {
   const s = stubFetch([500]);
   try {
