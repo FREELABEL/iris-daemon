@@ -573,6 +573,8 @@ export class LeadgenApiClient {
     bloq_id?: number;
     ig_handle?: string;
     step_index?: number;
+    /** 'reply' ties a one-off reply to the message it answers (#191637). Omit for a campaign send. */
+    kind?: 'message' | 'reply';
   }): Promise<ApiResponse> {
     try {
       const resp = await fetch(`${BASE_URL}/leads/${leadId}/outreach/record-dm`, {
@@ -588,6 +590,10 @@ export class LeadgenApiClient {
       // Also write the lead's comms log, the record the lead timeline shows. record-dm only writes the
       // outreach message, so every SOM and hand-approved DM was missing from comms (2026-10-29: 0 of 0
       // comms on leads 30313 and 30316 despite a sent DM). Best effort: a comms failure never fails a send.
+      // A refused reply writes nothing here: recordReply retries it as a plain message, which logs it once.
+      if (data.kind === 'reply' && !resp.ok) {
+        return { success: false, data: json, message: json.message };
+      }
       const comms = await this.logComms(leadId, {
         body: data.message, channel: 'instagram', direction: 'outbound',
         subject: `IG DM from @${data.channel_account}`,
