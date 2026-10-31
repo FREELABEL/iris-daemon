@@ -1,0 +1,1047 @@
+{
+ "capturedAt": "2026-10-12T21:12:14.341Z",
+ "at": [
+  {
+   "offsetHours": 0,
+   "now": "2026-10-12T21:12:14.341Z",
+   "rows": [
+    {
+     "jobId": 764,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [
+      "config"
+     ],
+     "drift": "every_5_minutes",
+     "nextFireAt": "2026-10-13T11:00:00.000Z",
+     "line": "Next in 14h · held for its hours · last beat 4 days ago",
+     "week": {
+      "expected": 6,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 5,
+      "outside": 3,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 894,
+     "state": "failing",
+     "silentSince": null,
+     "problems": [
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Last beat failed · next in 13m",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 27,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 848,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Next in 13m · last beat 5 h ago",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 27,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 865,
+     "state": "silent",
+     "silentSince": "2026-10-12T13:05:23+00:00",
+     "problems": [
+      "silent",
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Wakes but does nothing · last real beat 8 h ago",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 16,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 720,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Next in 48m · last beat 10 min ago",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 119,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 744,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [
+      "config"
+     ],
+     "drift": "every_4_hours",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Next in 48m · last beat 10 min ago",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 119,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 890,
+     "state": "silent",
+     "silentSince": "2026-10-12T04:00:57+00:00",
+     "problems": [
+      "silent"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:12:00.000Z",
+     "line": "Wakes but does nothing · last real beat 17 h ago",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 2,
+      "unknown": 17,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 868,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:22:00.000Z",
+     "line": "Next in 1h · last beat 49 min ago",
+     "week": {
+      "expected": 84,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 83,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 829,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T01:47:00.000Z",
+     "line": "Next in 5h · last beat 19 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 6,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 900,
+     "state": "failing",
+     "silentSince": null,
+     "problems": [
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:15:00.000Z",
+     "line": "Last beat failed · next in 6h",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 20,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 858,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:16:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 21,
+      "beats": 0,
+      "missed": 21,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 857,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:41:00.000Z",
+     "line": "Next in 6h · last beat 1 h ago",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 20,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 768,
+     "state": "silent",
+     "silentSince": "2026-10-07T20:01:46+00:00",
+     "problems": [
+      "silent",
+      "config",
+      "failing"
+     ],
+     "drift": "daily_430pm",
+     "nextFireAt": "2026-10-13T20:00:00.000Z",
+     "line": "Wakes but does nothing · last real beat 5 days ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 1,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 817,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T09:00:00.000Z",
+     "line": "Next in 12h · last beat 12 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 6,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 766,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T10:00:00.000Z",
+     "line": "Next in 13h · last beat 11 h ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 4,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 881,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T12:00:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 877,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 811,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Next in 16h · last beat 8 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 6,
+      "outside": 0,
+      "skips": 0
+     }
+    }
+   ]
+  },
+  {
+   "offsetHours": 6,
+   "now": "2026-10-13T03:12:14.341Z",
+   "rows": [
+    {
+     "jobId": 764,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [
+      "config"
+     ],
+     "drift": "every_5_minutes",
+     "nextFireAt": "2026-10-13T11:00:00.000Z",
+     "line": "Next in 8h · held for its hours · last beat 4 days ago",
+     "week": {
+      "expected": 6,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 5,
+      "outside": 3,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 894,
+     "state": "late",
+     "silentSince": null,
+     "problems": [
+      "late",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Late · due 5 h ago",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 26,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 848,
+     "state": "late",
+     "silentSince": null,
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Late · due 5 h ago",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 26,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 865,
+     "state": "silent",
+     "silentSince": "2026-10-12T13:05:23+00:00",
+     "problems": [
+      "silent",
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Wakes but does nothing · last real beat 14 h ago",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 16,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 720,
+     "state": "late",
+     "silentSince": "2026-10-12T21:01:20+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Late · due 5 h ago",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 5,
+      "unknown": 113,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 744,
+     "state": "late",
+     "silentSince": "2026-10-12T21:01:22+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_4_hours",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Late · due 5 h ago",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 5,
+      "unknown": 113,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 890,
+     "state": "late",
+     "silentSince": "2026-10-12T04:00:57+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:12:00.000Z",
+     "line": "Late · due 5 h ago",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 16,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 868,
+     "state": "late",
+     "silentSince": "2026-10-12T20:22:53+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:22:00.000Z",
+     "line": "Late · due 4 h ago",
+     "week": {
+      "expected": 84,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 80,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 829,
+     "state": "late",
+     "silentSince": null,
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T01:47:00.000Z",
+     "line": "Late · due 1 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 5,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 900,
+     "state": "failing",
+     "silentSince": null,
+     "problems": [
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:15:00.000Z",
+     "line": "Last beat failed · next in 3m",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 20,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 858,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:16:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 21,
+      "beats": 0,
+      "missed": 21,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 857,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:41:00.000Z",
+     "line": "Next in 29m · last beat 7 h ago",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 20,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 768,
+     "state": "silent",
+     "silentSince": "2026-10-07T20:01:46+00:00",
+     "problems": [
+      "silent",
+      "config",
+      "failing"
+     ],
+     "drift": "daily_430pm",
+     "nextFireAt": "2026-10-13T20:00:00.000Z",
+     "line": "Wakes but does nothing · last real beat 5 days ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 1,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 817,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T09:00:00.000Z",
+     "line": "Next in 6h · last beat 18 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 6,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 766,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T10:00:00.000Z",
+     "line": "Next in 7h · last beat 17 h ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 4,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 881,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T12:00:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 877,
+     "state": "silent",
+     "silentSince": "never",
+     "problems": [
+      "silent",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Wakes but does nothing · never ran",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 811,
+     "state": "ok",
+     "silentSince": null,
+     "problems": [],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Next in 10h · last beat 14 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 0,
+      "unknown": 6,
+      "outside": 0,
+      "skips": 0
+     }
+    }
+   ]
+  },
+  {
+   "offsetHours": 30,
+   "now": "2026-10-14T03:12:14.341Z",
+   "rows": [
+    {
+     "jobId": 764,
+     "state": "late",
+     "silentSince": "2026-10-08T19:00:25+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_5_minutes",
+     "nextFireAt": "2026-10-13T11:00:00.000Z",
+     "line": "Late · due 5 days ago",
+     "week": {
+      "expected": 6,
+      "beats": 1,
+      "missed": 2,
+      "unknown": 3,
+      "outside": 3,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 894,
+     "state": "late",
+     "silentSince": "2026-10-12T15:25:44+00:00",
+     "problems": [
+      "late",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 5,
+      "unknown": 22,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 848,
+     "state": "late",
+     "silentSince": "2026-10-12T15:25:35+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T21:25:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 28,
+      "beats": 1,
+      "missed": 5,
+      "unknown": 22,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 865,
+     "state": "late",
+     "silentSince": "2026-10-12T13:05:23+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 7,
+      "unknown": 12,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 720,
+     "state": "late",
+     "silentSince": "2026-10-12T21:01:20+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_30_minutes",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 29,
+      "unknown": 89,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 744,
+     "state": "late",
+     "silentSince": "2026-10-12T21:01:22+00:00",
+     "problems": [
+      "late",
+      "config"
+     ],
+     "drift": "every_4_hours",
+     "nextFireAt": "2026-10-12T22:00:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 120,
+      "beats": 1,
+      "missed": 29,
+      "unknown": 89,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 890,
+     "state": "late",
+     "silentSince": "2026-10-12T04:00:57+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:12:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 20,
+      "beats": 1,
+      "missed": 7,
+      "unknown": 12,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 868,
+     "state": "late",
+     "silentSince": "2026-10-12T20:22:53+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-12T22:22:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 84,
+      "beats": 1,
+      "missed": 15,
+      "unknown": 68,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 829,
+     "state": "late",
+     "silentSince": "2026-10-12T01:48:05+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T01:47:00.000Z",
+     "line": "Late · due yesterday",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 2,
+      "unknown": 4,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 900,
+     "state": "late",
+     "silentSince": "2026-10-12T19:15:45+00:00",
+     "problems": [
+      "late",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:15:00.000Z",
+     "line": "Late · due 23 h ago",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 17,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 858,
+     "state": "late",
+     "silentSince": "never",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:16:00.000Z",
+     "line": "Late · due 23 h ago",
+     "week": {
+      "expected": 21,
+      "beats": 0,
+      "missed": 21,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 857,
+     "state": "late",
+     "silentSince": "2026-10-12T19:41:39+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T03:41:00.000Z",
+     "line": "Late · due 23 h ago",
+     "week": {
+      "expected": 21,
+      "beats": 1,
+      "missed": 3,
+      "unknown": 17,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 768,
+     "state": "late",
+     "silentSince": "2026-10-07T20:01:46+00:00",
+     "problems": [
+      "late",
+      "config",
+      "failing"
+     ],
+     "drift": "daily_430pm",
+     "nextFireAt": "2026-10-13T20:00:00.000Z",
+     "line": "Late · due 23 h ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 4,
+      "unknown": 0,
+      "outside": 5,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 817,
+     "state": "late",
+     "silentSince": "2026-10-12T09:11:15+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T09:00:00.000Z",
+     "line": "Late · due 18 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 5,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 766,
+     "state": "late",
+     "silentSince": null,
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T10:00:00.000Z",
+     "line": "Late · due 17 h ago",
+     "week": {
+      "expected": 5,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 3,
+      "outside": 1,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 881,
+     "state": "late",
+     "silentSince": "never",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T12:00:00.000Z",
+     "line": "Late · due 15 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 877,
+     "state": "late",
+     "silentSince": "never",
+     "problems": [
+      "late",
+      "failing"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Late · due 14 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 0,
+      "missed": 7,
+      "unknown": 0,
+      "outside": 0,
+      "skips": 0
+     }
+    },
+    {
+     "jobId": 811,
+     "state": "late",
+     "silentSince": "2026-10-12T13:05:32+00:00",
+     "problems": [
+      "late"
+     ],
+     "drift": null,
+     "nextFireAt": "2026-10-13T13:00:00.000Z",
+     "line": "Late · due 14 h ago",
+     "week": {
+      "expected": 7,
+      "beats": 1,
+      "missed": 1,
+      "unknown": 5,
+      "outside": 0,
+      "skips": 0
+     }
+    }
+   ]
+  }
+ ]
+}
