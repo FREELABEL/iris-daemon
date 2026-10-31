@@ -25,6 +25,7 @@ export interface ApiResponse {
   success: boolean;
   duplicate?: boolean;
   owned?: boolean;            // refused: the handle is one of our own accounts (#191633)
+  status?: number;            // HTTP status, where a caller must tell a refusal from a failure
   message?: string;
   data?: any;
 }
@@ -590,16 +591,17 @@ export class LeadgenApiClient {
       // Also write the lead's comms log, the record the lead timeline shows. record-dm only writes the
       // outreach message, so every SOM and hand-approved DM was missing from comms (2026-10-29: 0 of 0
       // comms on leads 30313 and 30316 despite a sent DM). Best effort: a comms failure never fails a send.
-      // A refused reply writes nothing here: recordReply retries it as a plain message, which logs it once.
-      if (data.kind === 'reply' && !resp.ok) {
-        return { success: false, data: json, message: json.message };
+      // A refused reply (422) stored nothing and writes nothing here: recordReply retries it as a
+      // plain message, which logs it once.
+      if (data.kind === 'reply' && resp.status === 422) {
+        return { success: false, status: 422, data: json, message: json.message };
       }
       const comms = await this.logComms(leadId, {
         body: data.message, channel: 'instagram', direction: 'outbound',
         subject: `IG DM from @${data.channel_account}`,
         metadata: { logged_via: 'som record-dm', channel_account: data.channel_account, campaign: data.campaign_name ?? null, step_index: data.step_index ?? null },
       });
-      return { success: resp.ok, data: { ...json, comms_logged: comms.success }, message: json.message };
+      return { success: resp.ok, status: resp.status, data: { ...json, comms_logged: comms.success }, message: json.message };
     } catch (err: any) {
       return { success: false, message: err.message };
     }
