@@ -162,17 +162,16 @@ export class LinkedInDmProvider implements DmProviderInterface {
       return { name: target.name, profileUrl: target.profileUrl, status: 'failed', error: 'No message input found' };
     }
 
+    // A dry run does not type: the person can see typing, and a draft can stay behind (#191666).
+    if (this.dryRun) {
+      await page.keyboard.press('Escape');
+      return { name: target.name, profileUrl: target.profileUrl, status: 'dry_run' };
+    }
+
     await inputEl.click();
     await page.waitForTimeout(500);
     try { await inputEl.fill(target.message); } catch { await page.keyboard.type(target.message, { delay: 20 }); }
     await page.waitForTimeout(1000);
-
-    if (this.dryRun) {
-      await page.keyboard.press('Control+a');
-      await page.keyboard.press('Backspace');
-      await page.keyboard.press('Escape');
-      return { name: target.name, profileUrl: target.profileUrl, status: 'dry_run' };
-    }
 
     const sendSelectors = [
       'button.msg-form__send-button',
