@@ -1,0 +1,89 @@
+name: PR base guard
+
+# #191968: fl-api #210 merged into its parent's branch 7 seconds after the parent landed, read
+# MERGED, and never reached the deploy branch. Any PR whose base is not ALLOWED_BASES gets a
+# visible comment and a red check, including after the merge. No checkout: only the GitHub API
+# is read, so no code from the PR runs here. This job must never fail a PR into an allowed base:
+# on fl-api Railway skips a deploy when a check suite on the commit fails.
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, ready_for_review, closed]
+  # Audit: lists open PRs on other bases and PRs merged somewhere other than an allowed base.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  ALLOWED_BASES: 'main'
+
+jobs:
+  base:
+    name: PR base is a deploy or release branch
+    # Public repo: never our own runners, the private-ci group refuses public repositories.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const allowed = process.env.ALLOWED_BASES.split(' ')
+            const { owner, repo } = context.repo
+            const MARK = '<!-- pr-base-guard -->'
+
+            if (context.eventName === 'workflow_dispatch') {
+              const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'all', per_page: 100 })
+              const off = prs.filter((p) => !allowed.includes(p.base.ref) && (p.state === 'open' || p.merged_at))
+              const lines = off.map((p) => `#${p.number} ${p.merged_at ? 'MERGED' : 'open'} into ${p.base.ref}: ${p.title}`)
+              await core.summary.addHeading(`${off.length} PRs off ${allowed.join(', ')}`).addList(lines).write()
+              core.info(lines.join('\n') || 'none')
+              return
+            }
+
+            // Fork PRs get a read-only token: the red check still shows, the comment cannot.
+            const say = async (number, body) => {
+              try {
+                const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: number, per_page: 100 })
+                const mine = comments.find((c) => c.body.startsWith(MARK))
+                if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body: `${MARK}\n${body}` })
+                else if (body.startsWith('⚠️')) await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${MARK}\n${body}` })
+              } catch (e) { core.warning(`could not comment on #${number}: ${e.message}`) }
+            }
+
+            // Has this branch gone? Squash merges leave no ancestry, so ask for its merged PR first.
+            const stranded = async (branch) => {
+              const heads = await github.rest.pulls.list({ owner, repo, state: 'closed', head: `${owner}:${branch}`, per_page: 100 })
+              const parent = heads.data.find((p) => p.merged_at)
+              if (parent) return `its base \`${branch}\` already landed through #${parent.number}`
+              try { await github.rest.repos.getBranch({ owner, repo, branch }) }
+              catch (e) { if (e.status === 404) return `its base \`${branch}\` has been deleted`; throw e }
+              return ''
+            }
+
+            const pr = context.payload.pull_request
+            const merged = pr.merged === true
+            const fixTo = `\`gh pr edit <n> --base ${allowed[0]}\``
+
+            // A parent just landed: the children get no event of their own, so warn them here.
+            if (merged && pr.head.repo?.full_name === `${owner}/${repo}`) {
+              const kids = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: pr.head.ref, per_page: 100 })
+              for (const kid of kids) {
+                await say(kid.number, `⚠️ **Stranded:** base \`${pr.head.ref}\` just landed through #${pr.number}. Merging this PR will NOT reach \`${allowed[0]}\`. Retarget it first: ${fixTo.replace('<n>', kid.number)}`)
+              }
+            }
+
+            const base = pr.base.ref
+            if (allowed.includes(base)) {
+              await say(pr.number, `✅ Base is now \`${base}\`, an allowed branch.`)
+              return
+            }
+            if (pr.state === 'closed' && !merged) return
+
+            const why = merged ? '' : await stranded(base)
+            const body = merged
+              ? `⚠️ **Merged, but NOT into \`${allowed[0]}\`:** this landed on \`${base}\`, so it will not deploy from this merge. Check that the commits reach \`${allowed[0]}\`; if not, open a new PR for them.`
+              : `⚠️ **${why ? 'Stranded' : 'Wrong base'}:** this PR targets \`${base}\`${why ? ` and ${why}` : ''}. Merging it will NOT reach \`${allowed[0]}\` (allowed bases: ${allowed.join(', ')}). Retarget it first: ${fixTo.replace('<n>', pr.number)}`
+            await say(pr.number, body)
+            core.setFailed(body)
