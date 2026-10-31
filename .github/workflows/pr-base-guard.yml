@@ -52,14 +52,15 @@ jobs:
               } catch (e) { core.warning(`could not comment on #${number}: ${e.message}`) }
             }
 
-            // Has this branch gone? Squash merges leave no ancestry, so ask for its merged PR first.
+            // Has this branch gone? Squash merges leave no ancestry, so look for a merged PR whose
+            // head is the branch's tip. Long-lived branches merged long ago have since moved on.
             const stranded = async (branch) => {
-              const heads = await github.rest.pulls.list({ owner, repo, state: 'closed', head: `${owner}:${branch}`, per_page: 100 })
-              const parent = heads.data.find((p) => p.merged_at)
-              if (parent) return `its base \`${branch}\` already landed through #${parent.number}`
-              try { await github.rest.repos.getBranch({ owner, repo, branch }) }
+              let tip
+              try { tip = (await github.rest.repos.getBranch({ owner, repo, branch })).data.commit.sha }
               catch (e) { if (e.status === 404) return `its base \`${branch}\` has been deleted`; throw e }
-              return ''
+              const heads = await github.rest.pulls.list({ owner, repo, state: 'closed', head: `${owner}:${branch}`, per_page: 100 })
+              const parent = heads.data.find((p) => p.merged_at && p.head.sha === tip)
+              return parent ? `its base \`${branch}\` already landed through #${parent.number}` : ''
             }
 
             const pr = context.payload.pull_request
