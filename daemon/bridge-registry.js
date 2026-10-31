@@ -260,6 +260,10 @@ const PROVIDERS = {
       // check that only runs on the developer's laptop is the "works here, dead in production"
       // failure this rail exists to remove.
       list_accounts: { method: 'GET', path: '/api/mail/accounts' },
+      // READ — one message with its body. Bodies were unreachable off the Mac (#189480).
+      read_email: { method: 'GET', path: '/api/mail/message' },
+      // WRITE — a reply IN THE THREAD, built by Mail's own `reply` command (#189480).
+      reply_email: { method: 'POST', path: '/api/mail/reply' },
     },
   },
 
