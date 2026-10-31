@@ -12,6 +12,7 @@ import { leadOutcome, timingStatus, undeliverableNote, outcomeLine } from './lea
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
 const igAccounts = require('./helpers/ig-accounts');
+const { installDryRunGuard, stubApiWrites, applyTargetStrategy } = require('./helpers/dry-run-guard');
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
 import { LinkedInInboxProvider } from './helpers/providers/linkedin-inbox-provider';
 import { InstagramInboxJsonProvider, InstagramIdentityError } from './helpers/providers/instagram-inbox-json-provider';
@@ -288,6 +289,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
   // ── AUTH (HeyIRIS) ──
   await AuthHelper.loginWithToken(page, FRONTEND_TOKEN);
+  if (DRY_RUN) await installDryRunGuard(context); // #191666: nothing this browser clicks can write to our API
 
   // ── AUTH (Instagram / LinkedIn) ── load saved session cookies into this context
   let igFile: string | null = null;
@@ -537,16 +539,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   const apiClient = new LeadgenApiClient(TOKEN, BOARD_ID);
   if (DRY_RUN) {
     // A dry run reads leads and never writes to them: on 2026-10-22 one left [SOM FAIL] notes that
-    // put two real leads on a 3-day cooldown (#190637). Every write goes through here, so stub them.
-    const wouldWrite = (what: string) => async (leadId: number, arg?: any): Promise<any> => {
-      const detail = typeof arg === 'string' ? arg : JSON.stringify(arg ?? '');
-      console.log(`    [DRY] Would ${what} on lead #${leadId}: ${detail.substring(0, 120)}`);
-      return { success: true, message: 'dry run — not written' };
-    };
-    apiClient.addNote = wouldWrite('add note');
-    apiClient.updateLead = wouldWrite('update lead');
-    apiClient.recordDmSent = wouldWrite('record DM');
-    apiClient.completeStep = wouldWrite('complete step');
+    // put two real leads on a 3-day cooldown (#190637). The list covers every write (#191666).
+    stubApiWrites(apiClient);
   }
   const enrichStats = { checked: 0, enriched: 0, emailsFound: 0, alreadyHad: 0 };
 
@@ -1276,7 +1270,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
               await igPage.locator('text=Cancel').first().click().catch(() => {});
               await igPage.waitForTimeout(500);
               const followBtn = igPage.locator('button:text-is("Follow")').first();
-              if (await followBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+              if (DRY_RUN) console.log('  [DRY RUN] Would follow to open DMs; not following');
+              if (!DRY_RUN && await followBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
                 await followBtn.click();
                 await igPage.waitForTimeout(2000);
                 console.log('  Followed! Retrying Send message...');
@@ -1360,15 +1355,18 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           ).first();
 
           if (await dmInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await dmInput.click();
-            await dmInput.fill(msg).catch(async () => {
-              await igPage.keyboard.type(msg, { delay: 15 });
-            });
-            await igPage.waitForTimeout(1000);
+            // Typing shows the person a typing indicator and can leave a draft, so a dry run does not type (#191666).
+            if (!DRY_RUN) {
+              await dmInput.click();
+              await dmInput.fill(msg).catch(async () => {
+                await igPage.keyboard.type(msg, { delay: 15 });
+              });
+              await igPage.waitForTimeout(1000);
+            }
 
             if (DRY_RUN) {
               await igPage.screenshot({ path: `test-results/screenshots/api-direct-dry-${idx + 1}.png` }).catch(() => {});
-              console.log(`  [DRY RUN] Message typed to @${igHandle}: "${msg.substring(0, 50)}..."`);
+              console.log(`  [DRY RUN] Would type to @${igHandle}: "${msg.substring(0, 50)}..."`);
               results.sent++; apiDryRunTyped = true;
             } else {
               const sendBtn = igPage.locator('button:has-text("Send"):not([disabled])').first();
@@ -1684,52 +1682,22 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (outreachState === 'has-steps') {
         console.log('→ Strategy already applied, detecting current step...');
       } else {
-        if (outreachState === 'fresh') {
-          // Fresh lead — click "Start with Default Strategy" to initialize the outreach panel.
-          // This creates default steps, but we immediately replace them with the target strategy.
-          const startDefault = page.locator('button:has-text("Start with Default Strategy")').first();
-          if (await startDefault.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log('→ Fresh lead — Start with Default Strategy...');
-            await startDefault.click();
-            // Wait for outreach panel to fully initialize with default steps
-            // Poll for the Apply Strategy button (appears once default steps are created)
-            for (let aw = 0; aw < 20; aw++) {
-              const hasApply = await page.locator('button:has-text("Apply Strategy")').first().isVisible().catch(() => false);
-              const hasApplyShort = await page.locator('button:has-text("Apply")').first().isVisible().catch(() => false);
-              if (hasApply || hasApplyShort) break;
-              await page.waitForTimeout(500);
-            }
-          }
+        const applied = await applyTargetStrategy(page, { dryRun: DRY_RUN, strategyName: STRATEGY_NAME, outreachState });
+        if (applied === 'dry-run') {
+          // Without the strategy there are no steps and no message to read, so this lead's preview ends here (#191666).
+          results.sent++; // count as "would have sent"
+          const dryDuration = ((Date.now() - leadStart) / 1000).toFixed(1);
+          console.log(outcomeLine(name, leadOutcome({ dryRunTyped: true }), dryDuration));
+          leadTimings.push({ name, duration: parseFloat(dryDuration), status: timingStatus('dry-run') });
+          await page.keyboard.press('Escape');
+          continue;
         }
-
-        // Apply the target strategy (replaces default steps with the correct ones)
-        const applyBtn = page.locator('button:has-text("Apply Strategy")').first();
-        if (await applyBtn.isVisible({ timeout: 15000 }).catch(() => false)) {
-          console.log('→ Apply Strategy...');
-          await applyBtn.click();
-
-          const strat = page.locator(`button:has-text("${STRATEGY_NAME}")`).first();
-          if (await strat.isVisible({ timeout: 10000 }).catch(() => false)) {
-            console.log(`→ Selecting ${STRATEGY_NAME}`);
-            await strat.click();
-
-            const confirm = page.locator('button.swal2-confirm').first();
-            if (await confirm.isVisible({ timeout: 5000 }).catch(() => false)) {
-              console.log('→ Confirming replacement...');
-              await confirm.click();
-              // Wait for API to create steps + UI to re-render
-              for (let pw = 0; pw < 15; pw++) {
-                const playCount = await page.locator('button[title="Generate message"]').count().catch(() => 0);
-                if (playCount > 0) { break; }
-                await page.waitForTimeout(500);
-              }
-            }
-          } else {
-            console.log('⚠️  Strategy not found in dropdown');
-            await page.keyboard.press('Escape');
-            results.skipped++; continue;
-          }
-        } else {
+        if (applied === 'not-found') {
+          console.log('⚠️  Strategy not found in dropdown');
+          await page.keyboard.press('Escape');
+          results.skipped++; continue;
+        }
+        if (applied === 'no-button') {
           console.log('⚠️  No Apply Strategy button found');
           await page.screenshot({ path: `test-results/screenshots/no-apply-btn-${idx + 1}.png` });
         }
@@ -2011,16 +1979,20 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           }
 
           // Click "I've sent the message" checkbox + Complete
-          const sentCheckbox = page.locator('input[type="checkbox"]').first();
-          if (await sentCheckbox.isVisible({ timeout: 2000 }).catch(() => false)) {
-            await sentCheckbox.check();
-            await page.waitForTimeout(300);
-          }
-          const completeBtn = page.locator('button:has-text("Complete")').first();
-          if (await completeBtn.isEnabled({ timeout: 2000 }).catch(() => false)) {
-            await completeBtn.click();
-            await page.waitForTimeout(1500);
-            console.log('  Step completed');
+          if (DRY_RUN) {
+            console.log('  [DRY RUN] Would mark the step complete');
+          } else {
+            const sentCheckbox = page.locator('input[type="checkbox"]').first();
+            if (await sentCheckbox.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await sentCheckbox.check();
+              await page.waitForTimeout(300);
+            }
+            const completeBtn = page.locator('button:has-text("Complete")').first();
+            if (await completeBtn.isEnabled({ timeout: 2000 }).catch(() => false)) {
+              await completeBtn.click();
+              await page.waitForTimeout(1500);
+              console.log('  Step completed');
+            }
           }
         }
 
@@ -2326,7 +2298,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
                   await igPage.waitForTimeout(1000);
 
                   const followBtn = igPage.locator('button:text-is("Follow")').first();
-                  if (await followBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                  if (DRY_RUN) console.log('  [DRY RUN] Would follow to open DMs; not following');
+                  if (!DRY_RUN && await followBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
                     await followBtn.click();
                     await igPage.waitForTimeout(1500);
                     console.log('  ➕ Followed! Re-checking for Send message...');
@@ -2401,17 +2374,19 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
 
               if (await dmInput.isVisible({ timeout: 8000 }).catch(() => false)) {
                 const dmText = msg; // never empty here: an empty message skipped the lead at step 8 (#191275)
-                await dmInput.click();
-                await dmInput.fill(dmText).catch(async () => {
-                  // fill() can fail on contenteditable — fallback to keyboard
-                  await igPage.keyboard.type(dmText, { delay: 15 });
-                });
-                await igPage.waitForTimeout(1000);
+                // Typing shows the person a typing indicator and can leave a draft, so a dry run does not type (#191666).
+                if (!DRY_RUN) {
+                  await dmInput.click();
+                  await dmInput.fill(dmText).catch(async () => {
+                    // fill() can fail on contenteditable — fallback to keyboard
+                    await igPage.keyboard.type(dmText, { delay: 15 });
+                  });
+                  await igPage.waitForTimeout(1000);
+                }
 
                 if (DRY_RUN) {
-                  // Screenshot the typed message but DON'T send
                   await igPage.screenshot({ path: `test-results/screenshots/dry-run-dm-${idx + 1}.png` });
-                  console.log(`  [DRY RUN] Message typed but NOT sent: "${dmText.substring(0, 50)}..."`);
+                  console.log(`  [DRY RUN] Would type, not typed or sent: "${dmText.substring(0, 50)}..."`);
                   results.sent++; // count as "would have sent"
                   dryRunTyped = true;
                 } else {
