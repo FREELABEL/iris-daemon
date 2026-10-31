@@ -10,6 +10,8 @@ import { test } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LeadgenApiClient } from './helpers/leadgen-api-client';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { recordReply, replyCampaign } = require('./helpers/record-reply');
 
 const IG_ACCOUNT = process.env.IG_ACCOUNT!;
 const BOARD_ID = Number(process.env.BOARD_ID || 0);
@@ -76,7 +78,9 @@ test(`send approved replies as @${IG_ACCOUNT}`, async ({ browser }) => {
         const left = (await input.innerText().catch(() => '')).trim();
         if (left.length > 0) throw new Error(`still in the message box (${left.length} chars), not sent`);
         r.status = seen ? 'sent + seen in thread' : 'sent (composer cleared); confirm with the capture read-back';
-        const rec = await api.recordDmSent(it.leadId, { message: it.message, channel_account: IG_ACCOUNT, campaign_name: 'discover-creator-yes', bloq_id: BOARD_ID, ig_handle: it.handle });
+        // A one-off reply, not a campaign step: logged as a reply, labelled by account (#191637).
+        const { rec, recordedAs } = await recordReply(api, it.leadId, { message: it.message, channel_account: IG_ACCOUNT, campaign_name: replyCampaign(IG_ACCOUNT, process.env.CAMPAIGN_NAME), bloq_id: BOARD_ID, ig_handle: it.handle });
+        r.recordedAs = recordedAs;
         r.recorded = rec.success;
         await page.waitForTimeout(20000 + Math.random() * 20000); // human pace between sends
       }
