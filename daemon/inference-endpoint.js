@@ -29,6 +29,11 @@ const os = require('os')
 
 const MAX_TTL_S = 300
 const MAX_BODY = 2 * 1024 * 1024
+// The model name in a probe token (#192146). Never a served model, so it cannot run a completion.
+const PROBE_MODEL = '__probe__'
+// How long the gateway's reachability probe waits for the local model server. It asks for the model
+// list, which costs no generation; a server busy generating answers late, and that reads as `slow`.
+const PROBE_UPSTREAM_MS = 2000
 const DEFAULTS = { enabled: false, port: 3290, max_concurrent: 2, max_tokens: 8192, url: null, models: null, default_model: null }
 
 const settingsFile = (home = os.homedir()) => path.join(home, '.iris', 'inference.json')
@@ -120,13 +125,36 @@ function readBody (req, max) {
  * server or a daemon: getKey/getNodeId (live identity), served() (models this node answers for),
  * settings() (the owner's switch and caps), upstream (base URL of the local server).
  */
-function createHandler ({ getKey, getNodeId, served, settings, upstream, fetchFn = fetch, now = () => Date.now(), log = () => {} }) {
+function createHandler ({ getKey, getNodeId, served, settings, upstream, fetchFn = fetch, now = () => Date.now(), log = () => {}, probeUpstreamMs = PROBE_UPSTREAM_MS }) {
   const nonces = new NonceBook()
   let inFlight = 0
+
+  /**
+   * GET /healthz/model-server: the far end of the gateway's reachability probe (#192146). An answer
+   * here proves relay, tunnel, TLS and this endpoint; the body says whether the model server behind
+   * it is up. Signed like a completion, for PROBE_MODEL: what the owner runs is nobody else's to read.
+   * It takes no concurrency slot, so a machine busy generating still answers.
+   */
+  async function probeModelServer (req, res) {
+    if (!settings().enabled) return send(res, 503, { error: { message: 'this machine is not serving models right now', code: 'not_serving' } })
+    const auth = String(req.headers.authorization || '')
+    const v = verifyToken(auth.startsWith('Bearer ') ? auth.slice(7) : '', { key: getKey(), nodeId: getNodeId(), now: now(), seen: (n) => nonces.has(n, now()) })
+    if (!v.ok || v.model !== PROBE_MODEL) return send(res, 401, { error: { message: v.ok ? 'not a probe token' : v.why, code: 'unauthorized' } })
+    nonces.add(v.nonce, v.exp)
+    try {
+      const up = await fetchFn(`${upstream()}/models`, { signal: AbortSignal.timeout(probeUpstreamMs) })
+      if (up.body && up.body.cancel) up.body.cancel().catch(() => {})
+      return send(res, 200, up.ok ? { ok: true, model_server: 'up' } : { ok: false, model_server: 'down', detail: `HTTP ${up.status}` })
+    } catch (err) {
+      const slow = err && (err.name === 'TimeoutError' || err.name === 'AbortError')
+      return send(res, 200, { ok: false, model_server: slow ? 'slow' : 'down', detail: slow ? `no answer within ${probeUpstreamMs} ms` : 'connection failed' })
+    }
+  }
 
   return async (req, res) => {
     const url = new URL(req.url, 'http://x')
     if (req.method === 'GET' && url.pathname === '/healthz') return send(res, 200, { ok: true })
+    if (req.method === 'GET' && url.pathname === '/healthz/model-server') return probeModelServer(req, res)
     if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions') return send(res, 404, { error: { message: 'not found' } })
 
     const s = settings()
@@ -258,4 +286,4 @@ class InferenceEndpoint {
   }
 }
 
-module.exports = { InferenceEndpoint, createHandler, verifyToken, signToken, readSettings, settingsFile, NonceBook, MAX_TTL_S }
+module.exports = { InferenceEndpoint, createHandler, verifyToken, signToken, readSettings, settingsFile, NonceBook, MAX_TTL_S, PROBE_MODEL }
