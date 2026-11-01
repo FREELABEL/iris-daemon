@@ -790,6 +790,35 @@ export class LeadgenApiClient {
     }
   }
 
+  /** Remove a lead's outreach steps so it returns to the fresh pool (#192164). */
+  async clearSteps(leadId: number): Promise<ApiResponse> {
+    return this.write('DELETE', `/leads/${leadId}/outreach-steps-clear`);
+  }
+
+  /** Mark a completed step as not done: the DM it recorded was refused (#192164). */
+  async reopenStep(leadId: number, stepId: number): Promise<ApiResponse> {
+    return this.write('PUT', `/leads/${leadId}/outreach-steps/${stepId}`, { is_completed: false });
+  }
+
+  /** The endpoint requires the text, so it is sent back unchanged with the new status (#192164). */
+  async updateMessage(leadId: number, messageId: number, message: string, status: string): Promise<ApiResponse> {
+    return this.write('PUT', `/leads/${leadId}/outreach/messages/${messageId}`, { message, status });
+  }
+
+  private async write(method: string, urlPath: string, body?: Record<string, any>): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}${urlPath}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}`, 'Accept': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const data = await resp.json().catch(() => ({}));
+      return { success: resp.ok, data, message: data.message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
   /**
    * Delete a lead via DELETE /api/v1/leads/{id}.
    */
