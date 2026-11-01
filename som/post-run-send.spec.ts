@@ -20,6 +20,10 @@ import { LeadgenApiClient } from './helpers/leadgen-api-client';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const prs = require('./helpers/post-run-send');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
+const { readThreadText } = require('./helpers/delivery-check');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { undeliverableAccounts } = require('./helpers/dm-guard');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const kdm = require('./helpers/keyword-dm');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { isOwnedHandle } = require('./helpers/ig-accounts');
@@ -65,6 +69,10 @@ test(`post-run send as @${IG_ACCOUNT}`, async ({ page, context }) => {
     // Checked per person, not once: another run can have used the cap or reached them since the preview.
     if (isOwnedHandle(handle) || handle === IG_ACCOUNT.toLowerCase()) continue;
     if (prs.blockedHandles(prs.readLedger(LEDGER_FILE)).has(handle)) continue;
+    // Refused by Instagram from this account, by the batch or an earlier list: not again (#192164).
+    const known = (await api.getLead(it.leadId).catch(() => null))?.data;
+    const lead = known?.data || known;
+    if (lead && undeliverableAccounts(lead, lead.notes || [])[IG_ACCOUNT.toLowerCase()]?.kind === 'refused') continue;
     if (prs.remainingToday(capFile, DAILY_CAP) <= 0) { console.log(`STOP daily cap reached (${DAILY_CAP})`); break; }
 
     if (attempted) await page.waitForTimeout(kdm.jitterDelay(SEND_DELAY_MS));
@@ -78,7 +86,8 @@ test(`post-run send as @${IG_ACCOUNT}`, async ({ page, context }) => {
     }
     // The refusal is drawn a moment after the message appears (#192164).
     await page.waitForTimeout(2500);
-    const pageText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+    // Not the whole page: the thread list beside it previews other people's refusals (#192164).
+    const pageText = await readThreadText(page);
     const { outcome, reason, stop } = prs.classifySend(result, { url: page.url(), pageText });
 
     if (prs.countsTowardCap(outcome)) prs.recordCapSend(capFile, it.leadId);

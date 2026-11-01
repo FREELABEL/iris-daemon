@@ -41,3 +41,14 @@ test('the lead note names the account, the handle and the reason', () => {
     '[SOM UNDELIVERABLE] cannot DM @ballistic_shots_ from @heyiris.io: no Message or Follow button'
   )
 })
+
+test('#192164: unknown is neither sent nor undeliverable, and counts toward the cap because it may be real', () => {
+  const o = leadOutcome({ deliveredUnknownReason: 'could not read the thread back' })
+  assert.strictEqual(o, 'delivered-unknown')
+  assert.strictEqual(countsTowardDailyCap(o), true)
+  assert.strictEqual(timingStatus(o), 'delivered-unknown')
+  assert.match(outcomeLine('@a', o, '30', 'x'), /^❓/)
+  assert.strictEqual(countsTowardDailyCap('undeliverable'), false)
+  // a refusal and a confirmed send still win their own
+  assert.strictEqual(leadOutcome({ sent: true, deliveredUnknownReason: 'x' }), 'sent')
+})

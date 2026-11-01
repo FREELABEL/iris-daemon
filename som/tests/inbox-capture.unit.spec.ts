@@ -144,3 +144,28 @@ test('viewerUsernameFromHtml reads the logged-in account, or nothing', () => {
   expect(viewerUsernameFromHtml(html)).toBe('heyiris.io');
   expect(viewerUsernameFromHtml('<html>logged out</html>')).toBe('');
 });
+
+// #192164: shape from a read-only inbox read on 2026-11-01, wording and ids replaced.
+test('the refusal is flagged on the thread, is ours, and is not a reply', () => {
+  const payload = { data: { as_ig_direct_thread: {
+    thread_key: 't1', users: [{ id: '1', username: 'them' }], viewer: { interop_messaging_user_fbid: '9000' },
+    slide_messages: { edges: [
+      { node: { sender_fbid: '9000', timestamp_ms: '1000', content_type: 'TEXT', text_body: 'hi' } },
+      { node: { sender_fbid: '9000', timestamp_ms: '2000', content_type: 'REACHABILITY_SETTINGS_ONE_WAY_SEND_XMAT', igd_snippet: 'refused' } },
+    ] },
+  } } };
+  const [t] = parseMailboxPayload(payload);
+  const meta = threadToProfile(t).rawMetadata as any;
+  expect(meta.cantReceive).toBe(true);
+  expect(meta.cantReceiveAt).toBe(new Date(2000).toISOString());
+  expect(meta.hasTheirMessage).toBe(false);
+});
+
+test('a thread with no refusal is not flagged', () => {
+  const payload = { data: { as_ig_direct_thread: {
+    thread_key: 't2', users: [{ id: '1', username: 'them' }], viewer: { interop_messaging_user_fbid: '9000' },
+    slide_messages: { edges: [{ node: { sender_fbid: '9000', timestamp_ms: '1000', content_type: 'TEXT', text_body: 'hi' } }] },
+  } } };
+  const [t] = parseMailboxPayload(payload);
+  expect((threadToProfile(t).rawMetadata as any).cantReceive).toBe(false);
+});
