@@ -87,6 +87,10 @@ jobs:
         shell: pwsh
         run: node --test tests/shell-for-platform.test.js
 
+      - name: local IRIS server credentials on real Windows (no mode or uid; pid and loopback still apply)
+        shell: pwsh
+        run: node --test tests/engine-auth-local-servers.test.js
+
       - name: file search engines on real Windows (Windows Search, scan, fallback, injection)
         shell: pwsh
         run: node --test tests/disk-search-on-this-platform.test.js

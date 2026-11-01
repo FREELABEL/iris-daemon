@@ -3439,29 +3439,11 @@ function sessionServerCandidatesAsync() {
   })
 }
 
-// Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
-async function fetchJsonFromSessionServer (url, timeoutMs) {
-  // With Desktop's password when it published one (#190647); no header otherwise, as before.
-  const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
-  if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
-  return r.json()
-}
+// Credentials, refusals and the JSON-only rule live in lib/server-sessions.js (#190647, #192113).
+const fetchJsonFromSessionServer = (url, timeoutMs, refused) => require('./lib/server-sessions').fetchSessionServerJson(url, timeoutMs, refused)
 
-// Asserts on the BODY, never the status: unknown paths on these servers return HTTP 200 with the
-// web UI's HTML, so a status check calls any open port a session server. Requiring the returned
-// id to match also rules out a 200 describing somebody else's session.
-async function findLiveSessionServer(sid, timeoutMs = 1500) {
-  for (const base of sessionServerCandidates()) {
-    try {
-      const url = `${base}/session/${encodeURIComponent(sid)}`
-      const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
-      if (!r.ok) continue
-      const b = await r.json()
-      if (b && typeof b === 'object' && b.id === sid) return base
-    } catch { /* unreachable, non-JSON, or timed out — try the next */ }
-  }
-  return null
-}
+// Asserts on the BODY, never the status; see findSessionServer. Resolves { base, refused }.
+const findLiveSessionServer = (sid, timeoutMs = 1500) => require('./lib/server-sessions').findSessionServer(sid, sessionServerCandidates(), timeoutMs)
 
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const { message, submit, from } = req.body
@@ -3469,7 +3451,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const provenance = require('./lib/message-provenance').cleanProvenance(req.body && req.body.provenance)
   const sid = req.params.id
 
-  const base = await findLiveSessionServer(sid)
+  const { base, refused } = await findLiveSessionServer(sid)
+  if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sid, refused))
   if (!base) {
     // Say which of the two things is true, because they have different fixes: the session is not
     // running on this node, or no session server is reachable here at all. Never fall back to the
@@ -3522,7 +3505,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
     if (!r.ok) {
       const t = await r.text().catch(() => '')
       console.error(`[opencode] Live delivery failed: HTTP ${r.status} ${t.slice(0, 200)}`)
-      return res.status(502).json({ error: `live delivery to ${base} failed: HTTP ${r.status}`, session_id: sid })
+      const why = require('./lib/engine-auth').refusalReason(base, r.status)
+      return res.status(502).json({ error: why || `live delivery to ${base} failed: HTTP ${r.status}`, session_id: sid })
     }
 
     res.json({
@@ -3549,7 +3533,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
 app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
   const sid = req.params.id
   try {
-    const base = await findLiveSessionServer(sid)
+    const { base, refused } = await findLiveSessionServer(sid)
+    if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sid, refused))
     if (!base) return res.status(404).json({ error: `No live session server on this node is running ${sid}.`, session_id: sid })
     const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sid)}`, 3000)
     const dir = meta && meta.directory
@@ -3568,7 +3553,8 @@ app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
     })
     if (!resp.ok) {
       const t = await resp.text().catch(() => '')
-      return res.status(502).json({ error: `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
+      const why = require('./lib/engine-auth').refusalReason(base, resp.status)
+      return res.status(502).json({ error: why || `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
     }
     const delivered = pending.waiting.opencode.type === 'permission' ? `permission: ${r.body.reply}` : `answered ${r.body.answers.length} question(s)`
     console.log(`[opencode] answer ${sid.slice(-8)} -> ${delivered}`)
@@ -3591,7 +3577,8 @@ app.get('/api/sessions/opencode/:id/history', async (req, res) => {
     const desktop = desktopSessionHistory(sessionId, { limit })
     if (desktop) return res.json(desktop)
     try {
-      const base = await findLiveSessionServer(sessionId)
+      const { base, refused } = await findLiveSessionServer(sessionId)
+      if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sessionId, refused))
       if (base) {
         const { historyFromServerMessages } = require('./lib/server-sessions')
         const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sessionId)}`, 3000)
@@ -4351,7 +4338,11 @@ app.get('/api/sessions/opencode', async (req, res) => {
     const { listServerSessions, mergeSessionRows } = require('./lib/server-sessions')
     const servers = await sessionServerCandidatesAsync()
     timer.mark('find_servers')
-    const fromServers = await listServerSessions({ servers, fetchJson: fetchJsonFromSessionServer, limit })
+    // A server that refused contributes nothing, like one that is down, so say so in the answer.
+    const refused = []
+    const askServer = (url, timeoutMs) => fetchJsonFromSessionServer(url, timeoutMs, refused)
+    const refusedField = () => (refused.length ? { servers_refused: refused } : {})
+    const fromServers = await listServerSessions({ servers, fetchJson: askServer, limit })
     timer.mark('ask_servers')
     // Freshest row wins per id, gaps filled from the others.
     const page = mergeSessionRows(mergeSessionRows(sessions, desktop), fromServers.rows, limit)
@@ -4362,7 +4353,7 @@ app.get('/api/sessions/opencode', async (req, res) => {
     // unmeasured, never "idle" — because only the server running a session reports it.
     if (req.query.live === '1') {
       const { opencodeActivity } = require('./lib/opencode-activity')
-      const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
+      const live = await opencodeActivity({ sessions: page, servers, fetchJson: askServer })
       timer.mark('live_activity')
       for (const s of page) s.activity = live.activity[s.session_id] || null
       // A permission prompt or question the engine is HOLDING for a person (#190649) — reported in
@@ -4373,13 +4364,13 @@ app.get('/api/sessions/opencode', async (req, res) => {
       const recentDirs = page
         .filter((s) => s.project_path && Date.now() - Date.parse(s.updated_at || 0) <= ACTIVITY_WINDOW_MS)
         .map((s) => s.project_path)
-      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: fetchJsonFromSessionServer })
+      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: askServer })
       timer.mark('pending_questions')
       for (const s of page) { const p = pending.get(s.session_id); if (p) s.waiting = p.waiting }
-      return finish({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
+      return finish({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered, ...refusedField() })
     }
 
-    finish({ sessions: page, servers_answered: fromServers.answered })
+    finish({ sessions: page, servers_answered: fromServers.answered, ...refusedField() })
   } catch (err) {
     console.log(`[opencode] List sessions failed: ${err.message}`)
     finish({ sessions: [], error: err.message })
