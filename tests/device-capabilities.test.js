@@ -12,7 +12,7 @@ const assert = require('node:assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { parseMacProfiler, probeLinux } = require('../daemon/device-capabilities')
+const { parseMacProfiler, probeLinux, parseAdbDevices } = require('../daemon/device-capabilities')
 
 const audio = (name, transport, input, output) => ({
   _name: name,
@@ -173,4 +173,19 @@ test('camera names: product names pass, anything that can name a person does not
   assert.strictEqual(productCameraName('Desk View Camera'), null)
   assert.strictEqual(productCameraName(require('os').userInfo().username + ' cam'), null)
   assert.strictEqual(productCameraName('x'.repeat(65)), null)
+})
+
+test('android: only authorised phones count; one waiting on the USB prompt is reported apart (#191796)', () => {
+  const out = 'List of devices attached\n39081FDJH00ABC\tdevice\nR58M12345\tunauthorized\nemulator-5554\toffline\n\n'
+  assert.deepStrictEqual(parseAdbDevices(out), { count: 1, unauthorized: 1 })
+})
+
+test('android: adb answering with no phones is a measured 0 — the flag clears', () => {
+  assert.deepStrictEqual(parseAdbDevices('List of devices attached\n\n'), { count: 0, unauthorized: 0 })
+})
+
+test('android: no serial ever leaves the machine', () => {
+  const r = parseAdbDevices('List of devices attached\n39081FDJH00ABC\tdevice usb:1-1 product:sunfish model:Pixel_4a\n')
+  assert.ok(!JSON.stringify(r).includes('39081FDJH00ABC'))
+  assert.ok(!JSON.stringify(r).includes('Pixel'))
 })
