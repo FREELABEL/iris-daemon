@@ -52,3 +52,67 @@ test('#192164: unknown is neither sent nor undeliverable, and counts toward the 
   // a refusal and a confirmed send still win their own
   assert.strictEqual(leadOutcome({ sent: true, deliveredUnknownReason: 'x' }), 'sent')
 })
+
+// #192414: a confirmed DM moves the lead to Contacted, never backwards.
+const { contactedStatusFor, markContacted } = require('../som/lead-outcome')
+
+test('a confirmed send moves a lead before first contact to Contacted', () => {
+  for (const s of ['Prospected', 'prospected', 'New', '', null, undefined, '  Prospected ']) {
+    assert.strictEqual(contactedStatusFor('sent', s), 'Contacted', String(s))
+  }
+})
+
+test('a lead already past first contact is never moved', () => {
+  for (const s of ['Contacted', 'Responded', 'Qualified', 'Proposal', 'In Negotiation', 'Follow-Up', 'On Hold', 'Active', 'Partner', 'Won', 'Lost', 'Archived', 'Some Custom Stage']) {
+    assert.strictEqual(contactedStatusFor('sent', s), null, s)
+  }
+})
+
+test('only a confirmed send counts: unknown delivery, undeliverable, dry run and failures move nothing', () => {
+  for (const o of ['delivered-unknown', 'undeliverable', 'dry-run', 'failed']) {
+    assert.strictEqual(contactedStatusFor(o, 'Prospected'), null, o)
+  }
+})
+
+function fakeApi (status, { readOk = true, writeOk = true } = {}) {
+  const calls = []
+  return {
+    calls,
+    async getLead (id) { calls.push(['get', id]); return readOk ? { success: true, data: { data: { id, status } } } : { success: false, message: 'HTTP 500' } },
+    async updateLead (id, body) { calls.push(['put', id, body]); return { success: writeOk, message: writeOk ? '' : 'HTTP 422' } },
+  }
+}
+
+test('markContacted re-reads the lead and writes only status: Contacted', async () => {
+  const api = fakeApi('Prospected')
+  const r = await markContacted(api, 30092, 'sent')
+  assert.deepStrictEqual(r, { updated: true, from: 'Prospected', reason: '' })
+  assert.deepStrictEqual(api.calls, [['get', 30092], ['put', 30092, { status: 'Contacted' }]])
+})
+
+test('markContacted leaves a lead that replied in the meantime alone', async () => {
+  const api = fakeApi('Qualified')
+  const r = await markContacted(api, 1, 'sent')
+  assert.strictEqual(r.updated, false)
+  assert.match(r.reason, /already past first contact \(Qualified\)/)
+  assert.deepStrictEqual(api.calls, [['get', 1]])
+})
+
+test('markContacted writes nothing when it cannot read the lead, and never throws', async () => {
+  const api = fakeApi('Prospected', { readOk: false })
+  assert.strictEqual((await markContacted(api, 1, 'sent')).updated, false)
+  assert.deepStrictEqual(api.calls, [['get', 1]])
+  const boom = { async getLead () { throw new Error('socket hang up') }, async updateLead () { throw new Error('no') } }
+  assert.deepStrictEqual(await markContacted(boom, 1, 'sent'), { updated: false, reason: 'socket hang up' })
+})
+
+test('markContacted does nothing for delivered-unknown', async () => {
+  const api = fakeApi('Prospected')
+  assert.strictEqual((await markContacted(api, 1, 'delivered-unknown')).updated, false)
+  assert.deepStrictEqual(api.calls, [])
+})
+
+test('a failed write is reported, not hidden', async () => {
+  const r = await markContacted(fakeApi('New', { writeOk: false }), 1, 'sent')
+  assert.deepStrictEqual(r, { updated: false, from: 'New', reason: 'HTTP 422' })
+})
