@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { toSeconds, sectionArg, resolveYtDlp, run } = require('../daemon/clip-hive-download')
+const { toSeconds, sectionArg, resolveYtDlp, hasVideo, FORMAT, run } = require('../daemon/clip-hive-download')
 const { statusForExit } = require('../daemon/task-executor')
 
 test('times parse the way fl-api writes them', () => {
@@ -36,6 +36,13 @@ function fakeYtDlp (dir, { fail } = {}) {
   return p
 }
 
+function fakeProbe (dir, streams) {
+  const p = path.join(dir, 'ffprobe')
+  fs.writeFileSync(p, `#!/bin/sh\nprintf '${streams}'\n`)
+  fs.chmodSync(p, 0o755)
+  return p
+}
+
 function fakeApi (pick) {
   const calls = []
   global.fetch = async (url, opts = {}) => {
@@ -52,6 +59,7 @@ function fakeApi (pick) {
 test('pick -> download the section -> PUT to R2 -> source-ready, in that order', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chd-'))
   process.env.YTDLP_PATH = fakeYtDlp(dir)
+  process.env.FFPROBE_PATH = fakeProbe(dir, 'video')
   const calls = fakeApi({ job_id: 42, youtube_url: 'https://www.youtube.com/watch?v=abc', start: '0:10', duration: '90s', title: 'T',
     upload: { upload_url: 'https://r2.example/clips/sources/42.mp4?sig=1', method: 'PUT', headers: { 'Content-Type': 'video/mp4' } } })
 
@@ -96,4 +104,30 @@ test('a refused R2 upload never reports ready', async () => {
   await assert.rejects(run({ api: 'https://api.example', token: 't', body: {}, log: () => {} }), /R2 upload for job #9 -> HTTP 403/)
   assert.ok(!calls.some(c => c.url.includes('source-ready')))
   delete process.env.YTDLP_PATH
+})
+
+test('formats: plain https first, so an HLS stream cannot win (#192315)', () => {
+  const first = FORMAT.split('/')[0]
+  assert.match(first, /\[protocol=https\]\+ba\[protocol=https\]/)
+  assert.ok(FORMAT.endsWith('/b'), 'keeps a last resort')
+})
+
+test('the video check reads ffprobe, and says unknown when there is none', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chd-'))
+  assert.strictEqual(hasVideo('/x.mp4', { FFPROBE_PATH: fakeProbe(dir, 'video') }), true)
+  assert.strictEqual(hasVideo('/x.mp4', { FFPROBE_PATH: fakeProbe(dir, '') }), false)
+  assert.strictEqual(hasVideo('/x.mp4', { FFPROBE_PATH: path.join(dir, 'missing') }), null)
+})
+
+test('an audio-only download is refused and never uploaded (#192315)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chd-'))
+  process.env.YTDLP_PATH = fakeYtDlp(dir)
+  process.env.FFPROBE_PATH = fakeProbe(dir, '')
+  const calls = fakeApi({ job_id: 43, youtube_url: 'https://www.youtube.com/watch?v=abc', start: '0:10', duration: '90s', title: 'T',
+    upload: { upload_url: 'https://r2.example/clips/sources/43.mp4?sig=1', method: 'PUT', headers: { 'Content-Type': 'video/mp4' } } })
+
+  await assert.rejects(run({ api: 'https://api.example', token: 't', body: {}, log: () => {} }), /no video track/)
+  assert.ok(!calls.some(c => c.url.startsWith('https://r2.example/')), 'must not upload')
+  assert.ok(!calls.some(c => c.url.includes('/source-ready')), 'must not report it ready')
+  delete process.env.FFPROBE_PATH
 })

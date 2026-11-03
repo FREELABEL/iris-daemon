@@ -25,6 +25,27 @@ function sectionArg (start, duration) {
   return `*${a}-${a + toSeconds(duration)}`
 }
 
+/**
+ * Which formats to ask for. Plain https (DASH) first: on some videos YouTube's best video is an
+ * HLS (m3u8) stream, and cutting a section out of it with --download-sections yields NO video
+ * frames, only the audio. That was a 1.5 MB audio-only file uploaded as the clip source, and
+ * FFmpeg then failed with code 234 on fl-api: 7 of 28 clip jobs, 2026-11-02/03 (#192315).
+ * The old selector stays as the last resort, and the video check below catches what it lets by.
+ */
+const FORMAT = 'bv*[height<=1080][protocol=https]+ba[protocol=https]/b[height<=1080][protocol=https]/bv*[height<=1080]+ba/b'
+
+/**
+ * true / false: does the file have a video stream. null: no ffprobe on this node, so unknown.
+ * Never upload a file we know has no picture.
+ */
+function hasVideo (file, env = process.env) {
+  const probe = env.FFPROBE_PATH || 'ffprobe'
+  const r = spawnSync(probe, ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=codec_type',
+    '-of', 'csv=p=0', file], { encoding: 'utf8', timeout: 60000 })
+  if (r.error) return null
+  return /video/.test(r.stdout || '')
+}
+
 /** [cmd, ...prefixArgs] for yt-dlp: $YTDLP_PATH, then yt-dlp on PATH, then python3 -m yt_dlp. */
 function resolveYtDlp (env = process.env, has = commandWorks) {
   if (env.YTDLP_PATH) return [env.YTDLP_PATH]
@@ -70,7 +91,7 @@ async function run ({ api, token, body, log = console.log }) {
   const t0 = Date.now()
   try {
     execFileSync(ytdlp[0], [...ytdlp.slice(1), '--no-warnings', '--no-playlist',
-      '-f', 'bv*[height<=1080]+ba/b[height<=1080]/b', '--merge-output-format', 'mp4',
+      '-f', FORMAT, '--merge-output-format', 'mp4',
       '--download-sections', sectionArg(pick.start, pick.duration), '--force-keyframes-at-cuts',
       '-o', file, pick.youtube_url], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 600000 })
   } catch (e) {
@@ -80,6 +101,12 @@ async function run ({ api, token, body, log = console.log }) {
   if (!fs.existsSync(file)) throw new Error(`yt-dlp produced no file for job #${pick.job_id}`)
   const bytes = fs.statSync(file).size
   log(`[clip_cutter] downloaded ${(bytes / 1e6).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(0)}s`)
+  const video = hasVideo(file)
+  if (video === false) {
+    fs.rmSync(dir, { recursive: true, force: true })
+    throw new Error(`job #${pick.job_id}: the download has no video track (audio only), so nothing was uploaded`)
+  }
+  if (video === null) log('[clip_cutter] no ffprobe on this node; the video track was not checked')
 
   // 3. Upload straight to R2 with the pre-signed URL (never through the API).
   const up = pick.upload
@@ -96,4 +123,4 @@ async function run ({ api, token, body, log = console.log }) {
   return { job_id: pick.job_id, title: pick.title, bytes, status: ready.status }
 }
 
-module.exports = { toSeconds, sectionArg, resolveYtDlp, run }
+module.exports = { toSeconds, sectionArg, resolveYtDlp, hasVideo, FORMAT, run }
