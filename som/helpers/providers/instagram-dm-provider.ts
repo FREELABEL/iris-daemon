@@ -177,18 +177,14 @@ export class InstagramDmProvider {
       return { handle, status: 'failed', delivered: false, error: 'no DM input found' };
     }
 
+    // A dry run does not type: the person can see typing, and a draft can stay behind (#191666).
+    if (dryRun) return { handle, status: 'dry', delivered: false };
+
     await dmInput.click();
     await dmInput.fill(message).catch(async () => {
       await page.keyboard.type(message, { delay: 15 });
     });
     await page.waitForTimeout(1000);
-
-    if (dryRun) {
-      // Clear the composer so nothing lingers, and report without sending.
-      await page.keyboard.press('Control+a').catch(() => {});
-      await page.keyboard.press('Backspace').catch(() => {});
-      return { handle, status: 'dry', delivered: false };
-    }
 
     const sendBtn = page.locator('button:has-text("Send"):not([disabled])').first();
     if (await sendBtn.isVisible({ timeout: 3000 }).catch(() => false)) {

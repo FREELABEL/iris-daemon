@@ -401,25 +401,29 @@ async function resolveUserScriptBySlug (slug, expectedSha = null, cloud = null, 
   return { ...script, _verified: Boolean(expectedSha), _sha256: actual }
 }
 
-async function fetchDbCampaignConfigs () {
+// #191686 / #191770: a SEND must see the strategy `iris som campaign update` wrote a moment ago.
+// The 5-minute memo above served the previous answer to a batch started right after an update,
+// and a failed fetch fell back to the disk cache — also the previous answer. Sends pass
+// { fresh: true, requireDatabase: true }; everything else may keep using the memo.
+async function fetchDbCampaignConfigs ({ fresh = false, fetch: doFetch = fetch, identity } = {}) {
   const now = Date.now()
-  if (_dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
-    return _dbCampaignCache
+  if (!fresh && _dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
+    return { data: _dbCampaignCache }
   }
 
   const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
-  const { userId, token: apiToken } = resolveDaemonIdentity()
+  const { userId, token: apiToken } = identity || resolveDaemonIdentity()
 
   try {
     const url = `${apiBase}/api/v1/campaign-templates/daemon-configs?user_id=${userId}`
-    const res = await fetch(url, {
+    const res = await doFetch(url, {
       headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
       signal: AbortSignal.timeout(8000),
     })
 
     if (!res.ok) {
-      console.log(`[executor] DB campaign config API returned ${res.status} — falling back to som-config.js`)
-      return null
+      console.log(`[executor] DB campaign config API returned ${res.status}`)
+      return { error: `daemon-configs returned ${res.status}` }
     }
 
     const data = await res.json()
@@ -427,23 +431,30 @@ async function fetchDbCampaignConfigs () {
       _dbCampaignCache = data
       _dbCampaignCacheTs = now
       console.log(`[executor] Loaded ${Object.keys(data.configs).length} campaign configs from DB (source: ${data.source})`)
-      return data
+      return { data }
     }
 
-    return null
+    return { error: 'daemon-configs returned no campaigns' }
   } catch (err) {
-    console.log(`[executor] DB campaign config fetch failed: ${err.message} — falling back to som-config.js`)
-    return null
+    console.log(`[executor] DB campaign config fetch failed: ${err.message}`)
+    return { error: `daemon-configs fetch failed: ${err.message}` }
   }
+}
+
+function _resetCampaignConfigCache () {
+  _dbCampaignCache = null
+  _dbCampaignCacheTs = 0
 }
 
 /**
  * Get campaign configs — DB-first, som-config.js fallback.
- * Returns { configs: { id: { boardId, strategy, igAccount } }, activeAccounts: [...] }
+ * Returns { configs: { id: { boardId, strategy, igAccount } }, activeAccounts: [...], source }
+ *
+ * opts.fresh           — skip the 5-minute memo (every send)
+ * opts.requireDatabase — no som-config.js fallback: answer { source: 'unavailable', error } instead
  */
-async function getCampaignConfigs (freelabelRoot) {
-  // Try DB first
-  const dbData = await fetchDbCampaignConfigs()
+async function getCampaignConfigs (freelabelRoot, opts = {}) {
+  const { data: dbData, error } = await fetchDbCampaignConfigs(opts)
   if (dbData?.configs && Object.keys(dbData.configs).length > 0) {
     return {
       configs: dbData.configs,
@@ -451,6 +462,11 @@ async function getCampaignConfigs (freelabelRoot) {
       source: 'database',
     }
   }
+
+  if (opts.requireDatabase) {
+    return { configs: {}, activeAccounts: [], source: 'unavailable', error: error || 'daemon-configs unavailable' }
+  }
+  console.log('[executor] falling back to som-config.js')
 
   // Fallback to som-config.js — `freelabelRoot` here is the som dir
   // (batchRoot || batchBundledSomDir), so som-config.js sits alongside it,
@@ -2773,7 +2789,12 @@ class TaskExecutor {
 
           // ── Campaign config registry (DB-first, som-config.js fallback) ──
           // Phase 2: reads from iris-api /campaign-templates/daemon-configs
-          const { configs: somCampaignConfigs, source: configSource } = await getCampaignConfigs(freelabelRoot || bundledSomDir)
+          const { configs: somCampaignConfigs, source: configSource, error: configError } = await getCampaignConfigs(freelabelRoot || bundledSomDir, { fresh: true, requireDatabase: true })
+          if (configSource === 'unavailable') {
+            // #191770: without a fresh answer the script could be the one replaced by `iris som campaign update`.
+            reject(new Error(`SOM not run: could not confirm the campaign scripts (${configError}). Nothing was sent.`))
+            return
+          }
           console.log(`[executor] Campaign configs loaded from ${configSource}`)
 
           const campaignConfig = somCampaignConfigs[campaign]
@@ -3454,7 +3475,13 @@ async function call(method, p, body) {
             const batchWait = batchWaitArg ? parseInt(batchWaitArg.split('=')[1], 10) : 2
 
             const somDir = batchRoot || batchBundledSomDir
-            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(somDir)
+            const { configs: allConfigs, activeAccounts: activeAccountsList, source, error: configError } = await getCampaignConfigs(somDir, { fresh: true, requireDatabase: true })
+            if (source === 'unavailable') {
+              // #191770: the on-disk cache som-all reads is the PREVIOUS answer; running on it sent
+              // a replaced script. Refuse instead.
+              reject(new Error(`SOM batch not run: could not confirm the campaign scripts (${configError}). Nothing was sent.`))
+              return
+            }
             console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts, mode=${batchMode})`)
 
             // ── Bridge the disconnect (bug #133634) ──────────────────────────
@@ -5974,4 +6001,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }
+module.exports = { getCampaignConfigs, _resetCampaignConfigCache, ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }

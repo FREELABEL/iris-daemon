@@ -31,6 +31,9 @@ jobs:
       - name: Verify npm-script-backed tasks are shippable (catches missing discover/som scripts)
         run: node test/check-task-scripts.js
 
+      - name: a SOM dry run changes nothing (#191666)
+        run: node --test som/tests/dry-run-guard.test.js
+
       - name: file search engines on real Linux (scan, fallback, injection)
         run: node --test tests/disk-search-on-this-platform.test.js tests/disk-search.test.js tests/file-search-guard.test.js
 
@@ -83,6 +86,10 @@ jobs:
       - name: shell-for-platform unit tests
         shell: pwsh
         run: node --test tests/shell-for-platform.test.js
+
+      - name: local IRIS server credentials on real Windows (no mode or uid; pid and loopback still apply)
+        shell: pwsh
+        run: node --test tests/engine-auth-local-servers.test.js
 
       - name: file search engines on real Windows (Windows Search, scan, fallback, injection)
         shell: pwsh

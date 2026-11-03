@@ -5,10 +5,13 @@
 // can sit entirely past the ~300 rows the scan reaches: on 2026-10-21 the courses batch reported
 // "3 fresh via API but not visible", sent nothing and raised a false "leads exhausted" alert.
 // When that happens the batch opens those leads directly by id instead (API-direct).
-function leadSource ({ mode, allowListSize, uiEligible }) {
+function leadSource ({ mode, allowListSize, uiEligible, need = 1 }) {
   if (!allowListSize) return 'ui'
   if (mode === 'api') return 'api'
-  return uiEligible === 0 ? 'api-fallback' : 'ui'
+  // Fall back whenever the scan found FEWER than the batch needs, not only zero: on 2026-10-29 the
+  // creators scan reached 300 rows, found 3 "eligible" (all had replied) and sent nothing while the
+  // API held 7,691 fresh leads.
+  return uiEligible < Math.min(need, allowListSize) ? 'api-fallback' : 'ui'
 }
 
 // The API's "no outreach" list still holds leads DM'd before outreach steps were tracked; the

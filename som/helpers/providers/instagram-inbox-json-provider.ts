@@ -5,6 +5,8 @@ import {
   DiscoveryConfig,
   DiscoveryResult,
   dismissInstagramPopups, keepDiscovered } from './base-provider';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { REFUSED_TYPE } = require('../delivery-check');
 
 /**
  * Instagram Inbox (JSON) Provider — reads the DM inbox from the data the Instagram web app
@@ -28,6 +30,8 @@ export interface MailboxMessage {
   fromViewer: boolean;
   text: string;
   timestampMs: number;
+  /** Instagram's "this account can't receive your message": sent by us, typed by Instagram (#192164). */
+  refused?: boolean;
 }
 
 /** One DM thread as parsed from the mailbox payload. */
@@ -89,6 +93,7 @@ export function parseMailboxPayload(payload: any): MailboxThread[] {
         fromViewer: !!viewerFbid && String(n.sender_fbid) === viewerFbid,
         text: messageText(n),
         timestampMs: Number(n.timestamp_ms) || 0,
+        refused: REFUSED_TYPE.test(String(n.content_type || '')),
       }))
       .sort((a, b) => a.timestampMs - b.timestampMs);
 
@@ -138,6 +143,7 @@ export function threadToProfile(t: MailboxThread): DiscoveredProfile {
   const lines = t.messages.map(m =>
     `${m.fromViewer ? 'me' : t.username}: ${m.text.replace(/\s+/g, ' ')} [${new Date(m.timestampMs).toISOString()}]`);
   const lastThem = [...t.messages].reverse().find(m => !m.fromViewer);
+  const refusal = [...t.messages].reverse().find(m => m.refused);
   return {
     username: t.username,
     platform: 'instagram',
@@ -154,6 +160,8 @@ export function threadToProfile(t: MailboxThread): DiscoveredProfile {
       hasTheirMessage: t.messages.some(m => !m.fromViewer),
       lastActivityAt: t.lastActivityMs ? new Date(t.lastActivityMs).toISOString() : null,
       handleIsExact: true,
+      cantReceive: !!refusal,
+      cantReceiveAt: refusal?.timestampMs ? new Date(refusal.timestampMs).toISOString() : null,
     },
   };
 }

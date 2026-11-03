@@ -25,6 +25,7 @@ export interface ApiResponse {
   success: boolean;
   duplicate?: boolean;
   owned?: boolean;            // refused: the handle is one of our own accounts (#191633)
+  status?: number;            // HTTP status, where a caller must tell a refusal from a failure
   message?: string;
   data?: any;
 }
@@ -573,6 +574,8 @@ export class LeadgenApiClient {
     bloq_id?: number;
     ig_handle?: string;
     step_index?: number;
+    /** 'reply' ties a one-off reply to the message it answers (#191637). Omit for a campaign send. */
+    kind?: 'message' | 'reply';
   }): Promise<ApiResponse> {
     try {
       const resp = await fetch(`${BASE_URL}/leads/${leadId}/outreach/record-dm`, {
@@ -585,8 +588,45 @@ export class LeadgenApiClient {
         body: JSON.stringify(data),
       });
       const json = await resp.json();
-      return { success: resp.ok, data: json, message: json.message };
+      // Also write the lead's comms log, the record the lead timeline shows. record-dm only writes the
+      // outreach message, so every SOM and hand-approved DM was missing from comms (2026-10-29: 0 of 0
+      // comms on leads 30313 and 30316 despite a sent DM). Best effort: a comms failure never fails a send.
+      // A refused reply (422) stored nothing and writes nothing here: recordReply retries it as a
+      // plain message, which logs it once.
+      if (data.kind === 'reply' && resp.status === 422) {
+        return { success: false, status: 422, data: json, message: json.message };
+      }
+      const comms = await this.logComms(leadId, {
+        body: data.message, channel: 'instagram', direction: 'outbound',
+        subject: `IG DM from @${data.channel_account}`,
+        metadata: { logged_via: 'som record-dm', channel_account: data.channel_account, campaign: data.campaign_name ?? null, step_index: data.step_index ?? null },
+      });
+      return { success: resp.ok, status: resp.status, data: { ...json, comms_logged: comms.success }, message: json.message };
     } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
+   * Write one entry to the lead's comms log (POST /api/v1/atlas/comms/log, as `iris comms log` does).
+   */
+  async logComms(leadId: number, entry: {
+    body: string; channel: string; direction: 'outbound' | 'inbound'; subject?: string; sentAt?: string; metadata?: Record<string, any>;
+  }): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}/atlas/comms/log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}`, 'Accept': 'application/json' },
+        body: JSON.stringify({
+          lead_id: leadId, channel: entry.channel, direction: entry.direction, body: entry.body,
+          subject: entry.subject ?? null, sent_at: entry.sentAt ?? new Date().toISOString(),
+          metadata: entry.metadata ?? {},
+        }),
+      });
+      if (!resp.ok) console.log(`    ⚠ comms log HTTP ${resp.status} for lead #${leadId}`);
+      return { success: resp.ok };
+    } catch (err: any) {
+      console.log(`    ⚠ comms log failed for lead #${leadId}: ${err.message}`);
       return { success: false, message: err.message };
     }
   }
@@ -745,6 +785,35 @@ export class LeadgenApiClient {
       });
       const result = await resp.json();
       return { success: resp.ok, data: result, message: result.message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /** Remove a lead's outreach steps so it returns to the fresh pool (#192164). */
+  async clearSteps(leadId: number): Promise<ApiResponse> {
+    return this.write('DELETE', `/leads/${leadId}/outreach-steps-clear`);
+  }
+
+  /** Mark a completed step as not done: the DM it recorded was refused (#192164). */
+  async reopenStep(leadId: number, stepId: number): Promise<ApiResponse> {
+    return this.write('PUT', `/leads/${leadId}/outreach-steps/${stepId}`, { is_completed: false });
+  }
+
+  /** The endpoint requires the text, so it is sent back unchanged with the new status (#192164). */
+  async updateMessage(leadId: number, messageId: number, message: string, status: string): Promise<ApiResponse> {
+    return this.write('PUT', `/leads/${leadId}/outreach/messages/${messageId}`, { message, status });
+  }
+
+  private async write(method: string, urlPath: string, body?: Record<string, any>): Promise<ApiResponse> {
+    try {
+      const resp = await fetch(`${BASE_URL}${urlPath}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}`, 'Accept': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const data = await resp.json().catch(() => ({}));
+      return { success: resp.ok, data, message: data.message };
     } catch (err: any) {
       return { success: false, message: err.message };
     }

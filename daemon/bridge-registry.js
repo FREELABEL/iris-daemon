@@ -246,6 +246,10 @@ const PROVIDERS = {
       if (!appExists('Mail.app')) return { ok: false, reason: 'Mail.app is not installed' }
       return { ok: true }
     },
+    // The Mail.app accounts on this Mac (name, id, addresses) — never launches Mail (#191879).
+    accounts () {
+      return require('./mail-accounts').mailAccountsSnapshot()
+    },
     functions: {
       // `search_emails`, not `search` — matches fl-api's published name (#178748).
       search_emails: { method: 'GET', path: '/api/mail/search' },
@@ -256,6 +260,10 @@ const PROVIDERS = {
       // check that only runs on the developer's laptop is the "works here, dead in production"
       // failure this rail exists to remove.
       list_accounts: { method: 'GET', path: '/api/mail/accounts' },
+      // READ — one message with its body. Bodies were unreachable off the Mac (#189480).
+      read_email: { method: 'GET', path: '/api/mail/message' },
+      // WRITE — a reply IN THE THREAD, built by Mail's own `reply` command (#189480).
+      reply_email: { method: 'POST', path: '/api/mail/reply' },
     },
   },
 
@@ -324,6 +332,15 @@ function capabilities () {
       reason: probe.ok ? null : (probe.reason || 'unavailable'),
       detail: probe.detail || null,
       functions: Object.keys(provider.functions),
+    }
+    // WHICH mailboxes, not just "has Mail" (#191879): the CLI routes `--mail-account <address>`
+    // to the Mac that holds it. Names, ids and addresses only; read from a background cache.
+    if (key === 'apple_mail' && typeof provider.accounts === 'function') {
+      try {
+        Object.assign(out[key], provider.accounts())
+      } catch (e) {
+        Object.assign(out[key], { accounts: null, accounts_checked_at: null, accounts_reason: `accounts probe failed: ${e.message}` })
+      }
     }
   }
   return out

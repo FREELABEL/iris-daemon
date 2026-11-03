@@ -50,3 +50,11 @@ test('one run never pages past the cap, however big the board', () => {
   assert.strictEqual(shouldFetchNextPage({ page: MAX_CANDIDATE_PAGES, lastPage: 173 }), false)
   assert.strictEqual(shouldFetchNextPage({ page: 2, lastPage: 173 }, 2), false)
 })
+
+// 2026-10-29: the creators scan found 3 "eligible" rows (all had replied) out of 300 while the API held
+// 7,691 fresh leads; the batch only fell back on ZERO and sent nothing. Fewer than needed must fall back.
+test('falls back to the API when the scan finds fewer than the batch needs', () => {
+  assert.strictEqual(leadSource({ allowListSize: 7691, uiEligible: 3, need: 25 }), 'api-fallback')
+  assert.strictEqual(leadSource({ allowListSize: 7691, uiEligible: 30, need: 25 }), 'ui')
+  assert.strictEqual(leadSource({ allowListSize: 2, uiEligible: 2, need: 25 }), 'ui')
+})

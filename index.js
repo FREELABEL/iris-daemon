@@ -2339,6 +2339,119 @@ app.get('/api/mail/message', async (req, res) => {
 })
 
 /**
+ * GET /api/mail/message?id=<message id>
+ * One message: envelope from the index, body from its .emlx (#189480). The id is the `id`
+ * field /api/mail/search returns. Bodies were unreachable off the Mac before this.
+ */
+app.get('/api/mail/message', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: `Apple Mail is macOS-only — this machine is ${process.platform}`, reason_code: 'not_macos' })
+  }
+  const maxBody = Math.max(200, Math.min(100000, parseInt(req.query.max_body || '20000', 10)))
+  try {
+    const store = require('./drivers/apple-mail-store')
+    const env = await store.messageById(req.query.id)
+    if (!env) return res.status(404).json({ error: `No message with id ${req.query.id} in the Mail index` })
+    const { readBody } = require('./drivers/apple-mail-body')
+    let body = null
+    let bodyError = null
+    try {
+      body = readBody(env.id, env.mailbox)
+    } catch (e) {
+      // The envelope is still worth returning; the missing body is NAMED, never an empty string.
+      bodyError = e.message
+    }
+    res.json({
+      id: env.id,
+      subject: env.subject,
+      sender: env.sender,
+      sender_name: env.sender_name,
+      date_sent: env.sent_at ? env.sent_at.toISOString() : null,
+      mailbox: env.mailbox,
+      message_id_header: body ? body.messageIdHeader : null,
+      body: body ? body.text.slice(0, maxBody) : null,
+      body_truncated: body ? body.text.length > maxBody : false,
+      partial: body ? body.partial : false,
+      ...(bodyError ? { body_error: bodyError } : {}),
+    })
+  } catch (err) {
+    const bad = /message id must be/i.test(err.message)
+    if (!bad) logDriverError('mail/message', err, { store: 'Mail' })
+    res.status(bad ? 400 : 503).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/mail/reply
+ * Body: { message_id, body_text, reply_all?, draft?, from_email? }
+ *
+ * A reply IN THE THREAD (#189480). /api/mail/send always made a new message, so a reply sent
+ * through IRIS reached the recruiter as a separate email. This builds it with Mail's own
+ * `reply` command from the original message, which is what sets In-Reply-To / References.
+ */
+app.post('/api/mail/reply', async (req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: `Apple Mail is macOS-only — this machine is ${process.platform}`, reason_code: 'not_macos' })
+  }
+  const { message_id, body_text, reply_all, draft, from_email } = req.body || {}
+  if (!message_id || !body_text) {
+    return res.status(400).json({ error: 'message_id and body_text are required' })
+  }
+
+  const { parseMailboxUrl, buildReplyScript } = require('./lib/mail-reply')
+  let env
+  let script
+  try {
+    env = await require('./drivers/apple-mail-store').messageById(message_id)
+    if (!env) return res.status(404).json({ error: `No message with id ${message_id} in the Mail index` })
+    const { accountId, mailboxPath } = parseMailboxUrl(env.mailbox)
+
+    // Same rule as /api/mail/send: an address Mail.app does not have is refused, never quietly
+    // replaced by the default account.
+    let fromAddress
+    if (from_email) {
+      const known = (await listMailAccounts()).flatMap((a) => a.addresses)
+      fromAddress = known.find((a) => a.toLowerCase() === String(from_email).trim().toLowerCase())
+      if (!fromAddress) {
+        return res.status(422).json({ error: `Mail.app has no account for "${from_email}" — refusing.`, available_addresses: known })
+      }
+    }
+
+    script = buildReplyScript({
+      accountId, mailboxPath, messageId: env.id, body: body_text,
+      replyAll: reply_all === true || reply_all === 'true',
+      draft: draft === true || draft === 'true',
+      fromAddress,
+    })
+  } catch (err) {
+    return res.status(/message id must be|cannot reply/i.test(err.message) ? 400 : 503).json({ error: err.message })
+  }
+
+  if (!(await ensureMailRunning())) {
+    return res.status(503).json({ error: 'Mail.app could not be launched or is not scriptable. Open Mail and retry.' })
+  }
+
+  const isDraft = draft === true || draft === 'true'
+  try {
+    await new Promise((resolve, reject) => {
+      require('child_process').execFile('/usr/bin/osascript', ['-e', script], { timeout: 30000 }, (err, stdout, stderr) => {
+        if (err) reject(new Error((stderr || err.message).trim()))
+        else resolve(stdout)
+      })
+    })
+    console.log(`[apple-mail] ${isDraft ? 'Drafted reply' : 'Replied'} to ${env.sender}: ${env.subject}`)
+    res.json({
+      ok: true, provider: 'apple-mail', mode: isDraft ? 'draft' : 'sent', threaded: true,
+      in_reply_to: env.id, to_email: env.sender, subject: env.subject,
+    })
+  } catch (err) {
+    const msg = err.message.includes('-1743') ? 'Mail.app automation not authorized. Grant access in System Settings > Privacy & Security > Automation.' : err.message
+    console.error(`[apple-mail] Reply failed: ${msg}`)
+    res.status(500).json({ error: `Apple Mail reply failed: ${msg}` })
+  }
+})
+
+/**
  * GET /api/imessage/search
  * Read recent iMessages directly from ~/Library/Messages/chat.db (read-only).
  * Query: ?handle=<email_or_phone>&days=14&limit=100
@@ -2654,11 +2767,20 @@ app.get('/api/mail/search', async (req, res) => {
     return res.status(400).json({ error: 'from (or subject) query param is required' })
   }
 
+  // Said BEFORE touching the index. Without it a Linux box answered "Mail Envelope Index not
+  // found — is Mail.app configured on this Mac?" — wrong (not a Mac), and it read as a setup
+  // problem to fix here rather than "ask the Hive node that has Mail" (#189480).
+  if (process.platform !== 'darwin') {
+    return res.status(503).json({ error: `Apple Mail is macOS-only — this machine is ${process.platform}`, reason_code: 'not_macos' })
+  }
+
   try {
     const store = require('./drivers/apple-mail-store')
     const emails = await store.searchEmails({ from, subject, days, limit })
     res.json({
       emails: emails.map((e) => ({
+        // Mail's message id — what /api/mail/message and /api/mail/reply take (#189480).
+        id: e.id,
         subject: e.subject,
         sender: e.sender,
         sender_name: e.sender_name,
@@ -3317,29 +3439,11 @@ function sessionServerCandidatesAsync() {
   })
 }
 
-// Unknown paths on these servers answer 200 with the web UI's HTML; only JSON is an answer.
-async function fetchJsonFromSessionServer (url, timeoutMs) {
-  // With Desktop's password when it published one (#190647); no header otherwise, as before.
-  const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
-  if (!r.ok || !String(r.headers.get('content-type') || '').includes('application/json')) return null
-  return r.json()
-}
+// Credentials, refusals and the JSON-only rule live in lib/server-sessions.js (#190647, #192113).
+const fetchJsonFromSessionServer = (url, timeoutMs, refused) => require('./lib/server-sessions').fetchSessionServerJson(url, timeoutMs, refused)
 
-// Asserts on the BODY, never the status: unknown paths on these servers return HTTP 200 with the
-// web UI's HTML, so a status check calls any open port a session server. Requiring the returned
-// id to match also rules out a 200 describing somebody else's session.
-async function findLiveSessionServer(sid, timeoutMs = 1500) {
-  for (const base of sessionServerCandidates()) {
-    try {
-      const url = `${base}/session/${encodeURIComponent(sid)}`
-      const r = await fetch(url, { headers: require('./lib/engine-auth').engineHeaders(url), signal: AbortSignal.timeout(timeoutMs) })
-      if (!r.ok) continue
-      const b = await r.json()
-      if (b && typeof b === 'object' && b.id === sid) return base
-    } catch { /* unreachable, non-JSON, or timed out — try the next */ }
-  }
-  return null
-}
+// Asserts on the BODY, never the status; see findSessionServer. Resolves { base, refused }.
+const findLiveSessionServer = (sid, timeoutMs = 1500) => require('./lib/server-sessions').findSessionServer(sid, sessionServerCandidates(), timeoutMs)
 
 app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const { message, submit, from } = req.body
@@ -3347,7 +3451,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
   const provenance = require('./lib/message-provenance').cleanProvenance(req.body && req.body.provenance)
   const sid = req.params.id
 
-  const base = await findLiveSessionServer(sid)
+  const { base, refused } = await findLiveSessionServer(sid)
+  if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sid, refused))
   if (!base) {
     // Say which of the two things is true, because they have different fixes: the session is not
     // running on this node, or no session server is reachable here at all. Never fall back to the
@@ -3400,7 +3505,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
     if (!r.ok) {
       const t = await r.text().catch(() => '')
       console.error(`[opencode] Live delivery failed: HTTP ${r.status} ${t.slice(0, 200)}`)
-      return res.status(502).json({ error: `live delivery to ${base} failed: HTTP ${r.status}`, session_id: sid })
+      const why = require('./lib/engine-auth').refusalReason(base, r.status)
+      return res.status(502).json({ error: why || `live delivery to ${base} failed: HTTP ${r.status}`, session_id: sid })
     }
 
     res.json({
@@ -3427,7 +3533,8 @@ app.post('/api/sessions/opencode/:id/message', async (req, res) => {
 app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
   const sid = req.params.id
   try {
-    const base = await findLiveSessionServer(sid)
+    const { base, refused } = await findLiveSessionServer(sid)
+    if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sid, refused))
     if (!base) return res.status(404).json({ error: `No live session server on this node is running ${sid}.`, session_id: sid })
     const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sid)}`, 3000)
     const dir = meta && meta.directory
@@ -3446,7 +3553,8 @@ app.post('/api/sessions/opencode/:id/answer', async (req, res) => {
     })
     if (!resp.ok) {
       const t = await resp.text().catch(() => '')
-      return res.status(502).json({ error: `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
+      const why = require('./lib/engine-auth').refusalReason(base, resp.status)
+      return res.status(502).json({ error: why || `the session server refused the answer: HTTP ${resp.status} ${t.slice(0, 200)}`, session_id: sid })
     }
     const delivered = pending.waiting.opencode.type === 'permission' ? `permission: ${r.body.reply}` : `answered ${r.body.answers.length} question(s)`
     console.log(`[opencode] answer ${sid.slice(-8)} -> ${delivered}`)
@@ -3469,7 +3577,8 @@ app.get('/api/sessions/opencode/:id/history', async (req, res) => {
     const desktop = desktopSessionHistory(sessionId, { limit })
     if (desktop) return res.json(desktop)
     try {
-      const base = await findLiveSessionServer(sessionId)
+      const { base, refused } = await findLiveSessionServer(sessionId)
+      if (!base && refused.length) return res.status(502).json(require('./lib/server-sessions').refusedBody(sessionId, refused))
       if (base) {
         const { historyFromServerMessages } = require('./lib/server-sessions')
         const meta = await fetchJsonFromSessionServer(`${base}/session/${encodeURIComponent(sessionId)}`, 3000)
@@ -4229,7 +4338,11 @@ app.get('/api/sessions/opencode', async (req, res) => {
     const { listServerSessions, mergeSessionRows } = require('./lib/server-sessions')
     const servers = await sessionServerCandidatesAsync()
     timer.mark('find_servers')
-    const fromServers = await listServerSessions({ servers, fetchJson: fetchJsonFromSessionServer, limit })
+    // A server that refused contributes nothing, like one that is down, so say so in the answer.
+    const refused = []
+    const askServer = (url, timeoutMs) => fetchJsonFromSessionServer(url, timeoutMs, refused)
+    const refusedField = () => (refused.length ? { servers_refused: refused } : {})
+    const fromServers = await listServerSessions({ servers, fetchJson: askServer, limit })
     timer.mark('ask_servers')
     // Freshest row wins per id, gaps filled from the others.
     const page = mergeSessionRows(mergeSessionRows(sessions, desktop), fromServers.rows, limit)
@@ -4240,7 +4353,7 @@ app.get('/api/sessions/opencode', async (req, res) => {
     // unmeasured, never "idle" — because only the server running a session reports it.
     if (req.query.live === '1') {
       const { opencodeActivity } = require('./lib/opencode-activity')
-      const live = await opencodeActivity({ sessions: page, servers, fetchJson: fetchJsonFromSessionServer })
+      const live = await opencodeActivity({ sessions: page, servers, fetchJson: askServer })
       timer.mark('live_activity')
       for (const s of page) s.activity = live.activity[s.session_id] || null
       // A permission prompt or question the engine is HOLDING for a person (#190649) — reported in
@@ -4251,13 +4364,13 @@ app.get('/api/sessions/opencode', async (req, res) => {
       const recentDirs = page
         .filter((s) => s.project_path && Date.now() - Date.parse(s.updated_at || 0) <= ACTIVITY_WINDOW_MS)
         .map((s) => s.project_path)
-      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: fetchJsonFromSessionServer })
+      const pending = await pendingBySession({ servers, directories: recentDirs, fetchJson: askServer })
       timer.mark('pending_questions')
       for (const s of page) { const p = pending.get(s.session_id); if (p) s.waiting = p.waiting }
-      return finish({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered })
+      return finish({ sessions: page, activity_checked: { servers: live.servers, directories: live.directories, errors: live.errors }, servers_answered: fromServers.answered, ...refusedField() })
     }
 
-    finish({ sessions: page, servers_answered: fromServers.answered })
+    finish({ sessions: page, servers_answered: fromServers.answered, ...refusedField() })
   } catch (err) {
     console.log(`[opencode] List sessions failed: ${err.message}`)
     finish({ sessions: [], error: err.message })

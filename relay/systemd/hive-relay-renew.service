@@ -1,8 +1,18 @@
 [Unit]
 Description=Renew the Hive relay certificate (DNS-01) and hot-reload it
+# Any failure below (renewal, reload, or the served-certificate check) files an alert (#191664).
+OnFailure=hive-relay-alert@%N.service
 
 [Service]
 Type=oneshot
 User=siralexmayo
-ExecStart=/bin/sh -c 'CF_DNS_API_TOKEN=$(cat /home/siralexmayo/.iris/secrets/cloudflare-dns.token) /home/siralexmayo/.iris/relay/bin/lego renew --path /home/siralexmayo/.iris/relay/acme --domains relay.t.heyiris.io --dns cloudflare --dns.resolvers 1.1.1.1:53 --days 30 --log.format text'
+# lego 5.x CLI (installed at ~/.iris/relay/bin/lego). lego 5 removed `renew`: `run` obtains AND
+# renews, and only contacts the CA when the certificate is due. Written for lego 4
+# (`renew ... --days 30`), this unit failed every day from its first run (#191664).
+# --renew-days 30 is explicit on purpose: the expiry alert fires under 21 days, so renewal must
+# always start well before that, whatever lifetime the CA hands out.
+ExecStart=/bin/sh -c 'CF_DNS_API_TOKEN=$(cat /home/siralexmayo/.iris/secrets/cloudflare-dns.token) exec /home/siralexmayo/.iris/relay/bin/lego --log.format text run --path /home/siralexmayo/.iris/relay/acme --domains relay.t.heyiris.io --dns cloudflare --dns.resolvers 1.1.1.1:53 --renew-days 30'
+# The relay re-reads its certificate on SIGHUP — live tunnels are not dropped.
 ExecStartPost=+/bin/systemctl reload hive-relay
+# Check the certificate the relay actually SERVES, not the file: fails (and alerts) under 21 days.
+ExecStartPost=/usr/bin/node /home/siralexmayo/.iris/relay/app/relay/cert-check.js

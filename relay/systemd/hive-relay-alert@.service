@@ -1,0 +1,7 @@
+[Unit]
+Description=Alert: %i.service failed (Hive relay) — files/updates an IRIS bug (#191664)
+
+[Service]
+Type=oneshot
+User=siralexmayo
+ExecStart=/bin/sh /home/siralexmayo/.iris/relay/app/relay/alert.sh %i

@@ -59,8 +59,8 @@ function query(sql) {
   })
 }
 
-/** Search recent mail by sender substring, optionally by subject. */
-async function searchEmails({ from = '', days = 14, limit = 20, subject = '' } = {}) {
+/** The search query. Pure, so the shape (ids included) is tested without a Mail index. */
+function searchSql ({ from = '', days = 14, limit = 20, subject = '' } = {}) {
   const lim = Math.max(1, Math.min(200, Math.floor(Number(limit) || 20)))
   const d = Math.max(1, Math.min(365, Math.floor(Number(days) || 14)))
   const esc = (s) => String(s).replace(/'/g, "''")
@@ -69,8 +69,11 @@ async function searchEmails({ from = '', days = 14, limit = 20, subject = '' } =
   if (from) where.push(`a.address LIKE '%${esc(from)}%'`)
   if (subject) where.push(`s.subject LIKE '%${esc(subject)}%'`)
 
-  const rows = await query(`
-    SELECT s.subject   AS subject,
+  // m.ROWID is Mail's own message id — the same number AppleScript's `message id N` takes.
+  // It was not selected before, so nothing downstream could reply to or open a result (#189480).
+  return `
+    SELECT m.ROWID     AS id,
+           s.subject   AS subject,
            a.address   AS sender,
            a.comment   AS sender_name,
            m.date_sent AS date_sent,
@@ -82,16 +85,48 @@ async function searchEmails({ from = '', days = 14, limit = 20, subject = '' } =
      WHERE ${where.join(' AND ')}
      ORDER BY m.date_sent DESC
      LIMIT ${lim};
-  `)
+  `
+}
 
-  return rows.map((r) => ({
+/** One message's envelope by id. The id is validated here because it is interpolated. */
+function messageByIdSql (id) {
+  const n = Number(id)
+  if (!Number.isInteger(n) || n <= 0 || String(id).trim() !== String(n)) {
+    throw new Error(`message id must be a positive integer, got "${id}"`)
+  }
+  return `
+    SELECT m.ROWID AS id, s.subject AS subject, a.address AS sender, a.comment AS sender_name,
+           m.date_sent AS date_sent, mb.url AS mailbox
+      FROM messages m
+      LEFT JOIN subjects  s  ON s.ROWID  = m.subject
+      LEFT JOIN addresses a  ON a.ROWID  = m.sender
+      LEFT JOIN mailboxes mb ON mb.ROWID = m.mailbox
+     WHERE m.ROWID = ${n}
+     LIMIT 1;
+  `
+}
+
+function toEnvelope (r) {
+  return {
+    id: r.id == null ? null : Number(r.id),
     subject: r.subject == null ? '(no subject)' : String(r.subject),
     sender: r.sender == null ? '' : String(r.sender),
     sender_name: r.sender_name == null ? '' : String(r.sender_name),
     // date_sent is a plain Unix timestamp here, unlike the Core Data stores.
     sent_at: r.date_sent ? new Date(Number(r.date_sent) * 1000) : null,
     mailbox: r.mailbox == null ? '' : String(r.mailbox),
-  }))
+  }
+}
+
+/** Search recent mail by sender substring, optionally by subject. */
+async function searchEmails (opts = {}) {
+  return (await query(searchSql(opts))).map(toEnvelope)
+}
+
+/** One message's envelope, or null if the index has no such id. */
+async function messageById (id) {
+  const rows = await query(messageByIdSql(id))
+  return rows.length ? toEnvelope(rows[0]) : null
 }
 
 async function probeUnavailable() {
@@ -108,4 +143,4 @@ async function probeUnavailable() {
   }
 }
 
-module.exports = { searchEmails, probeUnavailable, storePath }
+module.exports = { searchEmails, messageById, searchSql, messageByIdSql, probeUnavailable, storePath }
