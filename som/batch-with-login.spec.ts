@@ -7,14 +7,16 @@ import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
-import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage } from './lead-selection';
-import { leadOutcome, timingStatus, unconfirmedNote, outcomeLine } from './lead-outcome'; // countsTowardDailyCap: the cap file is only written for a send that may have arrived
+import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage, dropUndeliverable } from './lead-selection';
+import { leadOutcome, timingStatus, unconfirmedNote, outcomeLine, markContacted } from './lead-outcome'; // countsTowardDailyCap: the cap file is only written for a send that may have arrived
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const dmGuard = require('./helpers/dm-guard'); // #192164
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkDelivery } = require('./helpers/delivery-check'); // #192164
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkStrategy, describeFailure } = require('./helpers/strategy-check');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const exactText = require('./helpers/exact-text'); // #192413
 const igAccounts = require('./helpers/ig-accounts');
 const { installDryRunGuard, stubApiWrites, applyTargetStrategy } = require('./helpers/dry-run-guard');
 import { runInboxScan, fetchBoardLeads, printSummary, sendResultAlert, persistUnmatchedReplies, type ScanConfig, type Lead as InboxLead } from './helpers/inbox-scanner';
@@ -287,6 +289,21 @@ function recordLinkedInDmSent(leadId?: number | null): void {
 const JOURNAL = dmGuard.journalFile();
 const JOURNAL_ACCOUNT = IS_LINKEDIN ? 'linkedin' : IG_ACCOUNT;
 const CROSS_ACCOUNT_RETRY = process.env.SOM_CROSS_ACCOUNT_RETRY === '1'; // off until the owner decides
+
+// #192412: leads already marked undeliverable never enter the candidate list, so they cannot take a batch slot.
+const deliverableIds = (leads: any[], label: string): number[] => {
+  const { keep, dropped } = dropUndeliverable(leads, JOURNAL_ACCOUNT, { crossAccount: CROSS_ACCOUNT_RETRY });
+  if (dropped.length) console.log(`  ⏭️  ${dropped.length} ${label} lead(s) already marked undeliverable for @${JOURNAL_ACCOUNT} — left out`);
+  return keep.map((l: any) => l.id);
+};
+
+// #192414: a confirmed DM moves the lead to Contacted (never backwards). Dry runs never get here ('sent' only).
+const promoteToContacted = async (api: any, leadId: number | null | undefined, outcome: string) => {
+  if (!leadId || outcome !== 'sent' || DRY_RUN) return;
+  const r = await markContacted(api, leadId, outcome);
+  if (r.updated) console.log(`  ✓ Lead #${leadId} status ${r.from || '(none)'} → Contacted`);
+  else console.log(`  · Lead #${leadId} status left as is: ${r.reason}`);
+};
 const journalOutcome = (leadId: number | null | undefined, outcome: string, kind?: string) => {
   if (!leadId || DRY_RUN || outcome === 'dry-run') return;
   try {
@@ -647,7 +664,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (freshRes.ok) {
         const freshData = await freshRes.json();
         const leads = freshData.data?.data || freshData.data || [];
-        const ids = leads.map((l: any) => l.id).filter(Boolean);
+        const ids = deliverableIds(leads, 'fresh');
         apiFilteredIds = new Set(ids);
         candidatePaging = { url: freshUrl, page: 1, lastPage: freshData.last_page || freshData.data?.last_page || 1 };
         const totalFresh = freshData.data?.total || freshData.total || ids.length;
@@ -663,7 +680,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             if (pendingRes.ok) {
               const pendingData = await pendingRes.json();
               const pendingLeads = pendingData.data?.data || pendingData.data || [];
-              const pendingIds = pendingLeads.map((l: any) => l.id).filter(Boolean);
+              const pendingIds = deliverableIds(pendingLeads, 'pending');
               if (pendingIds.length > 0) {
                 apiFilteredIds = new Set(pendingIds);
                 candidatePaging = { url: pendingUrl, page: 1, lastPage: pendingData.last_page || pendingData.data?.last_page || 1 };
@@ -796,7 +813,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             { headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' } });
           if (!res.ok) { console.log(`  Next candidate page failed: ${res.status}`); return false; }
           const body = await res.json();
-          const more = (body.data?.data || body.data || []).map((l: any) => l.id).filter((id: number) => id && !apiLeadIds.includes(id));
+          const more = deliverableIds(body.data?.data || body.data || [], 'next-page').filter((id: number) => !apiLeadIds.includes(id));
           if (more.length === 0) continue;
           apiLeadIds.push(...more);
           console.log(`\n⚡ ${results.sent + results.failed}/${directLimit} done after ${apiLeadIds.length - more.length} candidates — fetched page ${candidatePaging.page}/${candidatePaging.lastPage} (+${more.length})`);
@@ -1468,6 +1485,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
           await recordUndeliverable(leadId, leadData, igHandle, apiUndeliverable, apiKind || 'no-route');
         } else {
           journalOutcome(leadId, apiOutcome);
+          await promoteToContacted(apiClient, leadId, apiOutcome);
         }
         console.log(outcomeLine(name, apiOutcome, ((Date.now() - leadStart) / 1000).toFixed(1), apiUndeliverable || apiUnknown));
         leadTimings.push({ name, duration: (Date.now() - leadStart) / 1000, status: timingStatus(apiOutcome) });
@@ -2647,6 +2665,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         await recordUndeliverable(rowAttrs.id, uiLead, rowAttrs.igHandle, undeliverableReason, uiKind);
       } else {
         journalOutcome(rowAttrs.id, outcome);
+        await promoteToContacted(apiClient, rowAttrs.id, outcome);
       }
       console.log(outcomeLine(name, outcome, leadDuration, undeliverableReason || deliveredUnknownReason));
       leadTimings.push({ name, duration: parseFloat(leadDuration), status: timingStatus(outcome) });

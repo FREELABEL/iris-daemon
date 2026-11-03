@@ -77,9 +77,8 @@ function dmGate ({ lead = {}, notes = [], messages = [], account, firstContact =
   if (mine.filter(e => e.event === 'outcome' && e.outcome === 'failed').length >= MAX_FAILED) return block('failed-repeatedly', `failed ${MAX_FAILED} times from this account`)
 
   const turnedAway = undeliverableAccounts(lead, notes)
-  const own = turnedAway[here]
-  if (own && own.kind === 'refused') return block('undeliverable-this-account', 'Instagram refused it from this account')
-  if (own && (!own.at || now - new Date(own.at).getTime() < NO_ROUTE_COOLDOWN_MS)) return block('undeliverable-cooldown', 'no way to message them last time')
+  const ownBlock = turnedAwayHere(turnedAway, here, now)
+  if (ownBlock) return block(ownBlock.code, ownBlock.reason)
 
   for (const n of notes) {
     const text = noteText(n)
@@ -91,8 +90,9 @@ function dmGate ({ lead = {}, notes = [], messages = [], account, firstContact =
     }
   }
 
-  const elsewhere = Object.entries(turnedAway).filter(([a, v]) => a !== here && v.kind === 'refused').map(([a]) => a)
-  if (elsewhere.length && (!crossAccount || elsewhere.length > 1)) return block('undeliverable-other-account', 'refused from another account; retrying from another is off or already used')
+  const elsewhere = refusedElsewhere(turnedAway, here)
+  const elseBlock = turnedAwayElsewhere(elsewhere, crossAccount)
+  if (elseBlock) return block(elseBlock.code, elseBlock.reason)
 
   if (firstContact) {
     const counts = a => !elsewhere.includes(String(a || '').toLowerCase())
@@ -103,6 +103,41 @@ function dmGate ({ lead = {}, notes = [], messages = [], account, firstContact =
     }
   }
   return { allow: true, code: 'ok', reason: '' }
+}
+
+// The two undeliverable rules, shared by dmGate (per lead, with notes) and lead selection (#192412: the
+// candidate list, custom field only) so a batch never spends a slot opening a lead the gate would refuse.
+function turnedAwayHere (turnedAway, here, now = Date.now()) {
+  const own = turnedAway[String(here || '').toLowerCase()]
+  if (own && own.kind === 'refused') return { code: 'undeliverable-this-account', reason: 'Instagram refused it from this account' }
+  if (own && (!own.at || now - new Date(own.at).getTime() < NO_ROUTE_COOLDOWN_MS)) return { code: 'undeliverable-cooldown', reason: 'no way to message them last time' }
+  return null
+}
+
+function refusedElsewhere (turnedAway, here) {
+  const h = String(here || '').toLowerCase()
+  return Object.entries(turnedAway).filter(([a, v]) => a !== h && v.kind === 'refused').map(([a]) => a)
+}
+
+function turnedAwayElsewhere (elsewhere, crossAccount) {
+  if (elsewhere.length && (!crossAccount || elsewhere.length > 1)) return { code: 'undeliverable-other-account', reason: 'refused from another account; retrying from another is off or already used' }
+  return null
+}
+
+/**
+ * Would dmGate turn this lead away for being undeliverable, judged from the lead record alone (the
+ * dm_undeliverable custom field, plus the DM Undeliverable tag for a lead marked without the field)?
+ * Notes are not in the list response, so this can only skip MORE leads the gate would skip, never fewer.
+ */
+function undeliverableSkip (lead, account, { crossAccount = false, now = Date.now() } = {}) {
+  const turnedAway = undeliverableAccounts(lead, [])
+  const own = turnedAwayHere(turnedAway, account, now)
+  if (own) return own
+  const elsewhere = turnedAwayElsewhere(refusedElsewhere(turnedAway, account), crossAccount)
+  if (elsewhere) return elsewhere
+  const tagged = (lead && Array.isArray(lead.tags) ? lead.tags : []).some(t => t && typeof t === 'object' && String(t.name || '').toLowerCase() === TAG.name.toLowerCase())
+  if (tagged && !Object.keys(turnedAway).length && !crossAccount) return { code: 'undeliverable-tagged', reason: `tagged ${TAG.name}` }
+  return null
 }
 
 /** Created this run and nothing went out: put the lead back in the fresh pool. A refused lead stays out of it. */
@@ -166,4 +201,4 @@ function summaryLine ({ sent = 0, failed = 0, undeliverable = 0, deliveredUnknow
   return `Attempted: ${sent + failed}  |  Sent: ${sent}  |  Undeliverable: ${undeliverable}  |  Unknown: ${deliveredUnknown}  |  Failed: ${failed - undeliverable - deliveredUnknown}  |  Delivery rate: ${rate}`
 }
 
-module.exports = { DEFAULT_JOURNAL, TAG, journalFile, writeIntent, writeOutcome, readJournal, undeliverableAccounts, dmGate, shouldReleaseSteps, nextRoutes, markUndeliverable, summarize, summaryLine }
+module.exports = { DEFAULT_JOURNAL, TAG, NO_ROUTE_COOLDOWN_MS, journalFile, writeIntent, writeOutcome, readJournal, undeliverableAccounts, undeliverableSkip, dmGate, shouldReleaseSteps, nextRoutes, markUndeliverable, summarize, summaryLine }
