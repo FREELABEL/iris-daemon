@@ -163,3 +163,26 @@ test('the batch summary line has every number', () => {
   const line = g.summaryLine({ sent: 2, failed: 4, undeliverable: 1, deliveredUnknown: 1 })
   assert.strictEqual(line, 'Attempted: 6  |  Sent: 2  |  Undeliverable: 1  |  Unknown: 1  |  Failed: 2  |  Delivery rate: 50% (of 4 that went out)')
 })
+
+// #192412: the list filter and the per-lead gate are one rule.
+test('undeliverableSkip blocks exactly the custom-field cases dmGate blocks', () => {
+  const now = Date.parse('2026-11-03T12:00:00Z')
+  const cases = [
+    {},
+    { 'heyiris.io': { kind: 'refused', at: '2026-11-01T00:00:00Z' } },
+    { 'heyiris.io': { kind: 'no-route', at: new Date(now - 3 * 864e5).toISOString() } },
+    { 'heyiris.io': { kind: 'no-route', at: new Date(now - 20 * 864e5).toISOString() } },
+    { freelabelnet: { kind: 'refused' } },
+    { freelabelnet: { kind: 'refused' }, hourdemayo: { kind: 'refused' } },
+    { freelabelnet: { kind: 'no-route', at: new Date(now).toISOString() } },
+  ]
+  for (const crossAccount of [false, true]) {
+    for (const cf of cases) {
+      const lead = { id: 1, custom_fields: { dm_undeliverable: cf } }
+      const gate = g.dmGate({ lead, notes: [], messages: [], account: 'heyiris.io', journal: [], leadId: 1, crossAccount, now })
+      const skip = g.undeliverableSkip(lead, 'heyiris.io', { crossAccount, now })
+      assert.strictEqual(!!skip, !gate.allow, JSON.stringify({ cf, crossAccount }))
+      if (skip) assert.strictEqual(skip.code, gate.code)
+    }
+  }
+})

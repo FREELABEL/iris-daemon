@@ -58,3 +58,43 @@ test('falls back to the API when the scan finds fewer than the batch needs', () 
   assert.strictEqual(leadSource({ allowListSize: 7691, uiEligible: 30, need: 25 }), 'ui')
   assert.strictEqual(leadSource({ allowListSize: 2, uiEligible: 2, need: 25 }), 'ui')
 })
+
+// #192412: leads already marked undeliverable leave the candidate list.
+const { dropUndeliverable } = require('../som/lead-selection')
+const DAY = 24 * 3600 * 1000
+
+test('a lead refused from this account is dropped; others are kept', () => {
+  const leads = [
+    { id: 1, custom_fields: { dm_undeliverable: { 'heyiris.io': { kind: 'refused', at: '2026-11-02T00:00:00Z' } } } },
+    { id: 2, custom_fields: {} },
+    { id: 3 },
+  ]
+  const r = dropUndeliverable(leads, 'heyiris.io')
+  assert.deepStrictEqual(r.keep.map(l => l.id), [2, 3])
+  assert.deepStrictEqual(r.dropped, [{ id: 1, code: 'undeliverable-this-account' }])
+})
+
+test('no route from this account: dropped for 14 days, then tried again', () => {
+  const now = Date.parse('2026-11-03T12:00:00Z')
+  const lead = at => ({ id: 9, custom_fields: { dm_undeliverable: { thediscoverpage_: { kind: 'no-route', at } } } })
+  assert.strictEqual(dropUndeliverable([lead(new Date(now - 2 * DAY).toISOString())], 'thediscoverpage_', { now }).keep.length, 0)
+  assert.strictEqual(dropUndeliverable([lead(new Date(now - 15 * DAY).toISOString())], 'thediscoverpage_', { now }).keep.length, 1)
+})
+
+test('refused from another account: dropped unless cross-account retry is on (and only one account refused)', () => {
+  const one = { id: 4, custom_fields: { dm_undeliverable: { freelabelnet: { kind: 'refused', at: '2026-11-01T00:00:00Z' } } } }
+  const two = { id: 5, custom_fields: { dm_undeliverable: { freelabelnet: { kind: 'refused' }, hourdemayo: { kind: 'refused' } } } }
+  assert.deepStrictEqual(dropUndeliverable([one, two], 'heyiris.io').keep, [])
+  assert.deepStrictEqual(dropUndeliverable([one, two], 'heyiris.io', { crossAccount: true }).keep.map(l => l.id), [4])
+})
+
+test('the DM Undeliverable tag alone drops a lead (marked by hand, no field)', () => {
+  const tagged = { id: 6, tags: [{ id: 77, name: 'DM Undeliverable' }] }
+  assert.deepStrictEqual(dropUndeliverable([tagged], 'heyiris.io').keep, [])
+  assert.deepStrictEqual(dropUndeliverable([{ id: 7, tags: [{ id: 1, name: 'leadgen' }] }], 'heyiris.io').keep.map(l => l.id), [7])
+})
+
+test('rows without an id are ignored, and an empty or missing list is fine', () => {
+  assert.deepStrictEqual(dropUndeliverable([null, {}, { id: 8 }], 'x').keep.map(l => l.id), [8])
+  assert.deepStrictEqual(dropUndeliverable(undefined, 'x'), { keep: [], dropped: [] })
+})
