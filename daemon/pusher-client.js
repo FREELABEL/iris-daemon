@@ -64,6 +64,11 @@ class PusherClient {
         }
       })
 
+      // #192964 W1 — a Hive member started (or renewed) following one of this node's sessions.
+      this.channel.bind('session.follow', (data) => {
+        if (this.onFollowCallback) this.onFollowCallback(data)
+      })
+
       // Connection state logging
       this.pusher.connection.bind('state_change', (states) => {
         if (states.current === 'disconnected') {
@@ -84,6 +89,10 @@ class PusherClient {
 
   onTaskCancelled (callback) {
     this.onCancelCallback = callback
+  }
+
+  onSessionFollow (callback) {
+    this.onFollowCallback = callback
   }
 
   disconnect () {
