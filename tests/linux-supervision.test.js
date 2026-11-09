@@ -111,3 +111,9 @@ test('collect() reads systemd through the injected runner (no real systemctl)', 
   assert.equal(s.linger, true)
   assert.ok(seen.every((c) => !/\b(start|stop|restart|enable|disable)\b/.test(c)), 'the doctor must only read')
 })
+
+test('#192964: as root, the system unit is THE unit — no advice to move it to a user unit', () => {
+  const v = verdict({ ...nohup(), systemUnitLoaded: true, systemActive: true, systemPid: 700, root: true }, 700)
+  assert.equal(v.status, 'pass')
+  assert.doesNotMatch(v.detail, /legacy|move it/)
+})

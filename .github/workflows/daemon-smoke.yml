@@ -37,6 +37,11 @@ jobs:
       - name: file search engines on real Linux (scan, fallback, injection)
         run: node --test tests/disk-search-on-this-platform.test.js tests/disk-search.test.js tests/file-search-guard.test.js
 
+      # Needs setsid, so it cannot run on a Mac: real daemonctl against systemctl/loginctl doubles,
+      # user unit + linger for an account, system unit for root (#191615, #192964).
+      - name: daemonctl under systemd — user unit, and system unit as root
+        run: node --test tests/daemonctl-systemd.test.js tests/linux-supervision.test.js
+
   # The Windows leg. Separate job, not a matrix entry, because it answers a different
   # question and has different steps.
   #
