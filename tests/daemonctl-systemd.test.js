@@ -54,7 +54,10 @@ do_stop() {
   rm -f "$S/$scope.mainpid"
 }
 case "$verb" in
-  show-environment) [ "$scope" = user ] && [ ! -f "$S/no-user-bus" ] && { echo "PATH=/usr/bin"; exit 0; }; exit 1 ;;
+  show-environment)
+    [ "$scope" = user ] && [ ! -f "$S/no-user-bus" ] && { echo "PATH=/usr/bin"; exit 0; }
+    [ "$scope" = system ] && { echo "PATH=/usr/bin"; exit 0; }   # the system manager is always up
+    exit 1 ;;
   daemon-reload|reset-failed) exit 0 ;;
   enable) touch "$S/$scope.enabled"; [ -n "$now" ] && do_start; exit 0 ;;
   disable) rm -f "$S/$scope.enabled"; [ -n "$now" ] && do_stop; exit 0 ;;
@@ -466,6 +469,9 @@ describe('the unit file', () => {
   it('passes systemd-analyze verify --user, where systemd is available', (t) => {
     const probe = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' })
     if (probe.status !== 0) return t.skip('systemd-analyze not available')
+    // --user needs this account's runtime dir; a CI runner or `sudo -u` shell may have none
+    // ("Failed to lookup RuntimeDirectory path"), which says nothing about the unit.
+    if (!process.env.XDG_RUNTIME_DIR) return t.skip('no XDG_RUNTIME_DIR (no user session) — cannot run systemd-analyze --user')
     const d = fs.mkdtempSync(path.join(os.tmpdir(), 'unit-'))
     const f = path.join(d, 'iris-daemon.service')
     fs.writeFileSync(f, unit.replaceAll('__BRIDGE_DIR__', REPO))
