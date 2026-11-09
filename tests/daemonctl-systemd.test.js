@@ -54,7 +54,10 @@ do_stop() {
   rm -f "$S/$scope.mainpid"
 }
 case "$verb" in
-  show-environment) [ "$scope" = user ] && [ ! -f "$S/no-user-bus" ] && { echo "PATH=/usr/bin"; exit 0; }; exit 1 ;;
+  show-environment)
+    [ "$scope" = user ] && [ ! -f "$S/no-user-bus" ] && { echo "PATH=/usr/bin"; exit 0; }
+    [ "$scope" = system ] && { echo "PATH=/usr/bin"; exit 0; }   # the system manager is always up
+    exit 1 ;;
   daemon-reload|reset-failed) exit 0 ;;
   enable) touch "$S/$scope.enabled"; [ -n "$now" ] && do_start; exit 0 ;;
   disable) rm -f "$S/$scope.enabled"; [ -n "$now" ] && do_stop; exit 0 ;;
@@ -98,6 +101,8 @@ h="$(cat "$FAKE_STATE/port_holder" 2>/dev/null)"
 if [ -n "$h" ] && kill -0 "$h" 2>/dev/null; then printf 200; else printf 000; exit 7; fi
 `,
   pgrep: '#!/bin/sh\nexit 1\n',
+  // Root or not is the one thing that picks the unit's scope (#192964). Everything else is real id.
+  id: '#!/bin/sh\nif [ "$1" = "-u" ] && [ -n "$FAKE_UID" ]; then echo "$FAKE_UID"; elif [ "$1" = "-un" ] && [ "$FAKE_UID" = "0" ]; then echo root; else exec /usr/bin/id "$@"; fi\n',
   uname: '#!/bin/sh\nif [ "$1" = "-s" ] || [ -z "$1" ]; then echo "${FAKE_UNAME:-Linux}"; else /bin/uname "$@"; fi\n',
   sleep: '#!/bin/sh\nexec /bin/sleep 0.02\n'
 }
@@ -144,7 +149,12 @@ function ctl (...args) {
       PATH: `${bin}:/usr/bin:/bin`,
       FAKE_STATE: state,
       XDG_RUNTIME_DIR: path.join(root, 'run'),
-      FAKE_UNAME: process.env.FAKE_UNAME_OVERRIDE || 'Linux'
+      FAKE_UNAME: process.env.FAKE_UNAME_OVERRIDE || 'Linux',
+      ...(process.env.FAKE_UID_OVERRIDE != null ? {
+        FAKE_UID: process.env.FAKE_UID_OVERRIDE,
+        IRIS_SYSTEMD_SYSTEM_DIR: path.join(root, 'etc-systemd-system'),
+        IRIS_SYSTEMD_RUN_DIR: path.join(root, 'run-systemd-system')
+      } : {})
     },
     encoding: 'utf8',
     timeout: 60000
@@ -320,6 +330,65 @@ describe('a hand-written SYSTEM unit (iris-hive-001, #187774)', () => {
   })
 })
 
+describe('as ROOT: a system unit, no linger, no sudo (#192964 W3)', () => {
+  // A cloud VM enrolled as root (cloud-init, ssh root@) has no user manager with nobody logged in,
+  // so a user unit would never start at boot. Root gets the same template as a SYSTEM unit.
+  const sysUnit = () => path.join(root, 'etc-systemd-system', 'iris-daemon.service')
+  beforeEach(() => {
+    process.env.FAKE_UID_OVERRIDE = '0'
+    fs.mkdirSync(path.join(root, 'run-systemd-system'), { recursive: true })
+    touch('no-user-bus') // root has no user manager here: nothing may need one
+  })
+  afterEach(() => { delete process.env.FAKE_UID_OVERRIDE })
+
+  it('supervise installs and enables a SYSTEM unit and starts the daemon under it', () => {
+    const r = ctl('supervise')
+    assert.equal(r.code, 0, r.all)
+    assert.ok(fs.existsSync(sysUnit()), 'no system unit was written')
+    assert.ok(!fs.existsSync(unitFile()), 'a user unit was written for root')
+    const c = calls()
+    assert.match(c, /^systemctl enable iris-daemon\.service$/m)
+    assert.match(c, /^systemctl start iris-daemon\.service$/m)
+    assert.doesNotMatch(c, /systemctl --user (enable|start)/)
+    assert.doesNotMatch(c, /^sudo /m, 'root needs no sudo (and a minimal image may not have it)')
+    assert.doesNotMatch(c, /enable-linger/)
+    assert.equal(read('port_holder'), read('system.mainpid'), "the system unit's child must be the listener")
+    assert.ok(fs.existsSync(path.join(state, 'system.enabled')), 'not enabled: it would not start at boot')
+  })
+
+  it('renders the unit for the system manager: network-online, HOME, multi-user.target', () => {
+    assert.equal(ctl('supervise').code, 0)
+    const u = fs.readFileSync(sysUnit(), 'utf8')
+    assert.match(u, /^\[Unit\]\nWants=network-online\.target\nAfter=network-online\.target$/m)
+    assert.match(u, /^Environment=HOME=%h$/m)
+    assert.match(u, /^WantedBy=multi-user\.target$/m)
+    assert.doesNotMatch(u, /^WantedBy=default\.target$/m)
+    assert.match(u, /^Restart=always$/m)
+    assert.ok(!u.includes('__BRIDGE_DIR__'))
+  })
+
+  it('treats its own system unit as THE unit: status, stop, restart, no "move it" advice', () => {
+    assert.equal(ctl('supervise').code, 0)
+    const s = ctl('status')
+    assert.match(s.out, /supervised by systemd \(system unit iris-daemon\.service/)
+    assert.doesNotMatch(s.all, /move it to the user unit|linger is off/i)
+    const first = read('system.mainpid')
+    const r = ctl('restart')
+    assert.equal(r.code, 0, r.all)
+    assert.notEqual(read('system.mainpid'), first)
+    assert.equal(read('port_holder'), read('system.mainpid'))
+    assert.equal(ctl('stop').code, 0)
+    assert.equal(alive(first), false)
+  })
+
+  it('refuses where PID 1 is not systemd (a container), and changes nothing', () => {
+    fs.rmSync(path.join(root, 'run-systemd-system'), { recursive: true })
+    const r = ctl('supervise')
+    assert.equal(r.code, 1)
+    assert.ok(!fs.existsSync(sysUnit()))
+  })
+})
+
 describe('iris-daemon supervise — the migration', () => {
   it('moves a nohup daemon under systemd: old one stopped and port free BEFORE the unit starts', () => {
     const stray = orphan()
@@ -400,6 +469,9 @@ describe('the unit file', () => {
   it('passes systemd-analyze verify --user, where systemd is available', (t) => {
     const probe = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' })
     if (probe.status !== 0) return t.skip('systemd-analyze not available')
+    // --user needs this account's runtime dir; a CI runner or `sudo -u` shell may have none
+    // ("Failed to lookup RuntimeDirectory path"), which says nothing about the unit.
+    if (!process.env.XDG_RUNTIME_DIR) return t.skip('no XDG_RUNTIME_DIR (no user session) — cannot run systemd-analyze --user')
     const d = fs.mkdtempSync(path.join(os.tmpdir(), 'unit-'))
     const f = path.join(d, 'iris-daemon.service')
     fs.writeFileSync(f, unit.replaceAll('__BRIDGE_DIR__', REPO))

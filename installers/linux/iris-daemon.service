@@ -5,8 +5,11 @@
 # by `iris-daemon start` and installers/install.sh). __BRIDGE_DIR__ is replaced with the daemon's
 # directory (~/.iris/bridge for `iris node install`, ~/.iris/daemon for install.sh).
 #
-# USER-LEVEL ONLY, like the LaunchAgent: no root, no secrets. The node key is read from
-# ~/.iris/config.json by the wrapper at start — never written here.
+# A user unit for every account, like the LaunchAgent. ROOT is the one exception (#192964): root
+# has no user manager unless someone is logged in, so as root daemonctl installs this same file to
+# /etc/systemd/system, adding After=network-online.target, HOME=%h and WantedBy=multi-user.target.
+# No secrets either way: the node key is read from ~/.iris/config.json by the wrapper at start —
+# never written here.
 #
 # LINGER: a user unit is stopped when its user's last session ends, and is not started at boot,
 # unless lingering is on (`loginctl enable-linger $USER`). The installer turns it on where it

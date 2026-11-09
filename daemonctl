@@ -151,8 +151,25 @@ report_not_ready() {
 # Killing its child just makes systemd respawn it beside whatever we start — so it is driven via
 # sudo, or refused with the command that moves it to the user unit (`iris-daemon supervise`).
 SYSTEMD_UNIT="iris-daemon.service"
-SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+# ROOT GETS A SYSTEM UNIT (#192964 W3). A cloud VM is often enrolled as root (cloud-init, `ssh
+# root@`), and root has no user manager unless someone is logged in. So as root the same template
+# is installed to /etc/systemd/system and driven with plain `systemctl`: it starts at boot with
+# nobody logged in, and no linger is needed. For root that system unit IS the supported unit — it
+# is not the hand-written "legacy" one below, which is about a SYSTEM unit owning a NON-root
+# account's daemon. Every other account keeps the user unit + linger.
+is_root() { [ "$(id -u)" = "0" ]; }
+if is_root; then
+    SYSTEMD_USER_DIR="${IRIS_SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"
+    SYSTEMD_SCOPE_NAME="system unit"
+    JOURNAL_HINT="journalctl -u $SYSTEMD_UNIT -n 50"
+else
+    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    SYSTEMD_SCOPE_NAME="user unit"
+    JOURNAL_HINT="journalctl --user -u $SYSTEMD_UNIT -n 50"
+fi
 SYSTEMD_UNIT_FILE="$SYSTEMD_USER_DIR/$SYSTEMD_UNIT"
+# systemctl in THIS daemon's scope: --user for an account, the system manager for root.
+sctl() { if is_root; then systemctl "$@"; else systemctl --user "$@"; fi; }
 SYSTEMD_UNIT_TEMPLATE="$BRIDGE_DIR/installers/linux/$SYSTEMD_UNIT"
 DAEMON_PID_FILE="$HOME/.iris/daemon.pid"
 
@@ -166,18 +183,24 @@ systemd_user_ok() {
     if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
         export XDG_RUNTIME_DIR="/run/user/$(id -u)"   # cron / bare ssh sessions do not set it
     fi
+    if is_root; then
+        [ -d "${IRIS_SYSTEMD_RUN_DIR:-/run/systemd/system}" ] || return 1   # PID 1 is systemd, not a container's init
+        systemctl show-environment >/dev/null 2>&1
+        return
+    fi
     systemctl --user show-environment >/dev/null 2>&1
 }
 user_unit_installed() { [ -f "$SYSTEMD_UNIT_FILE" ]; }
-user_unit_active() { systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null; }
+user_unit_active() { sctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null; }
 user_unit_pid() {
-    _p="$(systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)"
+    _p="$(sctl show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)"
     [ -n "$_p" ] && [ "$_p" != "0" ] && echo "$_p"
 }
 
 # A system-scope unit of the same name that is still IN CHARGE: enabled (comes back at boot) or
 # running. A disabled, stopped one is retired and ignored — that is the state `supervise` leaves.
 legacy_system_unit_owns() {
+    is_root && return 1   # root's system unit is the supported one (see SYSTEMD_UNIT above)
     is_linux && command -v systemctl >/dev/null 2>&1 || return 1
     [ "$(systemctl show -p LoadState --value "$SYSTEMD_UNIT" 2>/dev/null)" = "loaded" ] || return 1
     systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null && return 0
@@ -196,12 +219,14 @@ legacy_refusal() {
 }
 
 linger_on() {
+    is_root && return 0   # a system unit starts at boot with nobody logged in; linger is moot
     [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = "yes" ]
 }
 # Without linger a user unit dies when its user's last session logs out and does not start at
 # boot. Say that plainly when we cannot fix it — "supervised" with linger off is supervised
 # until the operator closes their ssh session.
 ensure_linger() {
+    if is_root; then echo "  boot: system unit, enabled — starts at boot with nobody logged in"; return 0; fi
     _u="$(id -un)"
     if linger_on; then echo "  linger: on for $_u (the daemon runs with nobody logged in, and starts at boot)"; return 0; fi
     if command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$_u" 2>/dev/null && linger_on; then
@@ -237,12 +262,21 @@ install_user_unit() {
     mkdir -p "$SYSTEMD_USER_DIR" "$IRIS_LOG_DIR" || return 1
     # % is a systemd specifier; a literal one in the path must be doubled.
     _bd="$(printf '%s' "$BRIDGE_DIR" | sed -e 's/%/%%/g' -e 's/[|&\\]/\\&/g')"
-    sed "s|__BRIDGE_DIR__|$_bd|g" "$SYSTEMD_UNIT_TEMPLATE" > "$SYSTEMD_UNIT_FILE.tmp.$$" \
+    # As a SYSTEM unit (root): start after the network is up, at multi-user.target (default.target
+    # is the user manager's), and set HOME — the system manager does not, and the wrapper and the
+    # daemon read ~/.iris through it. awk, not sed `a\`: BSD and GNU sed disagree on it.
+    _sys=0; is_root && _sys=1
+    sed "s|__BRIDGE_DIR__|$_bd|g" "$SYSTEMD_UNIT_TEMPLATE" \
+        | awk -v sys="$_sys" '
+            sys && /^WantedBy=default\.target$/ { print "WantedBy=multi-user.target"; next }
+            { print }
+            sys && /^\[Unit\]$/ { print "Wants=network-online.target"; print "After=network-online.target" }
+            sys && /^\[Service\]$/ { print "Environment=HOME=%h" }' > "$SYSTEMD_UNIT_FILE.tmp.$$" \
         && mv -f "$SYSTEMD_UNIT_FILE.tmp.$$" "$SYSTEMD_UNIT_FILE" || { rm -f "$SYSTEMD_UNIT_FILE.tmp.$$"; return 1; }
     echo "  unit: $SYSTEMD_UNIT_FILE"
-    systemctl --user daemon-reload || { echo "systemctl --user daemon-reload failed" >&2; return 1; }
-    systemctl --user enable "$SYSTEMD_UNIT" >/dev/null 2>&1 \
-        || { echo "systemctl --user enable $SYSTEMD_UNIT failed" >&2; return 1; }
+    sctl daemon-reload || { echo "systemctl daemon-reload ($SYSTEMD_SCOPE_NAME) failed" >&2; return 1; }
+    sctl enable "$SYSTEMD_UNIT" >/dev/null 2>&1 \
+        || { echo "systemctl enable $SYSTEMD_UNIT ($SYSTEMD_SCOPE_NAME) failed" >&2; return 1; }
     pin_daemon_node
     ensure_linger || true
     return 0
@@ -251,9 +285,9 @@ install_user_unit() {
 # Start the unit and report only what was OBSERVED: ready, and the unit's MainPID is the pid
 # serving :3200 (not an orphan that happened to be there).
 start_user_unit() {
-    systemctl --user reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1 || true   # clear a tripped start limit
-    if ! systemctl --user start "$SYSTEMD_UNIT"; then
-        echo "systemctl --user start $SYSTEMD_UNIT failed. See: journalctl --user -u $SYSTEMD_UNIT -n 50" >&2
+    sctl reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1 || true   # clear a tripped start limit
+    if ! sctl start "$SYSTEMD_UNIT"; then
+        echo "systemctl start $SYSTEMD_UNIT ($SYSTEMD_SCOPE_NAME) failed. See: $JOURNAL_HINT" >&2
         return 1
     fi
     echo "Handed to systemd — waiting for the daemon to serve /health..."
@@ -287,7 +321,7 @@ supervision_line() {
         if [ -n "$_holder" ] && [ "$_holder" != "$_m" ]; then
             echo "Supervisor: SPLIT BRAIN — systemd's child is pid ${_m:-none} but pid $_holder holds :$BRIDGE_PORT (UNSUPERVISED). Fix: iris-daemon restart"
         else
-            echo "Supervisor: supervised by systemd (user unit $SYSTEMD_UNIT, pid ${_m:-none})"
+            echo "Supervisor: supervised by systemd ($SYSTEMD_SCOPE_NAME $SYSTEMD_UNIT, pid ${_m:-none})"
             linger_on || echo "  WARNING: linger is off — systemd stops it when you log out. Fix: sudo loginctl enable-linger $(id -un)"
         fi
         return
@@ -299,7 +333,7 @@ supervision_line() {
             echo "Supervisor: UNSUPERVISED (pid $_holder) — systemd --user is not available here, nothing restarts it if it crashes"
         fi
     elif systemd_user_ok && user_unit_installed; then
-        echo "Supervisor: systemd user unit installed, not running. Start: iris-daemon start"
+        echo "Supervisor: systemd $SYSTEMD_SCOPE_NAME installed, not running. Start: iris-daemon start"
     elif systemd_user_ok; then
         echo "Supervisor: none installed. Install and start: iris-daemon supervise"
     else
@@ -465,7 +499,7 @@ case "${1:-status}" in
                     exit 1
                 fi
             elif systemd_user_ok && user_unit_installed; then
-                systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
+                sctl stop "$SYSTEMD_UNIT" 2>/dev/null || true
             fi
         fi
 
@@ -584,10 +618,10 @@ case "${1:-status}" in
         _legacy=""; legacy_system_unit_owns && _legacy=1
         if [ "${2:-}" = "--dry-run" ]; then
             echo "Would:"
-            echo "  1. install $SYSTEMD_UNIT_FILE (Restart=always) for $BRIDGE_DIR, enable it, enable linger"
+            echo "  1. install $SYSTEMD_UNIT_FILE (Restart=always) for $BRIDGE_DIR, enable it$(is_root || echo ', enable linger')"
             [ -n "$_legacy" ] && echo "  2. sudo systemctl disable --now $SYSTEMD_UNIT   (the SYSTEM unit, pid $(legacy_system_unit_pid || echo none))"
             echo "  3. stop the daemon now holding :$BRIDGE_PORT (pid ${_old:-none}) and verify the port is free"
-            echo "  4. systemctl --user start $SYSTEMD_UNIT and verify its MainPID serves /health"
+            echo "  4. start the $SYSTEMD_SCOPE_NAME $SYSTEMD_UNIT and verify its MainPID serves /health"
             exit 0
         fi
         echo "[1/4] Installing the systemd user unit"
@@ -616,7 +650,7 @@ case "${1:-status}" in
         fi
         echo "[4/4] Starting under systemd"
         if ! "$0" start; then
-            echo "The supervised daemon did not come up. Logs: iris-daemon logs   journalctl --user -u $SYSTEMD_UNIT" >&2
+            echo "The supervised daemon did not come up. Logs: iris-daemon logs   $JOURNAL_HINT" >&2
             [ -n "$_legacy" ] && echo "  To go back to the system unit: sudo systemctl enable --now $SYSTEMD_UNIT" >&2
             exit 1
         fi
