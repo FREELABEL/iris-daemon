@@ -21,6 +21,7 @@
  */
 
 const { shouldPollPending } = require('./pending-poll')
+const remoteAccess = require('./remote-access')
 const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
 const { TaskExecutor } = require('./task-executor')
@@ -702,7 +703,16 @@ class Daemon {
       this._lastPendingPollAt = Date.now()
       this.checkPendingTasks().catch(() => {})
     }
+    // "Allow access to this computer" OFF (epic #192964): every beat says goodbye, so the hub lists
+    // this machine as offline, and a flip is reported within ~2 s instead of at the next beat.
+    const reportState = this.heartbeat.getStateCallback
+    this.heartbeat.getStateCallback = () => remoteAccess.withRemoteAccess(reportState())
+    this._unwatchRemoteAccess = remoteAccess.watch((allowed) => {
+      console.log(`[daemon] remote access ${allowed ? 'ON' : 'OFF'} — telling the hub now`)
+      this.heartbeat.ping().catch(() => {})
+    })
     this.heartbeat.start()
+    if (!remoteAccess.remoteAccessAllowed()) this.heartbeat.ping().catch(() => {})
 
     // Step 5b: Start local schedule registry
     this._startScheduleRegistry()

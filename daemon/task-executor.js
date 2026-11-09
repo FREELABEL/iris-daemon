@@ -4187,6 +4187,12 @@ exit 1
           const sessionId = sessionConfig.session_id
           const sessionProvider = sessionConfig.provider || 'claude_code'
 
+          // "Allow access to this computer" is OFF (epic #192964): this machine takes no inbound
+          // control — not a message, not an answer — even one queued before the switch flipped.
+          if (!require('./remote-access').remoteAccessAllowed()) {
+            reject(new Error(require('./remote-access').REFUSAL))
+            return
+          }
           if (!sessionId) {
             reject(new Error('session_message task requires config.session_id'))
             return
