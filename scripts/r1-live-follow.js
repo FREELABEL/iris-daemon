@@ -183,7 +183,9 @@ async function main () {
 
   const seen = new Map() // nonce → local ms
   const states = []
+  let firstTextAt = null // when the follower first showed anything: its snapshot (or first poll)
   const onText = (text, at) => {
+    if (firstTextAt === null) firstTextAt = at
     const m = /r1-nonce-([a-f0-9]{12})/.exec(text)
     if (m && !seen.has(m[1])) seen.set(m[1], at)
   }
@@ -193,8 +195,14 @@ async function main () {
   let early = null
   follower.exited.then((x) => { early = x })
 
-  // Give the follower a moment to subscribe before the window opens; the window is what R1 scores.
-  await new Promise((r) => setTimeout(r, 3000))
+  // R1 scores words typed into a session someone is ALREADY following, so the window opens once the
+  // follower shows its first view (snapshot), not after a fixed guess. How long that took is reported
+  // on its own as follower_ready_ms: a cold start is a separate number, never folded into a sample.
+  const spawnedAt = Date.now()
+  while (firstTextAt === null && !early && Date.now() - spawnedAt < 20000) await new Promise((r) => setTimeout(r, 50))
+  const followerReadyMs = firstTextAt === null ? null : firstTextAt - spawnedAt
+  log(`follower ready (first view) after ${followerReadyMs} ms`)
+  await new Promise((r) => setTimeout(r, 500))
   const windowStart = Date.now()
   const samples = []
   const gap = (DURATION_S * 1000) / SAMPLES
@@ -224,7 +232,7 @@ async function main () {
 
   const report = {
     check: 'R1', epic: 192964, at: new Date().toISOString(), from: require('os').hostname(), node_b: b.name,
-    follower: FOLLOWER, window_s: DURATION_S, samples: rows,
+    follower: FOLLOWER, follower_ready_ms: followerReadyMs, window_s: DURATION_S, samples: rows,
     latency_ms: { p50: pct(lat, 50), p95: pct(lat, 95), max: worst }, missing,
     sessions_history_tasks_on_b: tasks.length,
     follower_states: states.map((s) => s.mode || s.state).filter(Boolean),
