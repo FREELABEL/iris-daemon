@@ -44,6 +44,7 @@ const { ResourceMonitor } = require('./resource-monitor')
 const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter, resolveLocalLlmConfig } = require('./local-llm')
 const { InferenceEndpoint } = require('./inference-endpoint')
+const { TunnelKeepAlive } = require('./tunnel-keepalive')
 const { MeshLlmSupervisor } = require('./mesh-llm-supervisor')
 const { startDeviceProbe, getDeviceReport } = require('./device-capabilities')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
@@ -502,8 +503,11 @@ class Daemon {
         localModels: this.localModels,
         upstream: () => resolveLocalLlmConfig(process.env).baseUrl
       })
-      this.inference.tick()
-      this._inferenceTimer = setInterval(() => this.inference.tick(), 15000)
+      // The tunnel to it, restarted when its process dies (#192752) — `serve on` starts it and walks away.
+      this.tunnelKeepAlive = new TunnelKeepAlive({ getApiBase: () => this.config.apiUrl, getKey: () => this.config.apiKey })
+      const inferenceTick = () => { this.inference.tick(); this.tunnelKeepAlive.tick() }
+      inferenceTick()
+      this._inferenceTimer = setInterval(inferenceTick, 15000)
       if (this._inferenceTimer.unref) this._inferenceTimer.unref()
     } catch (e) {
       console.error(`[inference] not started: ${e.message}`)
