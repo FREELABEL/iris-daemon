@@ -23,6 +23,7 @@
 const { shouldPollPending } = require('./pending-poll')
 const { CloudClient } = require('./cloud-client')
 const { PusherClient } = require('./pusher-client')
+const { SessionStreamer } = require('./session-stream')
 const { TaskExecutor } = require('./task-executor')
 const { decide, isExpiredRefusal, KeyLedger } = require('./delivery-contract')
 const { Heartbeat } = require('./heartbeat')
@@ -390,6 +391,16 @@ class Daemon {
       this.pusher.onTaskDispatched((event) => this.handleTaskDispatched(event))
       // #184886 — a cancel reaches this machine now, not at the next heartbeat.
       this.pusher.onTaskCancelled((event) => this.handleTaskCancelled(event).catch(() => {}))
+      // #192964 W1 — live follow. A follower asked the platform; the platform asked us. We stream that
+      // one transcript to the platform, which broadcasts it to the session's Hive-members-only channel.
+      this.sessionStreamer = new SessionStreamer({
+        nodeId: this.nodeId,
+        publish: (sessionId, envelopes) => this.cloud.post(`/api/v6/node-agent/sessions/${encodeURIComponent(sessionId)}/stream`, { envelopes })
+      })
+      this.pusher.onSessionFollow((event) => {
+        const r = this.sessionStreamer.follow(event || {})
+        if (!r.ok) console.log(`[live] not following ${event && event.session_id}: ${r.reason}`)
+      })
       console.log('[daemon] Pusher connected — listening for tasks')
     } else {
       console.log('[daemon] No Pusher key — falling back to polling mode')
@@ -3210,6 +3221,7 @@ LIMIT ${limit}
     if (this.heartbeat) this.heartbeat.stop()
 
     // Disconnect Pusher
+    if (this.sessionStreamer) this.sessionStreamer.stopAll()
     if (this.pusher) this.pusher.disconnect()
 
     // Stop A2A server
