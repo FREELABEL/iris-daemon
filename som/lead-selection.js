@@ -35,4 +35,22 @@ function shouldFetchNextPage ({ page, lastPage }, maxPages = MAX_CANDIDATE_PAGES
   return page < lastPage && page < maxPages
 }
 
-module.exports = { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage, MAX_CANDIDATE_PAGES }
+// #192412: 14 of 52 outcomes on 2026-11-01..02 were undeliverable. The batch already marks such a lead
+// (dm_undeliverable custom field per account, DM Undeliverable tag for a refusal) and dmGate refuses it,
+// but only after the lead was opened, so it still took a place in the candidate list. Drop them from the
+// list itself, using the same rule. Leads without a record (no custom_fields in the payload) are kept: the
+// per-lead gate still checks them with their notes.
+function dropUndeliverable (leads, account, opts = {}) {
+  const { undeliverableSkip } = require('./helpers/dm-guard')
+  const keep = []
+  const dropped = []
+  for (const l of Array.isArray(leads) ? leads : []) {
+    if (!l || !l.id) continue
+    const why = undeliverableSkip(l, account, opts)
+    if (why) dropped.push({ id: l.id, code: why.code })
+    else keep.push(l)
+  }
+  return { keep, dropped }
+}
+
+module.exports = { dropUndeliverable, leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage, MAX_CANDIDATE_PAGES }

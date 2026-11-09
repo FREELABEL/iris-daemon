@@ -44,4 +44,41 @@ function outcomeLine (name, outcome, seconds, reason = '') {
   return `❌ ${name} not sent (${seconds}s)`
 }
 
-module.exports = { leadOutcome, countsTowardDailyCap, timingStatus, undeliverableNote, unconfirmedNote, outcomeLine }
+// #192414: a confirmed DM moves the lead to Contacted, so pulse and the board count it. On 2026-11-02 lead
+// #30092 got a confirmed DM and stayed Prospected.
+//   - only 'sent'. 'delivered-unknown' may not have arrived (#192164: "nothing records it as contact"); it
+//     keeps its [SOM UNCONFIRMED] note and stays where it is, so a person can check the thread.
+//   - never a downgrade: only a lead still before first contact moves. That is the same set fl-api's
+//     OutreachLedger::PRE_REPLY_STATUSES treats as not yet talking to us ('', New, Prospected). Anything
+//     else — Contacted, Qualified, Won, Lost, a custom board stage like "Responded" — is left alone.
+const CONTACTED = 'Contacted'
+const BEFORE_CONTACT = new Set(['', 'new', 'prospected'])
+
+function contactedStatusFor (outcome, currentStatus) {
+  if (outcome !== 'sent') return null
+  const now = String(currentStatus == null ? '' : currentStatus).trim().toLowerCase()
+  return BEFORE_CONTACT.has(now) ? CONTACTED : null
+}
+
+/**
+ * Re-reads the lead (a person may have moved it while the batch ran), then writes Contacted only when
+ * contactedStatusFor says so. Never throws: a failed write is reported, the DM is already recorded.
+ * @returns {Promise<{updated: boolean, from?: string, reason: string}>}
+ */
+async function markContacted (api, leadId, outcome) {
+  if (!leadId || outcome !== 'sent') return { updated: false, reason: 'not a confirmed send' }
+  try {
+    const res = await api.getLead(leadId)
+    if (!res || !res.success) return { updated: false, reason: `could not read the lead${res && res.message ? `: ${res.message}` : ''}` }
+    const lead = (res.data && (res.data.data || res.data)) || {}
+    const from = lead.status == null ? '' : String(lead.status)
+    const next = contactedStatusFor(outcome, from)
+    if (!next) return { updated: false, from, reason: `already past first contact (${from})` }
+    const w = await api.updateLead(leadId, { status: next })
+    return w && w.success ? { updated: true, from, reason: '' } : { updated: false, from, reason: (w && w.message) || 'update failed' }
+  } catch (e) {
+    return { updated: false, reason: e && e.message ? e.message : String(e) }
+  }
+}
+
+module.exports = { leadOutcome, countsTowardDailyCap, timingStatus, undeliverableNote, unconfirmedNote, outcomeLine, contactedStatusFor, markContacted, CONTACTED }
