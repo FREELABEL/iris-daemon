@@ -1074,6 +1074,18 @@ class TaskExecutor {
     }
   }
 
+  // True when the task is past its deadline or too old to run (task-age.js), and was reported
+  // expired. Browser jobs are aged by _browserJobGo's stricter limit; here only their deadline.
+  async _expireIfStale (task, ts, isBrowserTask) {
+    const verdict = require('./task-age').expiry(task, { browser: isBrowserTask })
+    if (!verdict) return false
+    console.log(`[executor] [${ts()}] ⌛ ${task.type} ${String(task.id).substring(0, 12)} expired, not run — ${verdict.reason}`)
+    try {
+      await this.cloud.submitResult(task.id, { status: 'expired', error: verdict.reason, output: '', duration_ms: 0 })
+    } catch {}
+    return true
+  }
+
   // True when the browser job should run. Otherwise it has already been reported to the cloud.
   async _browserJobGo (task, ts) {
     const consent = require('./browser-job-consent')
@@ -1138,6 +1150,12 @@ class TaskExecutor {
       // (the reservation persists until this run's finally). Re-running admission would
       // reject the task against its own reservation, so skip it — just record idempotency.
       this._executedTaskIds.set(taskId, Date.now())
+      // It may have gone stale while it waited for the slot.
+      if (await this._expireIfStale(task, ts, isBrowserTask)) {
+        this.gate.release(taskId)
+        this._drainGate(ts)
+        return
+      }
     } else {
       // ── Idempotency: never run the same task id twice (duplicate Pusher events) ──
       const now = Date.now()
@@ -1146,6 +1164,13 @@ class TaskExecutor {
       }
       if (this._executedTaskIds.has(taskId)) {
         console.log(`[executor] [${ts()}] Duplicate task ${taskId.substring(0, 12)} — already executed. Ignoring.`)
+        return
+      }
+
+      // ── Too old to run (#192109): before routing, admission or any work. After the duplicate
+      // check, so a late duplicate event cannot report a finished task as expired.
+      if (await this._expireIfStale(task, ts, isBrowserTask)) {
+        this._executedTaskIds.set(taskId, now)
         return
       }
 
@@ -4586,13 +4611,16 @@ exit 1
 
           const execStarted = Date.now()
 
-          execAsync(execPlan.command, {
+          // Our own timer, not exec's `timeout`: that one signals the shell alone, and what the
+          // command started outlived it (#192109). killTaskTree takes the whole tree.
+          let peerTimedOut = false
+          const peerChild = execAsync(execPlan.command, {
             cwd: execPlan.cwd,
-            timeout: execPlan.timeoutMs,
             encoding: 'utf-8',
             maxBuffer: 5 * 1024 * 1024,
             shell: shellFor('').cmd
           }, (err, stdout, stderr) => {
+            clearTimeout(peerTimer)
             const out = (stdout && stdout.toString()) || ''
             const errOut = (stderr && stderr.toString()) || ''
 
@@ -4601,7 +4629,7 @@ exit 1
             // indistinguishable from a command that ran and failed. For an install that
             // matters: "it failed" and "we cut it off halfway" need different responses
             // from whoever is helping.
-            const timedOut = !!(err && err.killed && err.signal)
+            const timedOut = peerTimedOut || !!(err && err.killed && err.signal)
 
             const execResult = {
               command: execPlan.command,
@@ -4626,6 +4654,10 @@ exit 1
               result: execResult
             })
           })
+          const peerTimer = setTimeout(() => {
+            peerTimedOut = true
+            if (!require('./child-lifecycle').hasExited(peerChild)) require('./task-stop').killTaskTree(peerChild.pid, 5000)
+          }, execPlan.timeoutMs)
           return
         }
 
@@ -4931,6 +4963,11 @@ exit 1
             // the timeout firing was silently dropped.
             lastOutCount = drain(stdoutFile, lastOutCount, 'stdout')
             lastErrCount = drain(stderrFile, lastErrCount, 'stderr')
+            // #192109: closing the session only HUPs the pane; a child that ignores SIGHUP (a hung
+            // strace, an `iris serve`) ran on. Read the pane's tree first, then kill it, then close.
+            let panePids = []
+            try { panePids = typeof this.tmux.panePids === 'function' ? this.tmux.panePids(sessionName) : [] } catch {}
+            for (const pid of panePids) require('./task-stop').killTaskTree(pid, 5000)
             this.tmux.cleanup(sessionName)
             if (isGraceful) {
               resolve({ exitCode: 124, timedOut: true })
@@ -5065,7 +5102,8 @@ exit 1
       })
 
       const timer = setTimeout(() => {
-        require('./child-lifecycle').killWithEscalation(child, 5000)
+        // The whole tree, not just the shell (#192109): its children would outlive the timeout.
+        if (!require('./child-lifecycle').hasExited(child)) require('./task-stop').killTaskTree(child.pid, 5000)
         if (isGraceful) {
           resolve({ exitCode: 124, timedOut: true })
         } else {
@@ -5237,7 +5275,8 @@ exit 1
       }
       const rtTimeoutLabel = timeout / 1000
       const timer = setTimeout(() => {
-        require('./child-lifecycle').killWithEscalation(child, 5000)
+        // The agent and all it started (#192109). Not once it exited: its pid may be someone else's.
+        if (!require('./child-lifecycle').hasExited(child)) require('./task-stop').killTaskTree(child.pid, 5000)
         reject(new Error(`Runtime ${runtime} timed out after ${rtTimeoutLabel}s`))
       }, timeout)
 

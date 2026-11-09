@@ -89,6 +89,91 @@ function killTree (child, graceMs = 3000, { platform = process.platform, ps = de
 }
 
 /**
+ * A TIMED-OUT task ends with everything it started (#192109). On 2026-11-01 a hung `strace` and an
+ * `iris serve` outlived their task's timeout: the timeout signalled only the direct child (or only
+ * closed the tmux session, which a process ignoring SIGHUP survives), and what the task had started
+ * ran on, re-parented to init where no walk from the task can find it any more.
+ *
+ * So, from ONE `ps` snapshot taken before anything is signalled:
+ *   - every pid under the root (the walk — finds children that moved to a group of their own), and
+ *   - every process GROUP those pids are in. A tmux pane leads its own group, so killing that group
+ *     also reaches a child that was already orphaned before the timeout fired.
+ * SIGTERM to all of it now; after `graceMs` SIGKILL to the same groups and pids, plus anything the
+ * survivors started in the meantime. The daemon's own group, the daemon and its ancestors are never
+ * signalled: a task spawned without `detached` shares the daemon's group, and there the walk alone
+ * does the work.
+ */
+function killTaskTree (rootPid, graceMs = 5000, { platform = process.platform, ps = psWithGroups, kill = signal, self = process.pid, exec = execFileSync } = {}) {
+  rootPid = Number(rootPid)
+  if (!rootPid || rootPid === self) return { pids: [], groups: [] }
+  if (platform === 'win32') {
+    try { exec('taskkill', ['/PID', String(rootPid), '/T', '/F'], { timeout: 5000, stdio: 'ignore' }) } catch { /* already gone */ }
+    return { pids: [rootPid], groups: [] }
+  }
+  const snapshot = () => { try { return processTable(ps()) } catch { return new Map() } }
+  const table = snapshot()
+  // The daemon, everything above it, and the groups they are in: never ours to kill.
+  const spare = new Set()
+  const spareGroups = new Set([0, 1])
+  for (let pid = self; pid > 1 && !spare.has(pid); pid = table.get(pid)?.ppid ?? 0) {
+    spare.add(pid)
+    if (table.has(pid)) spareGroups.add(table.get(pid).pgid)
+  }
+  const pids = [rootPid, ...walk(table, rootPid)].filter(pid => !spare.has(pid))
+  const groups = [...new Set(pids.map(pid => table.get(pid)?.pgid).filter(g => g && !spareGroups.has(g)))]
+
+  for (const g of groups) kill(-g, 'SIGTERM')
+  for (const pid of pids) kill(pid, 'SIGTERM')
+  const t = setTimeout(() => {
+    const now = snapshot()
+    const late = pids.filter(pid => now.has(pid)).flatMap(pid => walk(now, pid)).filter(pid => !spare.has(pid))
+    for (const g of groups) kill(-g, 'SIGKILL')
+    for (const pid of new Set([...pids, ...late])) kill(pid, 'SIGKILL')
+  }, graceMs)
+  if (typeof t.unref === 'function') t.unref()
+  return { pids, groups }
+}
+
+// `ps` columns pid ppid pgid, one process a line. Same flags on macOS and Linux.
+function psWithGroups () {
+  return execFileSync('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid='], { encoding: 'utf8', timeout: 5000 })
+}
+
+function processTable (rows) {
+  const table = new Map()
+  for (const line of String(rows).split('\n')) {
+    const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number)
+    if (pid && Number.isFinite(ppid)) table.set(pid, { ppid, pgid: Number.isFinite(pgid) ? pgid : 0 })
+  }
+  return table
+}
+
+// Every pid below `root` in a process table.
+function walk (table, root) {
+  const children = new Map()
+  for (const [pid, { ppid }] of table) {
+    if (!children.has(ppid)) children.set(ppid, [])
+    children.get(ppid).push(pid)
+  }
+  const out = []
+  const seen = new Set([root])
+  const stack = [root]
+  while (stack.length) {
+    for (const c of children.get(stack.pop()) || []) {
+      if (seen.has(c)) continue
+      seen.add(c)
+      out.push(c)
+      stack.push(c)
+    }
+  }
+  return out
+}
+
+function signal (pid, sig) {
+  try { process.kill(pid, sig); return true } catch { return false }
+}
+
+/**
  * The tasks this daemon has started and not yet reported on, kept ON DISK (#191560).
  *
  * A daemon that is SIGKILLed, crashes or loses power cannot report on the way out. The next one
@@ -141,4 +226,4 @@ async function reportInterrupted (cloud, taskIds, reason, timeoutMs = 3000) {
   return done
 }
 
-module.exports = { ENDED_STATUSES, endedAtAccept, descendantPids, killTree, InflightLedger, reportInterrupted }
+module.exports = { ENDED_STATUSES, endedAtAccept, descendantPids, killTree, killTaskTree, processTable, InflightLedger, reportInterrupted }
