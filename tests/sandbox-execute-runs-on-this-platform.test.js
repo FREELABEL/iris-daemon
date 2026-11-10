@@ -137,3 +137,30 @@ test('daemon/task-executor.js does not hardcode a POSIX shell for sandbox_execut
   assert.match(block[0], /scriptFor\(/,
     'sandbox_execute should resolve its interpreter through scriptFor()')
 })
+
+test('through the executor: sandbox_execute runs and reports its output (#192109)', async () => {
+  // The tests above spawn with scriptFor()'s options themselves. The executor did not pass
+  // them on, so on Windows node escaped the quoted script path and cmd.exe ran nothing:
+  // "'\"C:\…\task-script.cmd\"' is not recognized" for every `iris hive run`.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'iris-sbx-exec-'))
+  const keep = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+  const { TaskExecutor } = require('../daemon/task-executor')
+  const { WorkspaceManager } = require('../daemon/workspace-manager')
+  const sent = []
+  const cloud = { submitResult: async (id, body) => { sent.push(body) }, reportProgress: async () => {}, reportOutput: async () => {}, post: async () => ({}) }
+  const ex = new TaskExecutor(cloud, new WorkspaceManager(path.join(home, 'data')))
+  ex.tmux = { available: false, cleanup () {}, cleanupAll () {} }
+  const quiet = ['log', 'warn', 'error'].map((k) => [k, console[k]])
+  for (const [k] of quiet) console[k] = () => {}
+  try {
+    await ex.execute({ id: 'sbx-exec-0001', type: 'sandbox_execute', prompt: 'echo through-the-executor', config: { timeout_seconds: 30 } })
+  } finally {
+    for (const [k, fn] of quiet) console[k] = fn
+    Object.assign(process.env, keep)
+  }
+  const last = sent.at(-1) || {}
+  assert.strictEqual(last.status, 'completed', `expected completed, got ${JSON.stringify(last).slice(0, 400)}`)
+  assert.match(JSON.stringify(last), /through-the-executor/)
+})
