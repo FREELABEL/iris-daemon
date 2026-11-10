@@ -930,7 +930,11 @@ class Daemon {
         running_tasks: this.executor.runningTasks.size,
         persistent_processes: persistentProcesses,
         ingest_buffer: this.ingestBuffer.length,
-        uptime_s: Math.floor(process.uptime())
+        uptime_s: Math.floor(process.uptime()),
+        // Standalone (no bridge on this port, as on a Windows node run by a scheduled task) this
+        // IS the /health `iris daemon update` reads to prove the new code runs. Without the commit
+        // every update there rolled back after 180s, the new daemon healthy (#192109).
+        ...versionFields()
       })
     })
 
