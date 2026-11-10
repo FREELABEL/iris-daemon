@@ -76,7 +76,15 @@ const mailCompose = require('./lib/mail-compose')
 app.use(bridgeAuth({ openPaths: OPEN_PATHS, openPrefixes: OPEN_PREFIXES }))
 
 // Full paths to CLIs (avoids PATH issues in subprocess)
-const CLAUDE_BIN = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude'
+// Where `claude` is on THIS machine, looked up when it is needed (lib/claude-bin.js). It used to be
+// the env var with a fixed /opt/homebrew/bin/claude default — a Mac-only path that made every reply to
+// a Linux node fail with `spawn /opt/homebrew/bin/claude ENOENT` (epic #192964, W4 R2).
+function claudeBin () {
+  const { resolveClaudeBin, notFoundMessage } = require('./lib/claude-bin')
+  const r = resolveClaudeBin()
+  if (!r.bin) throw new Error(notFoundMessage(r.tried))
+  return r.bin
+}
 const OPENCODE_BIN = process.env.OPENCODE_BIN || '/opt/homebrew/bin/opencode'
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'
 const IRIS_API_URL = process.env.IRIS_API_URL || 'https://freelabel.net'
@@ -2982,7 +2990,7 @@ app.post('/api/sessions/claude-code', async (req, res) => {
     if (model) args.push('--model', model)
 
     console.log(`[claude-code] Creating session ${sid} in ${cwd}`)
-    const raw = await runCLI(CLAUDE_BIN, args, { timeoutMs: 90000, cwd })
+    const raw = await runCLI(claudeBin(), args, { timeoutMs: 90000, cwd })
     const data = tryJSON(raw)
 
     const result = {
@@ -3020,18 +3028,40 @@ app.post('/api/sessions/claude-code/:id/answer', (req, res) => {
   res.status(out.status).json(out.body)
 })
 
+// A message to a Claude Code session (epic #192964, W4 R2). RUNNING here inside tmux → typed into
+// its pane, so it lands in the same session the person is looking at (lib/session-message.js).
+// Running but not in tmux → refused with the reason. Only a session NOT running here is resumed
+// with `claude -p --resume`: with no live process there is nothing to fork away from.
 app.post('/api/sessions/claude-code/:id/message', async (req, res) => {
-  const { message } = req.body
+  const { message, from } = req.body || {}
   const sid = req.params.id
 
   try {
-    const args = ['-p', message, '--resume', sid, '--output-format', 'json']
+    const { deliverMessage } = require('./lib/session-message')
+    const { execFileSync } = require('child_process')
+    const out = await deliverMessage({
+      fs,
+      home: process.env.HOME,
+      now: () => Date.now(),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      kill: (pid, sig) => process.kill(pid, sig),
+      ps: () => execFileSync('ps', ['-A', '-o', 'pid=', '-o', 'ppid='], { encoding: 'utf8', timeout: 5000 }),
+      tmux: (args) => execFileSync('tmux', args, { encoding: 'utf8', timeout: 5000 })
+    }, sid, { message, from })
+    if (!out.resume) {
+      console.log(`[claude-code] Message to ${sid.slice(-8)} -> ${out.status} ${out.body.delivered ? `pane ${out.body.pane} seen=${out.body.seen}` : out.body.error}`)
+      return res.status(out.status).json(out.body)
+    }
 
-    console.log(`[claude-code] Message to session ${sid}`)
-    const raw = await runCLI(CLAUDE_BIN, args, { timeoutMs: 180000 })
+    const text = from ? `[via iris \u00b7 ${String(from).slice(0, 64)}] ${message}` : message
+    const args = ['-p', text, '--resume', sid, '--output-format', 'json']
+
+    console.log(`[claude-code] Message to session ${sid} (not running here — resuming it)`)
+    const raw = await runCLI(claudeBin(), args, { timeoutMs: 180000 })
     const data = tryJSON(raw)
 
     res.json({
+      delivered: 'resume',
       response: data?.result || raw,
       model: data?.model || null,
       tokens_used: (data?.usage?.input_tokens || 0) + (data?.usage?.output_tokens || 0),
@@ -4426,7 +4456,8 @@ app.post('/api/sessions/open-terminal', (req, res) => {
   let cmd = command
   if (!cmd) {
     if (provider === 'claude_code' || provider === 'claude-code') {
-      cmd = session_id ? `${CLAUDE_BIN} --resume ${session_id}` : CLAUDE_BIN
+      { let bin = 'claude'; try { bin = claudeBin() } catch { /* the terminal's own PATH may still have it */ }
+        cmd = session_id ? `${bin} --resume ${session_id}` : bin }
     } else if (provider === 'opencode') {
       cmd = OPENCODE_BIN
     } else if (provider === 'ollama') {

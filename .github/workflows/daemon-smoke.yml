@@ -42,6 +42,13 @@ jobs:
       - name: daemonctl under systemd — user unit, and system unit as root
         run: node --test tests/daemonctl-systemd.test.js tests/linux-supervision.test.js
 
+      # A reply typed into a running session's REAL tmux pane, on Linux like iris-hive-001
+      # (#192964 W4 R2). The Mac dev machines have no tmux, so this is where that test runs.
+      - name: a message reaches a running session's tmux pane
+        run: |
+          command -v tmux || (sudo apt-get update -qq && sudo apt-get install -y -qq tmux)
+          node --test tests/session-message.test.js
+
   # The Windows leg. Separate job, not a matrix entry, because it answers a different
   # question and has different steps.
   #
