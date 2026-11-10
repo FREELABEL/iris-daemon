@@ -2381,6 +2381,9 @@ class TaskExecutor {
           if (script.mode) fs.chmodSync(script.scriptPath, script.mode)
           cmd = script.cmd
           args = script.args
+          // windowsVerbatimArguments on Windows. Without it node escapes the quoted script path
+          // to \"…\", and cmd.exe answers "is not recognized" for every `iris hive run` (#192109).
+          spawnOptions = script.spawnOptions
           break
         }
 
