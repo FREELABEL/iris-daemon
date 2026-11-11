@@ -2034,13 +2034,18 @@ end tell`
       res.json(mailCompose.CAPABILITIES)
     })
 
-    // One message's envelope by RFC Message-ID — what a reply / reply-all is computed from.
+    // One message. A Mail index id (what /api/mail/search returns, what `iris mail read <id>`
+    // sends) reads the index and the .emlx directly: envelope AND body, in milliseconds. An RFC
+    // Message-ID (what a reply / reply-all is computed from) still goes through Mail.app.
     app.get(`${prefix}/api/mail/message`, async (req, res) => {
       if (process.platform !== 'darwin') {
         return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
       }
       try {
-        const out = await mailCompose.lookupMessage(require('child_process').execFile, req.query)
+        const mailMessage = require('../drivers/apple-mail-message')
+        const out = mailMessage.isRowId(req.query.id)
+          ? await mailMessage.readMessage(String(req.query.id).trim(), req.query.max_body)
+          : await mailCompose.lookupMessage(require('child_process').execFile, req.query)
         res.status(out.status).json(out.body)
       } catch (err) {
         res.status(500).json({ error: err.message })
@@ -2170,6 +2175,8 @@ LIMIT ${limit}
       // it as `body` when include_body=1.
       const sql = `
 SELECT
+  m.ROWID AS id,
+  mb.url AS mailbox,
   datetime(m.date_received, 'unixepoch', 'localtime') AS ts,
   a.address AS email,
   a.comment AS name,
@@ -2179,6 +2186,7 @@ FROM messages m
 JOIN addresses a ON m.sender = a.ROWID
 JOIN subjects s ON m.subject = s.ROWID
 LEFT JOIN summaries sum ON m.summary = sum.ROWID
+LEFT JOIN mailboxes mb ON mb.ROWID = m.mailbox
 WHERE (a.address LIKE '%${fromEscaped}%' OR a.comment LIKE '%${fromEscaped}%')
   AND m.date_received > ${cutoffEpoch}
 ORDER BY m.date_received DESC
@@ -2209,13 +2217,21 @@ LIMIT ${limit}
           )
         })
 
-        const messages = result.map((row) => ({
-          date: row.ts || '',
-          sender: row.name ? `${row.name} <${row.email}>` : row.email,
-          subject: row.subject || '',
-          // Summary is the Mail.app cached preview (~1KB). Truncate if too long.
-          body: includeBody ? (row.body || '').slice(0, 1500) : '',
-        }))
+        const maxBody = Math.max(200, Math.min(10000, parseInt(req.query.max_body || '4000', 10) || 4000))
+        const { bodyFor } = require('../drivers/apple-mail-message')
+        const messages = result.map((row) => {
+          // The body comes from the .emlx. The `summaries` preview was used before: it is empty
+          // until Mail builds one, so a search with include_body=1 often came back with no text.
+          const read = includeBody ? bodyFor(row.id, row.mailbox, maxBody) : null
+          return {
+            id: row.id == null ? null : Number(row.id),
+            date: row.ts || '',
+            sender: row.name ? `${row.name} <${row.email}>` : row.email,
+            subject: row.subject || '',
+            body: read ? (read.text ?? (row.body || '').slice(0, maxBody)) : '',
+            ...(read && read.error ? { body_error: read.error } : {}),
+          }
+        })
 
         res.json({ messages, count: messages.length, from, days })
       } catch (err) {

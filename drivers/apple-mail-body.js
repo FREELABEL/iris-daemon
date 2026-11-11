@@ -104,7 +104,7 @@ function decodePart (body, headers, charset) {
   return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
 }
 
-const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ndash: '–', mdash: '—', hellip: '…', rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”' }
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ndash: '–', mdash: '—', hellip: '…', rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”', zwnj: '', zwj: '', shy: '', zwsp: '', bull: '•', copy: '©', reg: '®', trade: '™', middot: '·' }
 
 function htmlToText (html) {
   return String(html)
@@ -116,7 +116,10 @@ function htmlToText (html) {
     .replace(/<[^>]+>/g, '')
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
-    .replace(/&([a-z]+);/gi, (m, n) => ENTITIES[String(n).toLowerCase()] || m)
+    .replace(/&([a-z]+);/gi, (m, n) => ENTITIES[String(n).toLowerCase()] ?? m)
+    // Marketing mail pads its preview line with hundreds of invisible characters.
+    .replace(/[\u200b-\u200d\u2060\u00ad\ufeff\u034f]/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
