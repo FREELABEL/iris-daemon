@@ -635,6 +635,10 @@ class Daemon {
       ...(this.inference && this.inference.report() ? { inference: this.inference.report() } : {}),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
+      // What each live session's worktree has touched (#193188): the server compares sessions
+      // linked to board items and tells both sides of an overlap through the Hive inbox.
+      // Omitted until the first scan lands; the server then keeps what it had.
+      ...(Array.isArray(this._workFilesReport) ? { work_files: this._workFilesReport } : {}),
       ...(this._atlasSyncReport ? { atlas_sync: this._atlasSyncReport } : {}),
       // Live free space on ~/.iris, plus the last failed state write (#188700). Omitted when the
       // platform cannot measure it; the cloud keeps the startup number then.
@@ -3035,6 +3039,19 @@ LIMIT ${limit}
     }
   }
 
+  /**
+   * Scan the live sessions' worktrees for touched files (#193188), in the background: the
+   * heartbeat state callback is synchronous, so it reads the last finished scan. One at a time.
+   */
+  _refreshWorkFiles (sessions) {
+    if (this._workFilesScanning) return
+    this._workFilesScanning = true
+    require('./work-files').collectWorkFiles(sessions)
+      .then((r) => { this._workFilesReport = r })
+      .catch(() => {})
+      .finally(() => { this._workFilesScanning = false })
+  }
+
   // Called periodically to refresh the session cache (async-safe)
   /**
    * Refresh the AI-session cache reported to the fleet on every heartbeat.
@@ -3186,6 +3203,7 @@ LIMIT ${limit}
       }
 
       this._cachedSessions = sessions
+      this._refreshWorkFiles(sessions)
     } catch (err) {
       // Could NOT look. Keep whatever was last known, but stop claiming it is current —
       // the heartbeat will omit the field entirely, so the server preserves the old list
