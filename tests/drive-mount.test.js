@@ -85,7 +85,7 @@ describe('mount plan: rw takes the lock, ro never does', () => {
     fs.writeFileSync(path.join(h, '.iris', 'drives', 'work.json'), JSON.stringify({
       name: 'work', meta: 'redis://:s3cretpw@100.64.0.9:6379/1', mountpoint: mp, identity: '501:20'
     }))
-    return { h, mp, table: `JuiceFS:work ${mp} fuse.juicefs rw 0 0\n` }
+    return { h, mp, table: `JuiceFS:work ${mp} fuse.juicefs rw,nosuid,nodev,user_id=1000,group_id=1000,allow_other 0 0\n` }
   }
 
   it('rw: the workspace is bound read-write and the drive is locked', () => {
@@ -120,6 +120,18 @@ describe('mount plan: rw takes the lock, ro never does', () => {
     const p = planDriveMount('work', { home: h, mountsTable: '', holder: 't', ttlSeconds: 60 })
     assert.equal(p.ok, false)
     assert.match(p.reason, /not mounted/)
+  })
+
+  it('a user FUSE mount without allow_other is refused with the fix — Docker could not see it (measured)', () => {
+    const { h, mp } = home()
+    const table = `JuiceFS:work ${mp} fuse.juicefs rw,nosuid,nodev,relatime,user_id=1000,group_id=1000,max_read=131072 0 0\n`
+    const p = planDriveMount('work:ro', { home: h, mountsTable: table, holder: 't', ttlSeconds: 60 })
+    assert.equal(p.ok, false)
+    assert.match(p.reason, /allow_other/)
+    assert.match(p.reason, /user_allow_other/)
+    // a root mount needs no option
+    const root = `JuiceFS:work ${mp} fuse.juicefs rw,user_id=0,group_id=0 0 0\n`
+    assert.equal(planDriveMount('work:ro', { home: h, mountsTable: root, holder: 't', ttlSeconds: 60 }).ok, true)
   })
 
   it('an unknown drive is refused', () => {

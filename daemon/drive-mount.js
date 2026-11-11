@@ -132,6 +132,22 @@ function isMounted (mountpoint, mountsTable) {
 }
 
 /**
+ * Can root's Docker daemon see into this FUSE mount? FUSE refuses every user but the one who
+ * mounted it — root included — unless it was mounted with allow_other. Measured on iris-hive-001
+ * (#188567): a user mount without it, and `docker run -v` fails with "error while creating mount
+ * source path … file exists". Say why instead. Mounts we cannot classify are given the benefit.
+ */
+function dockerCanSee (mountpoint, mountsTable) {
+  const mp = path.resolve(mountpoint)
+  const line = mountsTable.split('\n').find((l) => l.split(/\s+/)[1] === mp)
+  if (!line) return true
+  const [, , type, opts = ''] = line.split(/\s+/)
+  if (!/^fuse/.test(type)) return true
+  const o = opts.split(',')
+  return o.includes('allow_other') || o.includes('user_id=0')
+}
+
+/**
  * The drive's paths on this node — the mountpoint and its workspace. NEVER the metadata URL.
  * Throws with a plain reason when the drive is unknown here or not mounted: a sandbox must not be
  * handed the empty directory underneath an unmounted drive and told it is the drive.
@@ -163,6 +179,11 @@ function planDriveMount (spec, { home, mountsTable, holder, ttlSeconds = 600 } =
   } catch (e) {
     return { ok: false, reason: e.message }
   }
+  let table = mountsTable
+  if (table === undefined) { try { table = fs.readFileSync('/proc/mounts', 'utf8') } catch { table = '' } }
+  if (!dockerCanSee(d.mountpoint, table)) {
+    return { ok: false, reason: `drive ${want.name} is mounted without allow_other, so Docker cannot see it — add user_allow_other to /etc/fuse.conf, then iris hive drive unmount ${want.name} && iris hive drive mount ${want.name}` }
+  }
   fs.mkdirSync(d.workspace, { recursive: true })
   if (!want.readOnly) {
     const got = acquireRw(d.mountpoint, holder, ttlSeconds)
@@ -177,4 +198,4 @@ function planDriveMount (spec, { home, mountsTable, holder, ttlSeconds = 600 } =
   }
 }
 
-module.exports = { parseDriveSpec, acquireRw, releaseRw, readHolder, isMounted, resolveDrive, planDriveMount, NAME }
+module.exports = { parseDriveSpec, acquireRw, releaseRw, readHolder, isMounted, dockerCanSee, resolveDrive, planDriveMount, NAME }
