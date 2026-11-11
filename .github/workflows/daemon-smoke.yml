@@ -37,6 +37,13 @@ jobs:
       - name: file search engines on real Linux (scan, fallback, injection)
         run: node --test tests/disk-search-on-this-platform.test.js tests/disk-search.test.js tests/file-search-guard.test.js
 
+      # What a live session's worktree touched, against a real git repo (#193188). The server's
+      # overlap check (fl-iris-api WorkOverlapTest) parses a fixture this test produced.
+      - name: board overlap — touched files per live session (real git)
+        run: |
+          git config --global init.defaultBranch main
+          node --test tests/work-files.test.js
+
       # Needs setsid, so it cannot run on a Mac: real daemonctl against systemctl/loginctl doubles,
       # user unit + linger for an account, system unit for root (#191615, #192964).
       - name: daemonctl under systemd — user unit, and system unit as root
