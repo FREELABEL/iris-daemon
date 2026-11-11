@@ -2355,33 +2355,9 @@ app.get('/api/mail/message', async (req, res) => {
   if (process.platform !== 'darwin') {
     return res.status(503).json({ error: `Apple Mail is macOS-only — this machine is ${process.platform}`, reason_code: 'not_macos' })
   }
-  const maxBody = Math.max(200, Math.min(100000, parseInt(req.query.max_body || '20000', 10)))
   try {
-    const store = require('./drivers/apple-mail-store')
-    const env = await store.messageById(req.query.id)
-    if (!env) return res.status(404).json({ error: `No message with id ${req.query.id} in the Mail index` })
-    const { readBody } = require('./drivers/apple-mail-body')
-    let body = null
-    let bodyError = null
-    try {
-      body = readBody(env.id, env.mailbox)
-    } catch (e) {
-      // The envelope is still worth returning; the missing body is NAMED, never an empty string.
-      bodyError = e.message
-    }
-    res.json({
-      id: env.id,
-      subject: env.subject,
-      sender: env.sender,
-      sender_name: env.sender_name,
-      date_sent: env.sent_at ? env.sent_at.toISOString() : null,
-      mailbox: env.mailbox,
-      message_id_header: body ? body.messageIdHeader : null,
-      body: body ? body.text.slice(0, maxBody) : null,
-      body_truncated: body ? body.text.length > maxBody : false,
-      partial: body ? body.partial : false,
-      ...(bodyError ? { body_error: bodyError } : {}),
-    })
+    const out = await require('./drivers/apple-mail-message').readMessage(req.query.id, req.query.max_body)
+    res.status(out.status).json(out.body)
   } catch (err) {
     const bad = /message id must be/i.test(err.message)
     if (!bad) logDriverError('mail/message', err, { store: 'Mail' })
