@@ -2227,6 +2227,12 @@ class TaskExecutor {
     // (#186174). Now a throw anywhere in the body rejects this promise and fails only the task.
     return new Promise((resolve, reject) => {
       this._runProcessBody(task, workspace, outputLines, outputStream, resolve, reject).catch(reject)
+    }).finally(() => {
+      // #188567: a run that held a drive read-write lets go of it however it ended.
+      if (typeof task._driveRelease === 'function') {
+        try { task._driveRelease() } catch (e) { console.warn(`[executor] drive release failed: ${e.message}`) }
+        task._driveRelease = null
+      }
     })
   }
 
@@ -2435,9 +2441,23 @@ class TaskExecutor {
             console.log(`[executor] user_script '${slug}' settings: ${Object.keys(task._scriptArgEnv).join(', ')}`)
           }
 
+          // #188567 — a Hive drive at /workspace. rw takes the drive's one write lock (held in the
+          // drive, so every node sees it) until this run ends; ro takes none. Refusals fail the
+          // task with the reason — never a run without the drive it asked for.
+          let drive = null
+          if (task.config?.drive) {
+            const timeoutS = Number(task.timeout_seconds || task.config?.timeout_seconds) || 300
+            const dp = require('./drive-mount').planDriveMount(task.config.drive, { holder: `task-${task.id}`, ttlSeconds: timeoutS + 120 })
+            if (!dp.ok) throw new Error(`refusing to run '${slug}': ${dp.reason}`)
+            task._driveRelease = dp.release
+            drive = { hostPath: dp.hostPath, readOnly: dp.readOnly }
+            console.log(`[executor] user_script '${slug}' drive ${dp.name} at /workspace (${dp.readOnly ? 'read-only' : 'read-write'})`)
+          }
+
           const plan = planScriptExecution({
             runtime,
             scriptPath,
+            drive,
             env: task._scriptArgEnv,
             outputDir: workspace.outputDir || path.join(workspace.dir, '.output'),
             manifest: script.manifest || task.config?.manifest || {},

@@ -59,6 +59,9 @@ const RUNTIME_ENTRY = {
  * @param {object} [o.limits]   { cpus, memory, pids, timeoutSeconds }
  * @param {boolean} [o.allowNetwork] opt IN to egress (S2.3); default is none
  * @param {object} [o.env]      explicit env to hand in; NOTHING is inherited
+ * @param {object} [o.drive]    #188567 { hostPath, readOnly } — a Hive drive's workspace, bound at
+ *                              /workspace. Files only: the drive's metadata URL and keys never
+ *                              reach the container (drive-mount.js returns paths, never config).
  */
 function buildSandboxCommand (o) {
   const runtime = o.runtime || 'bash'
@@ -118,7 +121,17 @@ function buildSandboxCommand (o) {
     args.push('-e', `${k}=${v}`)
   }
 
-  args.push('--workdir', '/out')
+  if (o.drive) {
+    const hp = o.drive.hostPath
+    if (typeof hp !== 'string' || !path.isAbsolute(hp)) throw new Error('drive hostPath must be an absolute host path')
+    // A ':' or ',' would let a path smuggle its own mount options (e.g. "/a:/etc").
+    if (/[:,\n]/.test(hp)) throw new Error(`refusing drive path with mount syntax in it: ${hp}`)
+    // ro is the KERNEL's rule (a read-only bind), not a request the script could ignore.
+    args.push('-v', `${hp}:/workspace:${o.drive.readOnly ? 'ro' : 'rw'}`)
+  }
+
+  // With a drive the run starts in it — that is where its work lives between runs.
+  args.push('--workdir', o.drive ? '/workspace' : '/out')
   args.push(image)
   args.push(...RUNTIME_ENTRY[runtime](`/run/${scriptName}`))
 
@@ -231,6 +244,12 @@ function planScriptExecution (o) {
     return { mode: 'refused', isolated: false, reason: decision.reason, cmd: null, args: null }
   }
 
+  // #188567: a drive mounts into a SANDBOX. On the host the script would have the whole drive —
+  // and the whole machine — with no read-only enforcement and no lock it could not ignore.
+  if (o.drive && decision.mode !== 'sandboxed') {
+    return { mode: 'refused', isolated: false, reason: 'a Hive drive mounts only into a sandbox, and this run would not be sandboxed (no container runtime)', cmd: null, args: null }
+  }
+
   // The manifest may lower the timeout but not raise it past the sandbox ceiling; a script does
   // not get to grant itself more of the node than the node offers.
   const timeoutSeconds = Math.min(
@@ -245,6 +264,7 @@ function planScriptExecution (o) {
       outputDir: o.outputDir,
       allowNetwork: egressAllowed(manifest),
       env: o.env,
+      drive: o.drive,
       limits: { ...(o.limits || {}), timeoutSeconds }
     })
 
