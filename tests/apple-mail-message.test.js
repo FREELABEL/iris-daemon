@@ -79,3 +79,11 @@ test('a row id answers with envelope and body, read from disk, with no invisible
     delete process.env.IRIS_MAIL_DB
   }
 })
+
+test('each server registers GET /api/mail/message exactly once — a second route never runs', () => {
+  // Express answers with the FIRST matching route. A second registration on the same path is
+  // dead code that looks like a fix: that is how the .emlx reader sat unused (2026-11-11).
+  const count = (file, re) => (fs.readFileSync(path.join(__dirname, '..', file), 'utf-8').match(re) || []).length
+  assert.equal(count('index.js', /app\.get\(\s*'\/api\/mail\/message'/g), 1)
+  assert.equal(count('daemon/index.js', /app\.get\(\s*`\$\{prefix\}\/api\/mail\/message`/g), 1)
+})
