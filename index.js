@@ -2333,30 +2333,27 @@ app.get('/api/mail/capabilities', (req, res) => {
   res.json(mailCompose.CAPABILITIES)
 })
 
-/** GET /api/mail/message?id=<message-id>&days=90&account= — one message's envelope, for a reply. */
-app.get('/api/mail/message', async (req, res) => {
-  if (process.platform !== 'darwin') {
-    return res.status(503).json({ error: 'Apple Mail is only available on macOS' })
-  }
-  try {
-    const out = await mailCompose.lookupMessage(require('child_process').execFile, req.query)
-    res.status(out.status).json(out.body)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
 /**
- * GET /api/mail/message?id=<message id>
- * One message: envelope from the index, body from its .emlx (#189480). The id is the `id`
- * field /api/mail/search returns. Bodies were unreachable off the Mac before this.
+ * GET /api/mail/message?id=<id>
+ *
+ * ONE route for both kinds of id. It used to be TWO routes on the same path, and Express answers
+ * with the first: the Mail.app lookup below shadowed the .emlx reader added under it (#189480),
+ * so `iris mail read 387748` sent a row id to an AppleScript that only knows RFC Message-IDs. It
+ * scanned 90 days of mail, matched nothing and failed at 120 s, every time (2026-11-11).
+ *
+ * - A Mail index row id (the `id` /api/mail/search returns): envelope from the index, body from
+ *   its .emlx — milliseconds.
+ * - An RFC Message-ID (what a reply / reply-all is computed from): Mail.app's own lookup.
  */
 app.get('/api/mail/message', async (req, res) => {
   if (process.platform !== 'darwin') {
     return res.status(503).json({ error: `Apple Mail is macOS-only — this machine is ${process.platform}`, reason_code: 'not_macos' })
   }
+  const mailMessage = require('./drivers/apple-mail-message')
   try {
-    const out = await require('./drivers/apple-mail-message').readMessage(req.query.id, req.query.max_body)
+    const out = mailMessage.isRowId(req.query.id)
+      ? await mailMessage.readMessage(String(req.query.id).trim(), req.query.max_body)
+      : await mailCompose.lookupMessage(require('child_process').execFile, req.query)
     res.status(out.status).json(out.body)
   } catch (err) {
     const bad = /message id must be/i.test(err.message)
