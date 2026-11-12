@@ -1,4 +1,5 @@
 const { readOpencodeModel, readGitBranch } = require('./daemon/opencode-session-meta')
+const { confirmOutgoing, sqliteRunner, httpResult } = require('./drivers/imessage-confirm')
 const express = require('express')
 const obsidian = require('./drivers/obsidian')
 const { spawn } = require('child_process')
@@ -1996,8 +1997,9 @@ app.post('/api/imessage/direct-send', async (req, res) => {
     }
 
     try {
-      await iMessageChannel.driver.sendMessage(chat_guid, text)
-      return res.json({ ok: true, chat_guid, preview: text.slice(0, 80) })
+      const result = await iMessageChannel.driver.sendMessage(chat_guid, text, { confirm: true })
+      const { status, body } = httpResult(result.confirmation, chat_guid)
+      return res.status(status).json({ ...body, chat_guid, preview: text.slice(0, 80) })
     } catch (err) {
       console.error(`[imessage/direct-send] Failed: ${err.message}`)
       return res.status(500).json({ error: err.message })
@@ -2007,8 +2009,11 @@ app.post('/api/imessage/direct-send', async (req, res) => {
   // Handle-based send — try driver resolution first, fallback to AppleScript
   if (iMessageChannel && iMessageChannel.driver && iMessageChannel.driver.sendToHandle) {
     try {
-      const result = await iMessageChannel.driver.sendToHandle(handle, text)
-      return res.json({ ok: true, handle, method: result.method || 'chat_guid', preview: text.slice(0, 80) })
+      // A THROW means Messages never accepted the command, so falling through is safe. A
+      // not-confirmed send RETURNS — it must not fall through, or it would be sent twice.
+      const result = await iMessageChannel.driver.sendToHandle(handle, text, { confirm: true })
+      const { status, body } = httpResult(result.confirmation, handle)
+      return res.status(status).json({ ...body, handle, method: result.method || 'chat_guid', preview: text.slice(0, 80) })
     } catch (err) {
       console.error(`[imessage/direct-send] Driver sendToHandle failed: ${err.message}`)
       // Fall through to AppleScript fallback
@@ -2024,6 +2029,8 @@ app.post('/api/imessage/direct-send', async (req, res) => {
     return res.status(503).json({ error: 'Messages.app could not be launched or is not scriptable. Open Messages and retry.' })
   }
 
+  let sinceUnix = Date.now() / 1000
+
   try {
     const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
     const script =
@@ -2034,6 +2041,7 @@ app.post('/api/imessage/direct-send', async (req, res) => {
       `end tell`
 
     const { execFile } = require('child_process')
+    sinceUnix = Date.now() / 1000
     await new Promise((resolve, reject) => {
       execFile('/usr/bin/osascript', ['-e', script], { timeout: 15000 }, (err, stdout, stderr) => {
         if (err) {
@@ -2044,11 +2052,15 @@ app.post('/api/imessage/direct-send', async (req, res) => {
       })
     })
 
-    res.json({ ok: true, handle, method: 'applescript_buddy', preview: text.slice(0, 80) })
   } catch (err) {
     console.error(`[imessage/direct-send] AppleScript fallback failed: ${err.message}`)
-    res.status(500).json({ error: err.message })
+    return res.status(500).json({ error: err.message })
   }
+
+  // Messages accepted the command — that is not "sent". Answer with what chat.db says.
+  const confirmation = await confirmOutgoing({ runSql: sqliteRunner(), handle, text, sinceUnix })
+  const { status, body } = httpResult(confirmation, handle)
+  return res.status(status).json({ ...body, handle, method: 'applescript_buddy', preview: text.slice(0, 80) })
 })
 
 /**

@@ -12,6 +12,7 @@
  */
 
 const EventEmitter = require('events')
+const { confirmOutgoing } = require('./imessage-confirm')
 const { execFile } = require('child_process')
 const fs = require('fs')
 const os = require('os')
@@ -356,6 +357,7 @@ class NativeIMessageDriver extends EventEmitter {
       `  send "${escaped}" to chat id "${chatGuid}"\n` +
       `end tell`
 
+    const sinceUnix = Date.now() / 1000
     await this._runOsascript(script)
 
     // Track sent text to avoid picking it up in the next poll
@@ -363,8 +365,24 @@ class NativeIMessageDriver extends EventEmitter {
     this._recentlySent.add(key)
     setTimeout(() => this._recentlySent.delete(key), 30000)
 
-    console.log(`[native-imessage] ✓ Sent message (${text.length} chars)`)
+    if (options.confirm) return this._confirm({ chatGuid, text, sinceUnix })
+    console.log(`[native-imessage] Handed message to Messages (${text.length} chars, not confirmed)`)
     return { ok: true }
+  }
+
+  /**
+   * osascript returning only means Messages ACCEPTED the command. With {confirm:true} the send
+   * resolves to what chat.db says. Never throws for "not confirmed" — a throw makes callers try a
+   * second send path, which would duplicate a message that did go out.
+   */
+  async _confirm({ chatGuid, handle, text, sinceUnix, method }) {
+    const confirmation = await confirmOutgoing({
+      runSql: (sql) => this._runSqlite3(sql), chatGuid, handle, text, sinceUnix,
+      ...(this.config.confirmTimeoutMs ? { timeoutMs: this.config.confirmTimeoutMs, intervalMs: 20 } : {}),
+    })
+    const ok = confirmation.state === 'sent'
+    console.log(`[native-imessage] ${ok ? '✓ Confirmed sent' : `✗ Not confirmed (${confirmation.state})`} (${text.length} chars)`)
+    return { ok, confirmation, ...(method ? { method } : {}) }
   }
 
   /**
@@ -437,13 +455,15 @@ class NativeIMessageDriver extends EventEmitter {
       `  send "${escaped}" to targetBuddy\n` +
       `end tell`
 
+    const sinceUnix = Date.now() / 1000
     await this._runOsascript(script)
 
     const key = `${handle}:${text.slice(0, 100)}`
     this._recentlySent.add(key)
     setTimeout(() => this._recentlySent.delete(key), 30000)
 
-    console.log(`[native-imessage] ✓ Sent via buddy lookup (${text.length} chars)`)
+    if (options.confirm) return this._confirm({ handle, text, sinceUnix, method: 'buddy_lookup' })
+    console.log(`[native-imessage] Handed to Messages via buddy lookup (${text.length} chars, not confirmed)`)
     return { ok: true, method: 'buddy_lookup' }
   }
 
