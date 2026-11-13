@@ -1,0 +1,11 @@
+25 31 0:23 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
+26 31 0:24 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+27 31 0:5 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=16313832k
+29 31 0:26 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=3274928k,mode=755
+31 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw,errors=remount-ro
+40 31 259:1 / /boot/efi rw,relatime shared:31 - vfat /dev/nvme0n1p1 rw,fmask=0077
+55 31 7:3 / /snap/core22/1612 ro,nodev,relatime shared:29 - squashfs /dev/loop3 ro
+61 29 0:52 / /run/user/1000 rw,nosuid,nodev,relatime shared:401 - tmpfs tmpfs rw,size=3274924k
+70 31 0:60 / /var/lib/docker/overlay2/abc/merged rw,relatime - overlay overlay rw,lowerdir=/x
+88 31 8:17 / /media/me/Backup\040A rw,nosuid,nodev,relatime shared:520 - exfat /dev/sdb1 rw,fmask=0022
+89 31 8:33 / /mnt/redwalrus ro,relatime shared:521 - hfsplus /dev/sdc2 ro,umask=22

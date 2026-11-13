@@ -1,0 +1,5 @@
+Macintosh HD
+Backup A
+Studio Drive
+.timemachine
+Com.apple.TimeMachine.localsnapshots

@@ -306,6 +306,19 @@ class Daemon {
       if (typeof this._atlasSyncTimeout.unref === 'function') this._atlasSyncTimeout.unref()
     }
 
+    // Step 0b4: Vault copies on drives (#193363) — when a drive is plugged in, catch up the vault
+    // copies on it (`iris vault auto run`), and once a day rebuild lost copies on the vault's own
+    // spares (`iris vault heal --auto`). The CLI does the work; this only notices mounts. Never
+    // prompts (no TTY). Off with `iris vault auto off` or IRIS_VAULT_AUTO=0.
+    if (process.env.IRIS_VAULT_AUTO !== '0' && !this._vaultAuto) {
+      try {
+        const { VaultAuto } = require('../lib/vault-auto')
+        this._vaultAuto = new VaultAuto().start()
+      } catch (e) {
+        console.warn(`[vault-auto] not started: ${e.message}`)
+      }
+    }
+
     // Step 0c: Detect hardware profile (cached after first run)
     console.log('[daemon] Detecting hardware...')
     this.hardwareProfile = await detectProfile()
@@ -3298,6 +3311,7 @@ LIMIT ${limit}
 
     // Stop tmux zombie cleanup interval
     if (this._tmuxCleanupInterval) clearInterval(this._tmuxCleanupInterval)
+    if (this._vaultAuto) { this._vaultAuto.stop(); this._vaultAuto = null }
 
     // Write stopped status with PID for diagnostics
     try {
