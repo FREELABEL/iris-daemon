@@ -34,6 +34,9 @@ jobs:
       - name: a SOM dry run changes nothing (#191666)
         run: node --test som/tests/dry-run-guard.test.js
 
+      - name: each SOM send is reported to the server ledger without blocking the send (#193485)
+        run: node --test som/tests/send-ledger.test.js
+
       - name: file search engines on real Linux (scan, fallback, injection)
         run: node --test tests/disk-search-on-this-platform.test.js tests/disk-search.test.js tests/file-search-guard.test.js
 

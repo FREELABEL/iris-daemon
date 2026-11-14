@@ -17,7 +17,7 @@ const READ_ONLY_POSTS = [/\/ai\/generate-variation\/?$/, /\/ai\/generate-persona
 // Every LeadgenApiClient method that writes. tests/dry-run-guard.test.js fails if one is added and not listed.
 const API_WRITE_METHODS = [
   'addNote', 'clearSteps', 'completeStep', 'createLead', 'createLeadsBatch', 'deleteLead', 'enrichLead',
-  'generateEmailDraft', 'initializeOutreach', 'logComms', 'quickEnrichInstagram', 'recordDmSent', 'reopenStep',
+  'generateEmailDraft', 'initializeOutreach', 'logComms', 'postSendEvents', 'quickEnrichInstagram', 'recordDmSent', 'reopenStep',
   'resolveTags', 'sendEmail', 'updateLead', 'updateLeadTags', 'updateMessage',
 ];
 

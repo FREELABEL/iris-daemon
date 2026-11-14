@@ -33,8 +33,8 @@ function writeIntent (file, { leadId, account, campaign, boardId }) {
   append(file, { event: 'intent', lead_id: leadId, account, campaign, board_id: boardId })
 }
 
-function writeOutcome (file, { leadId, account, campaign, boardId, outcome, kind }) {
-  append(file, { event: 'outcome', lead_id: leadId, account, campaign, board_id: boardId, outcome, ...(kind ? { kind } : {}) })
+function writeOutcome (file, { leadId, account, campaign, boardId, outcome, kind, at }) {
+  append(file, { event: 'outcome', lead_id: leadId, account, campaign, board_id: boardId, outcome, ...(kind ? { kind } : {}), ...(at ? { at } : {}) })
 }
 
 function readJournal (file) {
