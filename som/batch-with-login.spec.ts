@@ -2,6 +2,7 @@ import { test, Page, Locator } from '@playwright/test';
 import { AuthHelper } from './helpers/auth-helper';
 import { LeadgenApiClient } from './helpers/leadgen-api-client';
 import { scrapeProfileStats } from './helpers/providers/base-provider';
+const igParse = require('./helpers/providers/ig-profile-parse');
 import { getDmProvider } from './helpers/providers/dm-provider-factory';
 import type { DmTarget } from './helpers/providers/dm-provider-types';
 import * as fs from 'fs';
@@ -1103,34 +1104,24 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         if (!IS_LINKEDIN) {
           try {
             const profileStats = await scrapeProfileStats(igPage);
-            if (profileStats && (profileStats.followers > 0 || profileStats.bio)) {
-              console.log(`  Profile: ${profileStats.displayName || igHandle} | ${profileStats.followers.toLocaleString()} followers | ${profileStats.bio?.substring(0, 50) || 'no bio'}...`);
+            const profileFields = igParse.leadFields(profileStats);
+            if (profileStats && profileFields) {
+              console.log(`  Profile (${profileStats.source}): ${profileStats.displayName || igHandle} | ${profileStats.followers == null ? '?' : profileStats.followers.toLocaleString()} followers | ${profileStats.bio?.substring(0, 50) || 'no bio'}...`);
               if (!DRY_RUN && leadId) {
                 // Save to notes
                 const statsNote = [
                   `[SOM Inline Enrich]`,
                   profileStats.displayName ? `Name: ${profileStats.displayName}` : '',
-                  `Followers: ${profileStats.followers.toLocaleString()}`,
-                  `Posts: ${profileStats.posts.toLocaleString()}`,
+                  profileStats.followers != null ? `Followers: ${profileStats.followers.toLocaleString()}` : '',
+                  profileStats.posts != null ? `Posts: ${profileStats.posts.toLocaleString()}` : '',
+                  profileStats.city ? `City: ${profileStats.city}` : '',
                   profileStats.bio ? `Bio: ${profileStats.bio.substring(0, 200)}` : '',
                   profileStats.externalUrl ? `URL: ${profileStats.externalUrl}` : '',
                   profileStats.category ? `Category: ${profileStats.category}` : '',
                 ].filter(Boolean).join(' | ');
                 apiClient.addNote(leadId, statsNote, 'enrichment').catch(() => {});
                 // Save to custom_fields
-                apiClient.updateLead(leadId, {
-                  custom_fields: {
-                    ig_followers: profileStats.followers,
-                    ig_following: profileStats.following,
-                    ig_posts: profileStats.posts,
-                    ig_bio: profileStats.bio?.substring(0, 500),
-                    ig_display_name: profileStats.displayName,
-                    ig_external_url: profileStats.externalUrl,
-                    ig_category: profileStats.category,
-                    ig_verified: profileStats.isVerified,
-                    ig_scraped_at: new Date().toISOString(),
-                  },
-                }).catch(() => {});
+                apiClient.updateLead(leadId, { custom_fields: profileFields }).catch(() => {});
               }
             }
           } catch (scrapeErr: any) {
@@ -2638,14 +2629,14 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         enrichStats.checked++;
 
         // Step 1: Save inline profile stats if we scraped them from the DOM
-        if (inlineProfileStats && (inlineProfileStats.followers > 0 || inlineProfileStats.bio)) {
+        if (inlineProfileStats && igParse.leadFields(inlineProfileStats)) {
           try {
             const statsNote = [
               `[SOM Inline Enrich]`,
               inlineProfileStats.displayName ? `Name: ${inlineProfileStats.displayName}` : '',
-              `Followers: ${inlineProfileStats.followers.toLocaleString()}`,
-              `Following: ${inlineProfileStats.following.toLocaleString()}`,
-              `Posts: ${inlineProfileStats.posts.toLocaleString()}`,
+              inlineProfileStats.followers != null ? `Followers: ${inlineProfileStats.followers.toLocaleString()}` : '',
+              inlineProfileStats.following != null ? `Following: ${inlineProfileStats.following.toLocaleString()}` : '',
+              inlineProfileStats.posts != null ? `Posts: ${inlineProfileStats.posts.toLocaleString()}` : '',
               inlineProfileStats.bio ? `Bio: ${inlineProfileStats.bio.substring(0, 200)}` : '',
               inlineProfileStats.externalUrl ? `URL: ${inlineProfileStats.externalUrl}` : '',
               inlineProfileStats.category ? `Category: ${inlineProfileStats.category}` : '',
@@ -2655,20 +2646,8 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
             apiClient.addNote(rowAttrs.id, statsNote, 'enrichment').catch(() => {});
 
             // Update lead custom_fields with profile data
-            apiClient.updateLead(rowAttrs.id, {
-              custom_fields: {
-                ig_followers: inlineProfileStats.followers,
-                ig_following: inlineProfileStats.following,
-                ig_posts: inlineProfileStats.posts,
-                ig_bio: inlineProfileStats.bio?.substring(0, 500),
-                ig_display_name: inlineProfileStats.displayName,
-                ig_external_url: inlineProfileStats.externalUrl,
-                ig_category: inlineProfileStats.category,
-                ig_verified: inlineProfileStats.isVerified,
-                ig_private: inlineProfileStats.isPrivate,
-                ig_scraped_at: new Date().toISOString(),
-              }
-            }).catch(() => {});
+            const inlineFields = igParse.leadFields(inlineProfileStats);
+            if (inlineFields) apiClient.updateLead(rowAttrs.id, { custom_fields: inlineFields }).catch(() => {});
           } catch { /* non-blocking */ }
         }
 
