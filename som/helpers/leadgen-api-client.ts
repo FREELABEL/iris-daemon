@@ -608,6 +608,29 @@ export class LeadgenApiClient {
   }
 
   /**
+   * Report SOM send events to the server ledger (#193485). POST /api/v1/som/send-events, up to 100.
+   * Never throws: { ok, status } tells send-ledger.js whether to keep the events queued.
+   */
+  async postSendEvents(events: any[]): Promise<{ ok: boolean; status: number; created?: number; duplicates?: number; message?: string }> {
+    try {
+      const resp = await fetch(`${BASE_URL}/som/send-events`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.token}`,
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ bloq_id: this.boardId, events }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const json: any = await resp.json().catch(() => ({}));
+      return { ok: resp.ok, status: resp.status, created: json?.data?.created, duplicates: json?.data?.duplicates, message: json?.message };
+    } catch (err: any) {
+      return { ok: false, status: 0, message: err.message };
+    }
+  }
+
+  /**
    * Write one entry to the lead's comms log (POST /api/v1/atlas/comms/log, as `iris comms log` does).
    */
   async logComms(leadId: number, entry: {

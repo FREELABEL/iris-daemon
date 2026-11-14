@@ -12,6 +12,7 @@ import { leadSource, candidateFetchSize, directQuotaReached, shouldFetchNextPage
 import { leadOutcome, timingStatus, unconfirmedNote, outcomeLine, markContacted } from './lead-outcome'; // countsTowardDailyCap: the cap file is only written for a send that may have arrived
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const dmGuard = require('./helpers/dm-guard'); // #192164
+const sendLedger = require('./helpers/send-ledger'); // #193485: each send also reported to the server
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { checkDelivery } = require('./helpers/delivery-check'); // #192164
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -305,11 +306,25 @@ const promoteToContacted = async (api: any, leadId: number | null | undefined, o
   if (r.updated) console.log(`  ✓ Lead #${leadId} status ${r.from || '(none)'} → Contacted`);
   else console.log(`  · Lead #${leadId} status left as is: ${r.reason}`);
 };
+// #193485: the step being sent for the current lead (API-direct sends step 1; the UI path sets it).
+let ledgerStep: number = FIXED_STEP || 1;
+const ledgerClient = new LeadgenApiClient(TOKEN as string, BOARD_ID);
+const postSendEvents = (events: any[]) => ledgerClient.postSendEvents(events);
+// Fire-and-forget: queued on disk, flushed in the background. Never throws, never blocks a send.
+const reportSend = (leadId: number | null | undefined, outcome: string, at: string, error?: string) => {
+  if (!leadId || DRY_RUN || outcome === 'dry-run') return;
+  sendLedger.report(sendLedger.buildEvent({
+    campaign: STRATEGY_NAME, campaignId: process.env.SOM_CAMPAIGN_ID || null, bloqId: BOARD_ID, leadId,
+    step: ledgerStep, channel: IS_LINKEDIN ? 'linkedin' : 'instagram', account: JOURNAL_ACCOUNT, outcome, error, at,
+  }), { post: postSendEvents });
+};
 const journalOutcome = (leadId: number | null | undefined, outcome: string, kind?: string) => {
   if (!leadId || DRY_RUN || outcome === 'dry-run') return;
+  const at = new Date().toISOString();
   try {
-    dmGuard.writeOutcome(JOURNAL, { leadId, account: JOURNAL_ACCOUNT, campaign: STRATEGY_NAME, boardId: BOARD_ID, outcome, kind });
+    dmGuard.writeOutcome(JOURNAL, { leadId, account: JOURNAL_ACCOUNT, campaign: STRATEGY_NAME, boardId: BOARD_ID, outcome, kind, at });
   } catch (e: any) { console.log(`  ⚠ journal not written: ${e.message}`); }
+  reportSend(leadId, outcome, at, kind);
 };
 
 test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, context }) => {
@@ -844,6 +859,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       if (idx >= apiLeadIds.length && !(await fetchMoreCandidates())) break;
       const leadId = apiLeadIds[idx];
       const leadStart = Date.now();
+      ledgerStep = 1; // #193485: the API-direct path sends step 1 (step_index 0)
       let apiSent = false, apiDryRunTyped = false, apiUndeliverable = '', apiUnknown = ''; // #191681
       let apiKind = '', apiSubmitted = false, apiStepsCreated = false; // #192164
       console.log(`\n━━━ Lead ${idx + 1}/${apiLeadIds.length} (ID: ${leadId}) ━━━\n`);
@@ -1507,7 +1523,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
         results.failed++;
         leadTimings.push({ name: `#${leadId}`, duration: (Date.now() - leadStart) / 1000, status: 'fail' });
         // After the click the intent stays open: the gate reads it as "may have gone out" and never retries.
-        if (apiSubmitted) { results.deliveredUnknown++; recordDmSent(leadId); } else journalOutcome(leadId, 'failed');
+        if (apiSubmitted) { results.deliveredUnknown++; recordDmSent(leadId); reportSend(leadId, 'delivered-unknown', new Date().toISOString(), 'error after send was pressed'); } else journalOutcome(leadId, 'failed');
       } finally {
         // Steps made this run for a DM that never left would take the lead out of the fresh pool for good.
         if (dmGuard.shouldReleaseSteps({ createdSteps: apiStepsCreated, submitted: apiSubmitted, kind: apiKind, dryRun: DRY_RUN })) {
@@ -1533,6 +1549,10 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
     console.log(`  ${dmGuard.summaryLine(results)}`);
     console.log(`  Total: ${totalDuration}s`);
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    if (!DRY_RUN) {
+      const fl = await sendLedger.flushWithin(10000, { post: postSendEvents });
+      console.log(`  Server ledger: ${fl.posted ?? 0} reported, ${fl.kept ?? 0} queued for later (${fl.status})`);
+    }
 
     // Discord batch summary with inbox replies
     await sendDiscordBatchSummary({
@@ -1602,6 +1622,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   for (let idx = 0; idx < toProcess.length; idx++) {
     const rowIndex = toProcess[idx];
     const leadStart = Date.now();
+    ledgerStep = FIXED_STEP || 1; // #193485: API-direct sends step 1; the UI path sets the real step
     let dmSentThisLead = false;
     let dryRunTyped = false, undeliverableReason = '', deliveredUnknownReason = ''; // #191681
     let uiKind = '', uiSubmitted = false, uiStepsCreated = false, uiLeadId: number | null = null; // #192164
@@ -1917,6 +1938,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       }
 
       console.log(`→ Executing step ${targetStepIndex + 1}`);
+      ledgerStep = targetStepIndex + 1; // #193485
       if (totalPlayButtons === 0) {
         console.log('⏭️  No play buttons found after 90s');
         await page.screenshot({ path: `test-results/screenshots/no-play-${idx + 1}.png` });
@@ -2704,7 +2726,7 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
       await page.screenshot({ path: `test-results/screenshots/error-${idx + 1}.png` }).catch(() => {});
       results.failed++;
       // After the click the intent stays open: the gate reads it as "may have gone out" and never retries.
-      if (uiSubmitted) { results.deliveredUnknown++; recordDmSent(uiLeadId); } else journalOutcome(uiLeadId, 'failed');
+      if (uiSubmitted) { results.deliveredUnknown++; recordDmSent(uiLeadId); reportSend(uiLeadId, 'delivered-unknown', new Date().toISOString(), 'error after send was pressed'); } else journalOutcome(uiLeadId, 'failed');
       try {
         for (const p of context.pages()) {
           if (p !== page && p.url().includes('instagram.com')) await p.close().catch(() => {});
@@ -2752,6 +2774,10 @@ test(`Batch Outreach — Board ${BOARD_ID} / ${STRATEGY_NAME}`, async ({ page, c
   if (PERSONALIZE) console.log('  Mode: PERSONALIZE');
   if (!VARY) console.log('  Mode: VARY DISABLED');
   if (DRY_RUN) console.log('  Mode: DRY RUN');
+  if (!DRY_RUN) {
+    const fl = await sendLedger.flushWithin(10000, { post: postSendEvents });
+    console.log(`  Server ledger: ${fl.posted ?? 0} reported, ${fl.kept ?? 0} queued for later (${fl.status})`);
+  }
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   // Merge inbox replies + in-batch replied leads for the Discord summary
