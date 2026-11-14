@@ -168,6 +168,13 @@ class Heartbeat {
     } catch (err) {
       this.failCount++
       console.error(`[heartbeat] Failed (${this.failCount}/${this.maxFails}): ${err.message}`)
+      // #193519 — the hub refused this machine as the node: another computer owns this key. Say it
+      // plainly, once; retrying cannot fix it, re-registering this machine can.
+      if (Number(err.statusCode) === 409 && /identity_conflict/.test(err.message) && !this.identityConflictReported) {
+        this.identityConflictReported = true
+        console.error('[heartbeat] IDENTITY CONFLICT — this computer is using ANOTHER computer\'s IRIS node key (often a copied ~/.iris folder). ' +
+          'The hub will not treat it as that machine and sends it no tasks. Fix: run `iris hive connect` on THIS computer to register it as its own node.')
+      }
 
       if (this.failCount >= this.circuitBreakerThreshold && this.state !== 'open') {
         // Circuit breaker — sustained failures, switch to slow probe
