@@ -1,5 +1,6 @@
 import { Page, BrowserContext } from '@playwright/test';
 const igAccounts = require('../ig-accounts');
+const igParse = require('./ig-profile-parse');
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -101,68 +102,92 @@ export async function dismissInstagramPopups(page: Page): Promise<void> {
 }
 
 /**
- * Scrape basic profile stats from an Instagram profile page.
- * Assumes the page is already navigated to the profile URL.
+ * Profile stats for the Instagram profile the page is on (#193482).
+ *
+ * Reads, in order: Instagram's own profile JSON (same-origin, with the page's session), the
+ * page's meta description, then the old header selectors. The selectors alone had been
+ * returning zeros and the display name as the bio since at least 2026-05. A count that could
+ * not be read is null — not 0. Write lead fields with leadFields() from ig-profile-parse, which
+ * leaves unknowns out instead of overwriting them.
  */
-export async function scrapeProfileStats(page: Page): Promise<{
-  followers: number;
-  following: number;
-  posts: number;
+export async function scrapeProfileStats(page: Page): Promise<IgProfileStats> {
+  const username = usernameFromUrl(page.url());
+
+  if (username) {
+    const body = await page.evaluate(async (u: string) => {
+      try {
+        const r = await fetch(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`, {
+          headers: { 'x-ig-app-id': '936619743392459' },
+          credentials: 'include',
+        });
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    }, username).catch(() => null);
+    const fromApi = igParse.fromWebProfileInfo(body);
+    if (fromApi) return fromApi;
+  }
+
+  const desc = await page.evaluate(() =>
+    document.querySelector('meta[name="description"]')?.getAttribute('content') ||
+    document.querySelector('meta[property="og:description"]')?.getAttribute('content') || ''
+  ).catch(() => '');
+  const meta = igParse.fromMetaDescription(desc);
+
+  const dom = await page.evaluate(() => {
+    const nameEl = document.querySelector('header section span[dir]') || document.querySelector('header h2');
+    const bioEl = document.querySelector('header section > div > span[dir]') ||
+                  document.querySelector('header section div:not(:first-child) span');
+    const linkEl = document.querySelector('header a[rel="me nofollow noopener noreferrer"]') ||
+                   document.querySelector('header a[href*="l.instagram.com"]');
+    return {
+      displayName: nameEl?.textContent?.trim() || '',
+      bio: bioEl?.textContent?.trim() || '',
+      isVerified: !!document.querySelector('header svg[aria-label="Verified"]'),
+      isPrivate: !!document.body.textContent?.includes('This account is private'),
+      externalUrl: linkEl?.textContent?.trim() || '',
+    };
+  }).catch(() => ({ displayName: '', bio: '', isVerified: false, isPrivate: false, externalUrl: '' }));
+
+  const displayName = meta?.displayName || dom.displayName;
+  return {
+    source: meta ? 'meta' : 'dom',
+    username: username || '',
+    followers: meta?.followers ?? null,
+    following: meta?.following ?? null,
+    posts: meta?.posts ?? null,
+    displayName,
+    bio: igParse.realBio(meta?.bio || dom.bio, displayName),
+    isVerified: dom.isVerified,
+    isPrivate: dom.isPrivate,
+    externalUrl: dom.externalUrl,
+    category: '',
+    city: null,
+    isBusiness: false,
+  };
+}
+
+export type IgProfileStats = {
+  source: 'api' | 'meta' | 'dom';
+  username: string;
+  followers: number | null;
+  following: number | null;
+  posts: number | null;
   displayName: string;
   bio: string;
   isVerified: boolean;
   isPrivate: boolean;
   externalUrl: string;
   category: string;
-}> {
-  return page.evaluate(() => {
-    const parseCount = (text: string): number => {
-      if (!text) return 0;
-      text = text.trim().toLowerCase().replace(/,/g, '');
-      if (text.endsWith('k')) return Math.round(parseFloat(text) * 1000);
-      if (text.endsWith('m')) return Math.round(parseFloat(text) * 1000000);
-      return parseInt(text, 10) || 0;
-    };
+  city: string | null;
+  isBusiness: boolean;
+};
 
-    // Stats from the header section (posts, followers, following)
-    const statEls = document.querySelectorAll('header section ul li');
-    let posts = 0, followers = 0, following = 0;
-    statEls.forEach((el, i) => {
-      const span = el.querySelector('span span') || el.querySelector('span');
-      const count = span?.textContent || '0';
-      if (i === 0) posts = parseCount(count);
-      if (i === 1) followers = parseCount(count);
-      if (i === 2) following = parseCount(count);
-    });
-
-    // Display name
-    const nameEl = document.querySelector('header section span[dir]') ||
-                   document.querySelector('header h2');
-    const displayName = nameEl?.textContent?.trim() || '';
-
-    // Bio
-    const bioEl = document.querySelector('header section > div > span[dir]') ||
-                  document.querySelector('header section div:not(:first-child) span');
-    const bio = bioEl?.textContent?.trim() || '';
-
-    // Verified badge
-    const isVerified = !!document.querySelector('header svg[aria-label="Verified"]');
-
-    // Private account
-    const isPrivate = !!document.body.textContent?.includes('This account is private');
-
-    // External URL
-    const linkEl = document.querySelector('header a[rel="me nofollow noopener noreferrer"]') ||
-                   document.querySelector('header a[href*="l.instagram.com"]');
-    const externalUrl = linkEl?.textContent?.trim() || '';
-
-    // Category (e.g. "Musician/Band", "Digital creator")
-    const catEl = document.querySelector('header div[class*="category"]') ||
-                  document.querySelector('header section > div > div > span:not([dir])');
-    const category = catEl?.textContent?.trim() || '';
-
-    return { followers, following, posts, displayName, bio, isVerified, isPrivate, externalUrl, category };
-  });
+/** "https://www.instagram.com/jo.doe/" → "jo.doe"; not a profile URL → null. */
+export function usernameFromUrl(url: string): string | null {
+  const m = String(url || '').match(/instagram\.com\/([A-Za-z0-9._]{1,30})\/?(?:[?#]|$)/);
+  if (!m) return null;
+  const reserved = ['p', 'reel', 'reels', 'explore', 'direct', 'accounts', 'stories', 'tv'];
+  return reserved.includes(m[1].toLowerCase()) ? null : m[1];
 }
 
 /** Parse a follower count string like "10K", "1.2M", "45,231" → number */
