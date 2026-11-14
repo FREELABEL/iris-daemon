@@ -175,6 +175,23 @@ class CloudClient {
   }
 
   /**
+   * This machine's identity proof (#193519): the same sha256-of-hardware-id `iris hive connect`
+   * registers with. Sent on every heartbeat, goodbye and task claim, so the hub can tell the real
+   * machine from another daemon holding a copy of this node's key. Computed once (it shells out
+   * to ioreg / the registry); `undefined` — and therefore omitted — where the id cannot be read.
+   */
+  identity () {
+    if (this._machineFingerprint === undefined) {
+      try {
+        this._machineFingerprint = require('./node-key-heal').machineFingerprint() || null
+      } catch {
+        this._machineFingerprint = null
+      }
+    }
+    return this._machineFingerprint ? { machine_fingerprint: this._machineFingerprint } : {}
+  }
+
+  /**
    * Send heartbeat — authenticates and registers the node as online.
    * @param {Object} extra - Additional data to include (capacity, hardware_profile, paused)
    */
@@ -184,14 +201,15 @@ class CloudClient {
     // leave the node. Best-effort: a broken vault must not stop the heartbeat.
     let vaultCredentials
     try { vaultCredentials = nodeVault.listNames() } catch { vaultCredentials = undefined }
-    return this.post('/api/v6/node-agent/heartbeat', vaultCredentials ? { ...extra, vault_credentials: vaultCredentials } : extra)
+    const body = { ...extra, ...this.identity() }
+    return this.post('/api/v6/node-agent/heartbeat', vaultCredentials ? { ...body, vault_credentials: vaultCredentials } : body)
   }
 
   /**
    * Mark node as offline (called during shutdown).
    */
   async markOffline () {
-    return this.post('/api/v6/node-agent/heartbeat', { going_offline: true })
+    return this.post('/api/v6/node-agent/heartbeat', { going_offline: true, ...this.identity() })
   }
 
   /**
@@ -243,7 +261,7 @@ class CloudClient {
   async acceptTask (taskId, body = {}) {
     // body.arrived_at — when the task reached THIS machine, by its own clock (#187568). The
     // server keeps the skew against its clock beside it, so a deadline in seconds is checkable.
-    return this.post(`/api/v6/node-agent/tasks/${taskId}/accept`, body)
+    return this.post(`/api/v6/node-agent/tasks/${taskId}/accept`, { ...body, ...this.identity() })
   }
 
   /**
