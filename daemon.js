@@ -50,6 +50,7 @@ const path = require('path')
 const fs = require('fs')
 const os = require('os')
 const { writeFileAtomic } = require('./lib/atomic-write')
+const { resolveFallback } = require('./lib/api-fallback')
 const net = require('net')
 const socketGuard = require('./daemon/socket-guard')
 const socketLock = require('./daemon/socket-lock')
@@ -476,7 +477,13 @@ function startDaemon () {
   const config = {
     apiKey: resolveApiKey(),
     apiUrl: resolvedApiUrl,
-    apiUrlFallback: getArg('--api-url-fallback') || process.env.IRIS_API_URL_FALLBACK || fileConfig.iris_api_url_fallback || (mode === 'local' ? PRODUCTION_URL : null),
+    // Production used to get NO fallback, so one host going dark took every node offline (#189649).
+    apiUrlFallback: resolveFallback({
+      explicit: getArg('--api-url-fallback') || process.env.IRIS_API_URL_FALLBACK || fileConfig.iris_api_url_fallback,
+      mode,
+      apiUrl: resolvedApiUrl,
+      productionUrl: PRODUCTION_URL
+    }),
     dataDir: getArg('--data-dir') || process.env.DAEMON_DATA_DIR || path.join(__dirname, '..', 'daemon-data'),
     flApiPath: getArg('--fl-api-path') || process.env.FL_API_PATH || null,
     pusherKey: process.env.PUSHER_KEY || fileConfig.pusher_key,
