@@ -223,6 +223,9 @@ node -e "
 const config = {
   node_api_key: $(node -e "process.stdout.write(JSON.stringify('${API_KEY}'))"),
   iris_api_url: $(node -e "process.stdout.write(JSON.stringify('${API_URL}'))"),
+  // A second host for when the first stops answering (#189649). Same API, different route.
+  // Older daemons read this key too, so it protects them without a daemon update.
+  iris_api_url_fallback: ({ 'freelabel.net': 'https://heyiris.io', 'heyiris.io': 'https://freelabel.net' })[(() => { try { return new URL('${API_URL}').hostname.replace(/^www\\./, '') } catch { return '' } })()] || undefined,
   pusher_key: $(node -e "process.stdout.write(JSON.stringify('${PUSHER_KEY}'))") || undefined,
   pusher_cluster: '${PUSHER_CLUSTER}',
   paused: ${EXISTING_PAUSED},
