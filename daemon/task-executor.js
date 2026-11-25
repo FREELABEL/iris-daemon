@@ -602,7 +602,9 @@ function getSomPreflightCheck () {
 // playbook_run/skill_run: `iris playbook run` exits 1 when a step failed — a scheduled
 // publisher that 401s must read as failed, not "with warnings" (#191214).
 // clip_cutter: a clip that never reaches IG must read as failed (#191214).
-const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch', 'playbook_run', 'skill_run', 'clip_cutter'])
+// inbox_scan: on iris-hive-001 it crashed on every run for days ("Missing X server or $DISPLAY")
+// and was listed as completed (#194234).
+const NONZERO_IS_FAILURE = new Set(['custom_playwright', 'som_batch', 'playbook_run', 'skill_run', 'clip_cutter', 'inbox_scan'])
 function statusForExit (type, exitCode) {
   if (exitCode === 0) return 'completed'
   return NONZERO_IS_FAILURE.has(type) ? 'failed' : 'completed_with_warnings'
@@ -759,6 +761,21 @@ function hasDesktopSession () {
  */
 function playwrightHeadedFlag () {
   return hasDesktopSession() ? '--headed' : ''
+}
+
+/**
+ * Prefix for a command that must run a HEADED browser (Instagram treats headless differently).
+ * On Linux with no display, a headed Chromium exits at once ("Missing X server or $DISPLAY") —
+ * inbox_scan did that on every run on iris-hive-001 (#194234). xvfb-run gives it a virtual
+ * display. Empty everywhere a display exists (macOS, a Linux desktop) or xvfb-run is missing.
+ */
+function headedDisplayPrefix (env = process.env, platform = process.platform, hasXvfbRun = null) {
+  if (platform !== 'linux') return ''
+  if (env.DISPLAY || env.WAYLAND_DISPLAY) return ''
+  if (hasXvfbRun === null) {
+    try { execSync('command -v xvfb-run', { stdio: 'ignore', timeout: 3000 }); hasXvfbRun = true } catch { hasXvfbRun = false }
+  }
+  return hasXvfbRun ? 'xvfb-run -a ' : ''
 }
 
 class TaskExecutor {
@@ -3847,7 +3864,7 @@ require(${JSON.stringify(path.join(__dirname, 'clip-hive-download.js'))})
 
           // Run sequentially — one browser per account
           const runnerScript = scanAccounts.map(a =>
-            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 npx playwright test ${inboxSpecPath} --headed --timeout=180000`
+            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 ${headedDisplayPrefix()}npx playwright test ${inboxSpecPath} --headed --timeout=180000`
           ).join(' && ')
           cmd = 'bash'
           args = ['-c', runnerScript]
@@ -6069,4 +6086,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { getCampaignConfigs, _resetCampaignConfigCache, ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd }
+module.exports = { getCampaignConfigs, _resetCampaignConfigCache, ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd, headedDisplayPrefix }
