@@ -763,6 +763,12 @@ function playwrightHeadedFlag () {
   return hasDesktopSession() ? '--headed' : ''
 }
 
+// Per-account Playwright limit for inbox_scan (#194234). 3 min was too short for a busy inbox:
+// on 2026-11-25 @heyiris.io classified replies at ~8 s each and hit 180000 ms mid-scan, failing
+// the run after the smaller account had succeeded. The executor's 30-min browser watchdog still
+// bounds the whole task (two accounts at 10 min each fit inside it).
+const INBOX_SCAN_ACCOUNT_TIMEOUT_MS = 600000
+
 /**
  * Prefix for a command that must run a HEADED browser (Instagram treats headless differently).
  * On Linux with no display, a headed Chromium exits at once ("Missing X server or $DISPLAY") —
@@ -3864,7 +3870,7 @@ require(${JSON.stringify(path.join(__dirname, 'clip-hive-download.js'))})
 
           // Run sequentially — one browser per account
           const runnerScript = scanAccounts.map(a =>
-            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 ${headedDisplayPrefix()}npx playwright test ${inboxSpecPath} --headed --timeout=180000`
+            `BOARD_ID=${a.boardId} IG_ACCOUNT=${a.igAccount} SINCE=${since} WRITE_BACK=${wb} DRY_RUN=${dry} SEND_REPLIES=${send} LIMIT=100 ${headedDisplayPrefix()}npx playwright test ${inboxSpecPath} --headed --timeout=${INBOX_SCAN_ACCOUNT_TIMEOUT_MS}`
           ).join(' && ')
           cmd = 'bash'
           args = ['-c', runnerScript]
@@ -6086,4 +6092,4 @@ function decryptLegacyCbc(fullPath, safeName, config) {
   }
 }
 
-module.exports = { getCampaignConfigs, _resetCampaignConfigCache, ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd, headedDisplayPrefix }
+module.exports = { getCampaignConfigs, _resetCampaignConfigCache, ensureSomSessions, accountEnvForScripts, TaskExecutor, envelopeBind, openEnvelopeBuffers, ENVELOPE_VERSION, ensureScriptToken, resolveUserScriptBySlug, resolveUserScriptAssets, somConfigCandidates, getSomPreflightCheck, statusForExit, resolvePlaybookCwd, headedDisplayPrefix, INBOX_SCAN_ACCOUNT_TIMEOUT_MS }
