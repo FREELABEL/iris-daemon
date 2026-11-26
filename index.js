@@ -3982,6 +3982,17 @@ app.get('/api/sessions/acp/:id/history', async (req, res) => {
   await forwardToAcpHolder(req, res, 'GET', `/history?limit=${limit}`)
 })
 
+// The coding-agent registry (#194315): the one table of agents, aliases and what IRIS can do with
+// each, for the CLI and Desktop to read instead of keeping their own. No paths from this machine.
+app.get('/api/coding-agents', (req, res) => {
+  try {
+    res.json(require('./lib/coding-agents').publicView())
+  } catch (err) {
+    // A registry that does not load is a fault to show, not an empty list.
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.get('/api/sessions/codex', (req, res) => {
   try {
     const { listCodexSessions } = require('./lib/codex-sessions')

@@ -71,5 +71,7 @@ test('no Codex on this machine is an empty list, not an error', () => {
 
 test('wired: the bridge serves it and the heartbeat asks for it', () => {
   assert.match(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8'), /app\.get\('\/api\/sessions\/codex'/)
-  assert.match(fs.readFileSync(path.join(__dirname, '..', 'daemon', 'index.js'), 'utf8'), /\{ slug: 'codex', name: 'codex' \}/)
+  // The heartbeat's providers come from registry/coding-agents.yaml since #194315.
+  assert.match(fs.readFileSync(path.join(__dirname, '..', 'daemon', 'index.js'), 'utf8'), /providers = codingAgents\.collectors\(\)/)
+  assert.ok(require('../lib/coding-agents').collectors().some((c) => c.slug === 'codex' && c.name === 'codex'))
 })
