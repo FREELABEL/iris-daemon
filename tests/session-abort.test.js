@@ -181,3 +181,10 @@ test('the bridge exposes POST /api/sessions/:provider/:id/abort, wired to lib/se
   assert.ok(at > 0)
   assert.match(BRIDGE.slice(at, at + 1200), /require\('\.\/lib\/session-abort'\)/)
 })
+
+test('the heartbeat advertises session_abort, so the cloud sends Stop only to daemons that have it', () => {
+  const HB = fs.readFileSync(path.join(__dirname, '..', 'daemon', 'index.js'), 'utf8')
+  const at = HB.indexOf('task_capabilities: (() => {')
+  assert.ok(at > 0)
+  assert.match(HB.slice(at, at + 600), /session_abort: true/)
+})
