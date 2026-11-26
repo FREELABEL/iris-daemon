@@ -1,0 +1,180 @@
+# Coding agents IRIS knows about — ONE table for every place that used to keep its own (#194315).
+#
+# Before this file there were three, and they disagreed: the daemon's session report
+# (claude-code / opencode / ollama / codex / acp), the CLI's ACP list (claude / codex / gemini /
+# opencode / iris) and Desktop's marks (claude_code, claude, gemini, gemini_cli …). The same agent
+# had two names, and a new agent meant three edits in three repos.
+#
+# Adding an agent: add a block below with `status: planned` and `verified: false`. It is then
+# recognised everywhere by name (sessions reported under any alias land on its id), shown with its
+# own name, and counted in Home's "Today" line. Its sessions are only COLLECTED once a collector
+# exists for it — see `sessions.collector`.
+#
+# Field rules:
+#   id            stable, snake_case, never reused; what every surface stores
+#   aliases       every name this agent has ever been reported or typed as; unique across the file
+#   status        supported (collected + verified) · list_only (collected, cannot be steered)
+#                 · acp_only (reachable only through `iris acp run`) · planned (known, not collected)
+#   sessions.store       where its history lives on disk; `env` overrides the base directory
+#   sessions.collector   the bridge route slug (`/api/sessions/<slug>`) or null when none exists
+#   sessions.can         what IRIS can do with a session: list, history, live, message, answer
+#   acp           how `iris acp run` starts it, if it speaks the Agent Client Protocol
+#   verified      where the storage facts came from, and when — or false if nobody has checked
+
+version: 1
+
+agents:
+  - id: claude_code
+    name: Claude Code
+    vendor: Anthropic
+    aliases: [claude_code, claude-code, claude, claudecode]
+    mark: claude
+    status: supported
+    sessions:
+      collector: claude-code
+      store: { base: "~/.claude/projects", env: CLAUDE_CONFIG_DIR, pattern: "<project-slug>/<session-id>.jsonl", format: jsonl }
+      can: [list, history, message, answer]
+    acp: { command: [claude-agent-acp], install: "npm install -g @agentclientprotocol/claude-agent-acp" }
+    verified: "iris-daemon index.js /api/sessions/claude-code + lib/claude-session-name.js; read on 2026-11-26"
+
+  - id: codex
+    name: Codex CLI
+    vendor: OpenAI
+    aliases: [codex, codex-cli, codex_cli, openai-codex]
+    mark: codex
+    status: list_only
+    sessions:
+      collector: codex
+      store: { base: "~/.codex/sessions", env: CODEX_HOME, pattern: "YYYY/MM/DD/rollout-<ts>-<thread-id>.jsonl", format: jsonl }
+      can: [list]
+    acp: { command: [codex-acp], install: "npm install -g @agentclientprotocol/codex-acp" }
+    verified: "openai/codex source (Apache-2.0), read 2026-10-08 for iris-daemon lib/codex-sessions.js (#188539)"
+
+  - id: opencode
+    name: opencode
+    vendor: SST
+    aliases: [opencode, open-code, opencode-ai]
+    mark: iris
+    status: supported
+    sessions:
+      collector: opencode
+      store: { base: "~/.local/share/opencode", env: XDG_DATA_HOME, pattern: "opencode.db (SQLite); storage/session/** (legacy JSON)", format: sqlite }
+      can: [list, history, live, message, answer]
+    acp: { command: [opencode, acp], install: "npm install -g opencode-ai" }
+    verified: "iris-daemon lib/server-sessions.js + lib/desktop-sessions.js (#189446, #190648)"
+
+  - id: iris
+    name: IRIS
+    vendor: FREELABEL
+    aliases: [iris, iris-desktop, iris_desktop, iris-code]
+    mark: iris
+    status: supported
+    # IRIS Desktop and the iris CLI are opencode underneath and keep the same store, per account
+    # under ~/.iris/accounts/<id>. Their sessions are collected by the opencode collector.
+    sessions:
+      collector: opencode
+      store: { base: "~/.iris/accounts", pattern: "<account>/opencode/opencode*.db", format: sqlite }
+      can: [list, history, live, message, answer]
+    acp: { command: [iris, acp], install: "curl -fsSL https://heyiris.io/install | bash" }
+    verified: "iris-daemon lib/desktop-sessions.js (#190648)"
+
+  - id: gemini_cli
+    name: Gemini CLI
+    vendor: Google
+    aliases: [gemini_cli, gemini-cli, gemini]
+    mark: gemini
+    status: acp_only
+    sessions:
+      collector: null
+      store: { base: "~/.gemini", pattern: "unverified", format: unknown }
+      can: []
+    acp: { command: [gemini, --experimental-acp], install: "npm install -g @google/gemini-cli" }
+    verified: false  # ACP command is from iris-opencode src/acp/client.ts; the on-disk store is not checked
+
+  - id: amp
+    name: Amp
+    vendor: Sourcegraph
+    aliases: [amp, ampcode, amp-code, sourcegraph-amp]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false  # seen in Hive as a provider on 2026-11-09; where its threads live is not checked
+
+  - id: ollama
+    name: Ollama
+    vendor: Ollama
+    aliases: [ollama]
+    mark: ollama
+    status: list_only
+    # A model runner, not a coding agent — kept because the daemon reports its sessions today.
+    sessions:
+      collector: ollama
+      store: null
+      can: [list]
+    acp: null
+    verified: "iris-daemon daemon/index.js _refreshSessionCache providers"
+
+  - id: cursor
+    name: Cursor
+    vendor: Anysphere
+    aliases: [cursor, cursor-agent, cursor_agent]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+  - id: aider
+    name: Aider
+    vendor: Aider
+    aliases: [aider, aider-chat]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+  - id: goose
+    name: Goose
+    vendor: Block
+    aliases: [goose]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+  - id: qwen_code
+    name: Qwen Code
+    vendor: Alibaba
+    aliases: [qwen_code, qwen-code, qwen]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+  - id: copilot_cli
+    name: GitHub Copilot CLI
+    vendor: GitHub
+    aliases: [copilot_cli, copilot-cli, copilot, gh-copilot]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+  - id: cline
+    name: Cline
+    vendor: Cline
+    aliases: [cline]
+    mark: other
+    status: planned
+    sessions: { collector: null, store: null, can: [] }
+    acp: null
+    verified: false
+
+# Sessions run through `iris acp run --keep` are reported with provider "acp" plus the agent
+# underneath. The router maps them to that agent's id; "acp" alone means "an ACP agent, unknown".
+acp_provider: acp

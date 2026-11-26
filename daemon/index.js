@@ -3139,16 +3139,14 @@ LIMIT ${limit}
         req.setTimeout(5000, () => { req.destroy(); resolve(null) })
       })
 
-      // Provider slugs on the wire differ from the names reported upward:
-      // the endpoints are claude-code / opencode / ollama, the fleet field uses
-      // claude_code so it matches the task_type vocabulary.
-      const providers = [
-        { slug: 'claude-code', name: 'claude_code' },
-        { slug: 'opencode', name: 'opencode' },
-        { slug: 'ollama', name: 'ollama' },
-        { slug: 'codex', name: 'codex' }, // #188539 — list-only
-        { slug: 'acp', name: 'acp' } // #191170 — `iris acp run --keep`; message + answer reach the live session
-      ]
+      // Which session sources to ask comes from registry/coding-agents.yaml (#194315), not from a
+      // list kept here: a new agent's collector is a block in that file plus a bridge route. The
+      // slugs on the wire (claude-code) differ from the names reported upward (claude_code, the
+      // task_type vocabulary); the registry carries both. Until #194315 this was a hard-coded
+      // [claude-code, opencode, ollama, codex (#188539, list-only), acp (#191170)] — the registry
+      // test pins that set, so moving to the file changed nothing that is asked.
+      const codingAgents = require('../lib/coding-agents')
+      const providers = codingAgents.collectors()
 
       const sessions = []
       const truncated = []
@@ -3180,6 +3178,10 @@ LIMIT ${limit}
           sessions.push({
             session_id: s.session_id,
             provider: s.provider || name,
+            // The registry's id for the agent behind this row (claude_code, codex, gemini_cli…), so
+            // every surface groups and labels sessions the same way. An ACP row resolves to the agent
+            // it drives; a name nobody registered stays visible as itself with agent null.
+            ...(() => { const a = codingAgents.agentOf(s.provider || name, s.agent); return { agent: a.id, agent_name: a.name } })(),
             name: s.name || 'Session',
             // A name a human can use. `name` stays raw; this is derived, so nothing is lost.
             // Measured live: 14 sessions across two machines had names that were not
