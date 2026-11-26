@@ -607,6 +607,9 @@ class Daemon {
       task_capabilities: (() => {
         try {
           return {
+            // #194307: a shared room's Stop. Advertised so the cloud only sends session_abort to
+            // a daemon that implements it — an older one would run its prompt as a shell command.
+            session_abort: true,
             browser_use: require('./browser-use-task').browserUseCapability(),
             // #187922: the type plus which desktops this node can bring up (own / Lume VM / container).
             ...require('./computer-use-task').computerUseCapabilities()

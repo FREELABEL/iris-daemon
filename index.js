@@ -3954,6 +3954,29 @@ app.post('/api/sessions/acp/:id/answer', async (req, res) => {
   return out
 })
 
+// ─── Stop a running session, through its own harness's interrupt (#194307) ─────────────────────
+// A shared room's Stop. Esc in the Claude Code pane, the opencode engine's abort, the ACP holder's
+// cancel — never a process kill. Behind the global bridgeAuth like every other /api route.
+app.post('/api/sessions/:provider/:id/abort', async (req, res) => {
+  const { abortSession } = require('./lib/session-abort')
+  const { execFileSync } = require('child_process')
+  const acp = require('./lib/acp-sessions')
+  const out = await abortSession({
+    fs,
+    home: process.env.HOME,
+    kill: (pid, sig) => process.kill(pid, sig),
+    ps: () => execFileSync('ps', ['-A', '-o', 'pid=', '-o', 'ppid='], { encoding: 'utf8', timeout: 5000 }),
+    tmux: (args) => execFileSync('tmux', args, { encoding: 'utf8', timeout: 5000 }),
+    findServer: (sid) => findLiveSessionServer(sid),
+    engineHeaders: (url) => require('./lib/engine-auth').engineHeaders(url),
+    findHolder: (sid) => acp.findHolder(fs, process.env.HOME, sid),
+    callHolder: acp.callHolder,
+    fetch
+  }, req.params.provider, req.params.id)
+  console.log(`[${req.params.provider}] abort ${String(req.params.id).slice(-8)} -> ${out.status} ${out.body.stopped || out.body.error}`)
+  res.status(out.status).json(out.body)
+})
+
 app.get('/api/sessions/acp/:id/history', async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 60, 200))
   await forwardToAcpHolder(req, res, 'GET', `/history?limit=${limit}`)
