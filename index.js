@@ -4054,6 +4054,7 @@ const { extractSessionName, sessionTitle } = require('./lib/claude-session-name'
 // When a session last SPOKE. The file's mtime is NOT that — measured up to 721 minutes apart.
 const { lastMessageAtFromChunk, readTailChunk } = require('./lib/session-times')
 const { waitingFromChunk } = require('./lib/session-waiting')
+const { digestFor } = require('./lib/session-digest')
 const { waitingFromHold } = require('./lib/session-answer')
 const HOLD_DEPS = { fs, home: process.env.HOME, now: () => Date.now(), kill: (pid, sig) => process.kill(pid, sig) }
 
@@ -4270,8 +4271,11 @@ app.get('/api/sessions/claude-code', async (req, res) => {
           // ...or from the answer hook's live hold, which is the ONLY place the question exists while
           // the hook holds it — Claude Code writes the tool_use to the transcript afterwards.
           const waiting = waitingFromHold(HOLD_DEPS, sessionId) || waitingFromChunk(tail)
+          // What it was for and where it ended, for Home's "Today" line (#194315). null when off or stale.
+          const digest = digestFor('claude', headLines.join('\n'), tail, lastMessageAt)
 
           sessions.push({
+            digest,
             session_id: sessionId,
             name: sessionName,
             project_path: projectPath,
