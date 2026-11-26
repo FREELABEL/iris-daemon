@@ -4342,6 +4342,45 @@ exit 1
           break
         }
 
+        case 'session_abort': {
+          // A shared room's Stop (#194307): interrupt a running session through its own harness
+          // (Esc in the Claude Code pane, the opencode engine's abort, the ACP holder's cancel).
+          // The platform decided the caller may stop this room; this machine still decides whether
+          // it takes inbound control at all — the same switch session_message obeys.
+          const abortConfig = task.config || {}
+          if (!require('./remote-access').remoteAccessAllowed()) {
+            reject(new Error(require('./remote-access').REFUSAL))
+            return
+          }
+          const abortSid = String(abortConfig.session_id || '')
+          if (!/^[A-Za-z0-9_-]{1,128}$/.test(abortSid)) {
+            reject(new Error('session_abort: config.session_id is missing or has characters a session id never has'))
+            return
+          }
+          const abortProvider = String(abortConfig.provider || 'claude-code').replace(/^claude_code$/, 'claude-code')
+          if (!/^[a-z0-9-]{1,32}$/.test(abortProvider)) {
+            reject(new Error('session_abort: config.provider is not a harness name'))
+            return
+          }
+          const abortPort = parseInt(process.env.A2A_PORT || process.env.BRIDGE_PORT || '3200', 10)
+          const abortTokenPath = path.join(os.homedir(), '.iris', 'bridge-token')
+          const abortToken = fs.existsSync(abortTokenPath) ? fs.readFileSync(abortTokenPath, 'utf8').trim() : ''
+          if (!abortToken) {
+            reject(new Error(`session_abort needs the bridge token at ${abortTokenPath} — without it the bridge returns 401 and nothing is stopped`))
+            return
+          }
+          // --fail-with-body: a 404 ("not running here") or 409 ("not in tmux") fails the task AND
+          // carries the reason back to the person who pressed Stop.
+          const abortCmd = `curl -sS --fail-with-body -X POST "http://localhost:${abortPort}/api/sessions/${abortProvider}/${abortSid}/abort" -H "Content-Type: application/json" -H "X-Bridge-Key: ${abortToken}" -d '{}'`
+          {
+            const plan = shellFor(abortCmd)
+            cmd = plan.cmd
+            args = plan.args
+            spawnOptions = plan.spawnOptions
+          }
+          break
+        }
+
         case 'social_feed_sync': {
           // Sync Instagram feed data from residential IP → fl-api cache
           // prompt: "moore-life" or "moore-life,other-profile" or "--auto" or empty (defaults to --auto)
