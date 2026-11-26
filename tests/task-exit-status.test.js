@@ -38,3 +38,13 @@ test('no prefix where a display exists or xvfb-run is missing', () => {
   assert.strictEqual(headedDisplayPrefix({}, 'darwin', true), '')
   assert.strictEqual(headedDisplayPrefix({}, 'linux', false), '')
 })
+
+const { INBOX_SCAN_ACCOUNT_TIMEOUT_MS } = require('../daemon/task-executor')
+
+// A busy inbox (@heyiris.io) hit the old 3-min per-account limit mid-scan on 2026-11-25 (#194234).
+test('inbox_scan gives each account long enough, inside the 30-min browser watchdog', () => {
+  assert.ok(INBOX_SCAN_ACCOUNT_TIMEOUT_MS >= 600000)
+  assert.ok(INBOX_SCAN_ACCOUNT_TIMEOUT_MS * 2 < 30 * 60 * 1000)
+  const src = require('fs').readFileSync(require('path').join(__dirname, '../daemon/task-executor.js'), 'utf8')
+  assert.ok(src.includes('--timeout=${INBOX_SCAN_ACCOUNT_TIMEOUT_MS}'), 'the inbox command uses the constant')
+})
