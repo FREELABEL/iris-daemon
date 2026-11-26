@@ -3202,6 +3202,9 @@ LIMIT ${limit}
             // when status is not needs_you (an old, probably-abandoned prompt) so nothing is hidden.
             waiting: s.waiting || null,
             project_path: s.project_path || null,
+            // First ask / last ask / last reply, short (#194315, lib/session-digest.js). null when the
+            // provider has none, the session is older than 48 h, or IRIS_SESSION_DIGESTS=off.
+            digest: s.digest || null,
             git_branch: s.git_branch || null,
             model: s.model || null,
             updated_at: s.updated_at || null
