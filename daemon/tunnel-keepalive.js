@@ -17,13 +17,16 @@
  * No recorded tunnel → not ours to start (serve on never succeeded, or serve off cleared it). The
  * runner authenticates with this node's own key, which the platform binds to the node's owner — the
  * same account that claimed the name — so no user token is stored anywhere.
+ *
+ * The phone endpoint (#194511) records its tunnel the same way in ~/.iris/phone.json; a second
+ * instance with that file's `readSettings` keeps it up. Tunnels are per name, so the two never meet.
  */
 
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { spawn, spawnSync } = require('child_process')
-const { readSettings } = require('./inference-endpoint')
+const { readSettings: readInferenceSettings } = require('./inference-endpoint')
 
 const MIN_NODE = 20
 const BASE_DELAY_MS = 15_000
@@ -84,14 +87,14 @@ function runningPid (home, name) {
 }
 
 class TunnelKeepAlive {
-  constructor ({ home = os.homedir(), getApiBase, getKey, log = (m) => console.log(`[inference] ${m}`), spawnFn = spawn, probe = probeNode, now = () => Date.now() }) {
-    Object.assign(this, { home, getApiBase, getKey, log, spawnFn, probe, now })
+  constructor ({ home = os.homedir(), getApiBase, getKey, log = (m) => console.log(`[inference] ${m}`), spawnFn = spawn, probe = probeNode, now = () => Date.now(), readSettings = readInferenceSettings, enableHint = 'iris hive models serve on' }) {
+    Object.assign(this, { home, getApiBase, getKey, log, spawnFn, probe, now, readSettings, enableHint })
     this.state = { failures: 0, lastRestartAt: 0 }
   }
 
   tick () {
     try {
-      const s = readSettings(this.home)
+      const s = this.readSettings(this.home)
       const name = s.tunnel && s.tunnel.name
       const alive = !!(name && runningPid(this.home, name))
       const d = decideTunnelRestart({ settings: s, alive, now: this.now(), state: this.state })
@@ -101,7 +104,7 @@ class TunnelKeepAlive {
       const runner = [s.tunnel.runner, path.join(this.home, '.iris', 'bridge', 'relay', 'tunnel.js'), path.join(__dirname, '..', 'relay', 'tunnel.js')]
         .find((r) => r && fs.existsSync(r))
       if (!node || !runner) {
-        this.log(`tunnel ${name} is down and cannot be restarted: ${!node ? `no Node ${MIN_NODE}+ (recorded: ${s.node || 'none'}) — run: iris hive models serve on` : 'relay runner not found — run: iris bridge install'}`)
+        this.log(`tunnel ${name} is down and cannot be restarted: ${!node ? `no Node ${MIN_NODE}+ (recorded: ${s.node || 'none'}) — run: ${this.enableHint}` : 'relay runner not found — run: iris bridge install'}`)
         return d
       }
       const pid = this.start({ name, node, runner, port: s.port, zones: s.tunnel.zones })

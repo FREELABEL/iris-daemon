@@ -45,6 +45,7 @@ const { detectProfile, getCachedProfile } = require('./hardware-profile')
 const { LocalModelReporter, resolveLocalLlmConfig } = require('./local-llm')
 const { InferenceEndpoint } = require('./inference-endpoint')
 const { TunnelKeepAlive } = require('./tunnel-keepalive')
+const { PhoneEndpoint, readSettings: readPhoneSettings } = require('./phone-endpoint')
 const { MeshLlmSupervisor } = require('./mesh-llm-supervisor')
 const { startDeviceProbe, getDeviceReport } = require('./device-capabilities')
 const { IrisA2AExecutor, buildAgentCard } = require('./a2a-executor')
@@ -526,6 +527,26 @@ class Daemon {
       console.error(`[inference] not started: ${e.message}`)
       this.inference = null
     }
+    // IRIS Desktop on this machine, for the owner's iPhone app, through its own relay tunnel (#194511).
+    // Off unless ~/.iris/phone.json says so; checks an hp1 token signed with the node key (read live),
+    // refuses everything while "Allow access to this computer" is off, restarts its tunnel like #192752.
+    try {
+      this.phone = new PhoneEndpoint({ getKey: () => this.config.apiKey, getNodeId: () => this.nodeId })
+      this.phoneTunnel = new TunnelKeepAlive({
+        getApiBase: () => this.config.apiUrl,
+        getKey: () => this.config.apiKey,
+        readSettings: readPhoneSettings,
+        enableHint: 'turn phone access on again (it records the tunnel in ~/.iris/phone.json)',
+        log: (m) => console.log(`[phone] ${m}`)
+      })
+      const phoneTick = () => { this.phone.tick(); this.phoneTunnel.tick() }
+      phoneTick()
+      this._phoneTimer = setInterval(phoneTick, 15000)
+      if (this._phoneTimer.unref) this._phoneTimer.unref()
+    } catch (e) {
+      console.error(`[phone] not started: ${e.message}`)
+      this.phone = null
+    }
     this.heartbeat.getStateCallback = () => ({
       capacity: this.resourceMonitor ? this.resourceMonitor.getCapacity() : null,
       // Re-sent on EVERY heartbeat, not just at registration. Sending it once at startup
@@ -649,6 +670,8 @@ class Daemon {
       // Whether this machine serves its models to the owner's gateway, and where (#191176). Sent
       // when off too ({enabled:false}): the hub keeps a stale report for an absent key.
       ...(this.inference && this.inference.report() ? { inference: this.inference.report() } : {}),
+      // Whether the owner's phone can reach IRIS Desktop here, and where (#194511). Explicit when off.
+      ...(this.phone ? { phone: this.phone.report() } : {}),
       // The last worktree sweep (#188702): how many, whether over the cap, why the rest were kept.
       ...(this._worktreeReport ? { worktrees: this._worktreeReport } : {}),
       // What each live session's worktree has touched (#193188): the server compares sessions
@@ -3282,6 +3305,8 @@ LIMIT ${limit}
     if (this.localModels) this.localModels.stop()
     if (this._inferenceTimer) clearInterval(this._inferenceTimer)
     if (this.inference) this.inference.stop()
+    if (this._phoneTimer) clearInterval(this._phoneTimer)
+    if (this.phone) this.phone.stop()
     if (this.meshLlm) this.meshLlm.stop()
 
     // Stop mesh networking
