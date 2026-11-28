@@ -102,7 +102,11 @@ function extractToken (headers, rawUrl) {
     let decoded = ''
     try { decoded = Buffer.from(auth.slice(6).trim(), 'base64').toString('utf8') } catch {}
     const i = decoded.indexOf(':')
-    if (i > 0 && decoded.slice(0, i) === 'iris') token = decoded.slice(i + 1)
+    const user = i > 0 ? decoded.slice(0, i) : ''
+    const pass = i > 0 ? decoded.slice(i + 1) : ''
+    // `iris` is the phone's sign-in path. `opencode` is what the app's "Connect by address" sends
+    // (the engine's own username): an hp1 pass there is accepted, and verified like any other.
+    if (user === 'iris' || (user === 'opencode' && pass.startsWith('hp1.'))) token = pass
   }
   const url = String(rawUrl || '/')
   const q = url.indexOf('?')

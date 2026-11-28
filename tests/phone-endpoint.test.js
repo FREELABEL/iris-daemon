@@ -49,7 +49,11 @@ test('verifyToken: every way a token can be wrong, and reuse is fine', () => {
 test('extractToken: Basic iris:<t>, Bearer, ?iris_token= — and the query param is always stripped', () => {
   assert.deepStrictEqual(extractToken({ authorization: basic('iris', 'hp1.a') }, '/x'), { token: 'hp1.a', url: '/x' })
   assert.deepStrictEqual(extractToken({ authorization: 'Bearer hp1.b' }, '/x'), { token: 'hp1.b', url: '/x' })
-  assert.strictEqual(extractToken({ authorization: basic('opencode', 'hp1.a') }, '/x').token, null)
+  // The app's "Connect by address" sends the engine's own username, opencode (#194511): an hp1 pass
+  // there is taken (it is verified like any other); anything else under opencode is not a token.
+  assert.strictEqual(extractToken({ authorization: basic('opencode', 'hp1.a') }, '/x').token, 'hp1.a')
+  assert.strictEqual(extractToken({ authorization: basic('opencode', 'the-engine-password') }, '/x').token, null)
+  assert.strictEqual(extractToken({ authorization: basic('someone', 'hp1.a') }, '/x').token, null)
   assert.deepStrictEqual(extractToken({}, '/pty/1/connect?iris_token=hp1.c&directory=%2Ftmp%2Fa%20b'), { token: 'hp1.c', url: '/pty/1/connect?directory=%2Ftmp%2Fa%20b' })
   assert.deepStrictEqual(extractToken({}, '/a?iris_token=hp1.c'), { token: 'hp1.c', url: '/a' })
   // a header wins, but the query copy still never reaches the engine
